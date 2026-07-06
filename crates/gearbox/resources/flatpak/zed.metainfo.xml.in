@@ -5,20 +5,20 @@
     <project_license>Apache-2.0 and GPL-3.0-or-later</project_license>
 
     <name>$APP_NAME</name>
-    <summary>High-performance, multiplayer code editor</summary>
+    <summary>Gearbox Chinese GUI code editor</summary>
     <developer id="dev.gearbox">
         <name translate="no">Gearbox, Inc.</name>
     </developer>
     <description>
         <p>
-            Productive coding starts with a tool that stays out of your way. Gearbox blends the power of an IDE with the speed of a lightweight editor for productivity you can feel under your fingertips.
+            Gearbox is a Chinese GUI code editor derived from an open-source editor foundation, focused on a fast local development experience.
         </p>
         <p>Features:</p>
         <ul>
             <li>Performance: Efficiently uses every CPU core and your GPU for instant startup, quick file loading, and responsive keystrokes.</li>
-            <li>Language-aware: Maintains a syntax tree for precise highlighting, and auto-indent, with LSP support for autocompletion and refactoring.</li>
-            <li>Collaboration: Real-time editing and navigation for multiple developers in a shared workspace.</li>
-            <li>AI Integration: Integrates GitHub Copilot and GPT-4 for natural language code generation.</li>
+            <li>Language-aware: Maintains syntax trees for precise highlighting and auto-indent, with LSP support for completion and refactoring.</li>
+            <li>Workflow: Project navigation, editing, terminal, search, and AI-assisted development in one local workspace.</li>
+            <li>AI Integration: Supports configurable AI-assisted coding providers.</li>
         </ul>
     </description>
 
@@ -34,13 +34,13 @@
         <content_attribute id="social-audio">intense</content_attribute>
     </content_rating>
 
-    <url type="homepage">https://zed.dev</url>
-    <url type="bugtracker">https://github.com/zed-industries/zed/issues</url>
-    <url type="faq">https://zed.dev/faq</url>
-    <url type="help">https://zed.dev/docs/getting-started</url>
-    <url type="contact">https://zed.dev/community-links</url>
-    <url type="vcs-browser">https://github.com/zed-industries/zed</url>
-    <url type="contribute">https://github.com/zed-industries/zed/blob/main/CONTRIBUTING.md</url>
+    <url type="homepage">https://github.com/ShamirSecret/gearbox-zed</url>
+    <url type="bugtracker">https://github.com/ShamirSecret/gearbox-zed/issues</url>
+    <url type="faq">https://github.com/ShamirSecret/gearbox-zed</url>
+    <url type="help">https://github.com/ShamirSecret/gearbox-zed</url>
+    <url type="contact">https://github.com/ShamirSecret/gearbox-zed/issues</url>
+    <url type="vcs-browser">https://github.com/ShamirSecret/gearbox-zed</url>
+    <url type="contribute">https://github.com/ShamirSecret/gearbox-zed</url>
 
     <supports>
         <internet>offline-only</internet>
@@ -54,23 +54,23 @@
     <screenshots>
         <screenshot type="default">
             <caption>Gearbox with a large project open, showing language server and gitblame support</caption>
-            <image>https://zed.dev/img/flatpak/flatpak-1.png</image>
+            <image>https://github.com/ShamirSecret/gearbox-zed/img/flatpak/flatpak-1.png</image>
         </screenshot>
         <screenshot>
-            <caption>Gearbox with a file open and a channel message thread in the right sidebar</caption>
-            <image>https://zed.dev/img/flatpak/flatpak-2.png</image>
+            <caption>Gearbox with a file open and a assistant thread in the right sidebar</caption>
+            <image>https://github.com/ShamirSecret/gearbox-zed/img/flatpak/flatpak-2.png</image>
         </screenshot>
         <screenshot>
-            <caption>Example of a channel's shared document</caption>
-            <image>https://zed.dev/img/flatpak/flatpak-3.png</image>
+            <caption>Example of a shared document</caption>
+            <image>https://github.com/ShamirSecret/gearbox-zed/img/flatpak/flatpak-3.png</image>
         </screenshot>
         <screenshot>
             <caption>Gearbox's extension list</caption>
-            <image>https://zed.dev/img/flatpak/flatpak-4.png</image>
+            <image>https://github.com/ShamirSecret/gearbox-zed/img/flatpak/flatpak-4.png</image>
         </screenshot>
         <screenshot>
             <caption>Theme switcher UI and example theme</caption>
-            <image>https://zed.dev/img/flatpak/flatpak-5.png</image>
+            <image>https://github.com/ShamirSecret/gearbox-zed/img/flatpak/flatpak-5.png</image>
         </screenshot>
     </screenshots>
 

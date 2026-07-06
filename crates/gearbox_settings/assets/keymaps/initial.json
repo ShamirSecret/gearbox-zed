@@ -1,7 +1,7 @@
 // Gearbox 快捷键
 //
 // Gearbox 当前基于 Gearbox 构建，快捷键格式兼容 Gearbox。
-// 配置说明可参考上游文档: https://zed.dev/docs/key-bindings
+// 配置说明可参考上游文档: https://github.com/ShamirSecret/gearbox-zed
 //
 // 如需查看 Gearbox 的默认快捷键，可从命令面板运行
 // `zed: open default keymap`。

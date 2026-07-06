@@ -463,7 +463,13 @@ impl Agent {
 
     pub fn label(&self) -> SharedString {
         match self {
-            Self::NativeAgent => "Zed Agent".into(),
+            Self::NativeAgent => {
+                if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") {
+                    "Gearbox Agent".into()
+                } else {
+                    "Zed Agent".into()
+                }
+            }
             Self::Custom { id, .. } => id.0.clone(),
             #[cfg(any(test, feature = "test-support"))]
             Self::Stub => "Stub Agent".into(),

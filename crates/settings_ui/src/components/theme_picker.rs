@@ -6,6 +6,14 @@ use picker::{Picker, PickerDelegate};
 use theme::ThemeRegistry;
 use ui::{ListItem, ListItemSpacing, prelude::*};
 
+fn gearbox_theme_name(name: &str) -> String {
+    if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") {
+        name.replace("Zed", "Gearbox")
+    } else {
+        name.to_string()
+    }
+}
+
 type ThemePicker = Picker<ThemePickerDelegate>;
 
 pub struct ThemePickerDelegate {
@@ -162,7 +170,7 @@ impl PickerDelegate for ThemePickerDelegate {
                 .inset(true)
                 .spacing(ListItemSpacing::Sparse)
                 .toggle_state(selected)
-                .child(Label::new(theme_match.string.clone()))
+                .child(Label::new(gearbox_theme_name(&theme_match.string)))
                 .into_any_element(),
         )
     }

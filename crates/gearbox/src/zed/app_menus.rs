@@ -300,20 +300,20 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
                 MenuItem::action(
                     "文档",
                     super::OpenBrowser {
-                        url: "https://zed.dev/docs".into(),
+                        url: "https://github.com/ShamirSecret/gearbox-zed".into(),
                     },
                 ),
                 MenuItem::action("Gearbox 仓库", feedback::OpenZedRepo),
                 MenuItem::action(
                     "Gearbox Twitter",
                     super::OpenBrowser {
-                        url: "https://twitter.com/zeddotdev".into(),
+                        url: "https://github.com/ShamirSecret/gearbox-zed".into(),
                     },
                 ),
                 MenuItem::action(
                     "加入团队",
                     super::OpenBrowser {
-                        url: "https://zed.dev/jobs".into(),
+                        url: "https://github.com/ShamirSecret/gearbox-zed".into(),
                     },
                 ),
             ],

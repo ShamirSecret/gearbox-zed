@@ -1,23 +1,23 @@
-name: zed
+name: gearbox
 title: Gearbox
 base: core24
 version: "$RELEASE_VERSION"
-summary: The editor for what's next
+summary: Gearbox Chinese GUI code editor
 description: |
   Gearbox is a modern open-source code editor, built from the ground up in Rust with
-  a GPU-accelerated renderer. We help you build software faster than ever before.
+  a GPU-accelerated renderer. Gearbox provides a Chinese GUI for fast local software development.
 grade: stable
 confinement: classic
 compression: lzo
-website: https://zed.dev/
-source-code: https://github.com/zed-industries/zed
-issues: https://github.com/zed-industries/zed/issues
-contact: https://zed.dev/community-links#support-and-feedback
+website: https://github.com/ShamirSecret/gearbox-zed/
+source-code: https://github.com/ShamirSecret/gearbox-zed
+issues: https://github.com/ShamirSecret/gearbox-zed/issues
+contact: https://github.com/ShamirSecret/gearbox-zed/issues
 
 parts:
-  zed:
+  gearbox:
     plugin: dump
-    source: "https://github.com/zed-industries/zed/releases/download/v$RELEASE_VERSION/zed-linux-x86_64.tar.gz"
+    source: "https://github.com/ShamirSecret/gearbox-zed/releases/download/v$RELEASE_VERSION/gearbox-linux-x86_64.tar.gz"
 
     organize:
       # These renames seem to not be necessary, but it's tidier.

@@ -105,9 +105,9 @@ use zed_actions::{
     OpenSettingsFile, OpenStatusPage, OpenZedUrl, Quit,
 };
 
-const DOCS_URL: &str = "https://zed.dev/docs/";
-const STATUS_URL: &str = "https://status.zed.dev";
-const MERCH_URL: &str = "https://merch.zed.dev/";
+const DOCS_URL: &str = "https://github.com/ShamirSecret/gearbox-zed/";
+const STATUS_URL: &str = "https://github.com/ShamirSecret/gearbox-zed";
+const MERCH_URL: &str = "https://github.com/ShamirSecret/gearbox-zed";
 
 pub struct CrashHandler(pub Arc<crashes::Client>);
 
@@ -642,7 +642,7 @@ fn initialize_file_watcher(window: &mut Window, cx: &mut Context<Workspace>) {
             db::indoc! {r#"
             inotify_init returned {}
 
-            This may be due to system-wide limits on inotify instances. For troubleshooting see: https://zed.dev/docs/linux
+            This may be due to system-wide limits on inotify instances. For troubleshooting see: https://github.com/ShamirSecret/gearbox-zed#linux-troubleshooting
             "#},
             e
         );
@@ -656,7 +656,7 @@ fn initialize_file_watcher(window: &mut Window, cx: &mut Context<Workspace>) {
         cx.spawn(async move |_, cx| {
             if prompt.await == Ok(0) {
                 cx.update(|cx| {
-                    cx.open_url("https://zed.dev/docs/linux#could-not-start-inotify");
+                    cx.open_url("https://github.com/ShamirSecret/gearbox-zed#linux-file-watcher-troubleshooting");
                     cx.quit();
                 });
             }
@@ -673,7 +673,7 @@ fn initialize_file_watcher(window: &mut Window, cx: &mut Context<Workspace>) {
             db::indoc! {r#"
             ReadDirectoryChangesW initialization failed: {}
 
-            This may occur on network filesystems and WSL paths. For troubleshooting see: https://zed.dev/docs/windows
+            This may occur on network filesystems and WSL paths. For troubleshooting see: https://github.com/ShamirSecret/gearbox-zed#windows-troubleshooting
             "#},
             e
         );
@@ -687,7 +687,7 @@ fn initialize_file_watcher(window: &mut Window, cx: &mut Context<Workspace>) {
         cx.spawn(async move |_, cx| {
             if prompt.await == Ok(0) {
                 cx.update(|cx| {
-                    cx.open_url("https://zed.dev/docs/windows");
+                    cx.open_url("https://github.com/ShamirSecret/gearbox-zed#windows-troubleshooting");
                     cx.quit()
                 });
             }
@@ -705,14 +705,14 @@ fn show_software_emulation_warning_if_needed(
         let (graphics_api, docs_url, open_url) = if cfg!(target_os = "windows") {
             (
                 "DirectX",
-                "https://zed.dev/docs/windows",
-                "https://zed.dev/docs/windows",
+                "https://github.com/ShamirSecret/gearbox-zed#windows-troubleshooting",
+                "https://github.com/ShamirSecret/gearbox-zed#windows-troubleshooting",
             )
         } else {
             (
                 "Vulkan",
-                "https://zed.dev/docs/linux",
-                "https://zed.dev/docs/linux#zed-fails-to-open-windows",
+                "https://github.com/ShamirSecret/gearbox-zed#linux-troubleshooting",
+                "https://github.com/ShamirSecret/gearbox-zed#linux-gpu-troubleshooting",
             )
         };
         let message = format!(

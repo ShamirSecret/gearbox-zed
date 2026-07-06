@@ -2,20 +2,20 @@
 Version=1.0
 Type=Application
 Name=$APP_NAME
-GenericName=Text Editor
-Comment=A high-performance, multiplayer code editor.
+GenericName=Code Editor
+Comment=Gearbox Chinese GUI code editor.
 TryExec=$APP_CLI
 StartupNotify=$DO_STARTUP_NOTIFY
 Exec=$APP_CLI $APP_ARGS
 Icon=$APP_ICON
 Categories=Utility;TextEditor;Development;IDE;
-Keywords=zed;
+Keywords=gearbox;editor;ide;
 # To add Gearbox to "Open Folder With..." context menu, add `inode/directory` to the MimeType field (semicolon separated)
-# Arch linux users have reported this setting Gearbox as default file browser. See https://github.com/zed-industries/zed/pull/39076 and related issues.
+# Arch linux users have reported this setting Gearbox as default file browser. See https://github.com/ShamirSecret/gearbox-zed/pull/39076 and related issues.
 # If this happens to you, an unconfirmed fix may be to install Arch's `gnome-defaults-list` package.
-MimeType=text/plain;application/x-zerosize;x-scheme-handler/zed;
+MimeType=text/plain;application/x-zerosize;x-scheme-handler/gearbox;
 Actions=NewWorkspace;
 
 [Desktop Action NewWorkspace]
 Exec=$APP_CLI --new $APP_ARGS
-Name=Open a new workspace
+Name=打开新工作区

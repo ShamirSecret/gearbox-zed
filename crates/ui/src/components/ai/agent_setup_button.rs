@@ -68,7 +68,7 @@ impl Component for AgentSetupButton {
             "Default",
             AgentSetupButton::new("preview")
                 .icon(Icon::new(IconName::ZedAgent))
-                .name("Zed Agent")
+                .name(if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") { "Gearbox Agent" } else { "Zed Agent" })
                 .into_any_element(),
         )
         .into_any_element()

@@ -405,21 +405,21 @@ impl LanguageModelProvider for CloudLanguageModelProvider {
     }
 
     fn authentication_error_message(&self) -> SharedString {
-        "Failed to sign in with your Zed account (401).".into()
+        "Failed to sign in with your Gearbox account (401).".into()
     }
 
     fn missing_credentials_error_message(&self) -> SharedString {
-        "You are not signed in to your Zed account. \
+        "You are not signed in to your Gearbox account. \
         Sign in to continue."
             .into()
     }
 
     fn fast_mode_confirmation(&self, _cx: &App) -> Option<FastModeConfirmation> {
         Some(FastModeConfirmation {
-            title: "Enable Fast Mode for Zed?".into(),
+            title: "Enable Fast Mode for Gearbox?".into(),
             message: "Fast mode routes requests through the upstream provider's fast mode or priority tier. The \
                 upstream provider's premium per-token pricing applies and is passed through to \
-                your Zed billing."
+                your Gearbox billing."
                 .into(),
         })
     }
@@ -443,32 +443,32 @@ fn zed_ai_description(
     eligible_for_trial: bool,
 ) -> &'static str {
     if !is_connected {
-        return "Sign in to have access to Zed's complete agentic experience with hosted models.";
+        return "Sign in to have access to Gearbox's complete agentic experience with hosted models.";
     }
 
     match plan {
         Some(Plan::ZedPro) => {
-            "You have access to Zed's hosted models through your Pro subscription."
+            "You have access to Gearbox hosted models through your Pro subscription."
         }
-        Some(Plan::ZedProTrial) => "You have access to Zed's hosted models through your Pro trial.",
+        Some(Plan::ZedProTrial) => "You have access to Gearbox hosted models through your Pro trial.",
         Some(Plan::ZedStudent) => {
-            "You have access to Zed's hosted models through your Student subscription."
+            "You have access to Gearbox hosted models through your Student subscription."
         }
         Some(Plan::ZedBusiness) => {
             if is_zed_model_provider_enabled {
-                "You have access to Zed's hosted models through your organization."
+                "You have access to Gearbox hosted models through your organization."
             } else {
-                "Zed's hosted models are disabled by your organization's configuration."
+                "Gearbox hosted models are disabled by your organization's configuration."
             }
         }
         Some(Plan::ZedVip) => {
-            "You have access to Zed's hosted models through your VIP subscription."
+            "You have access to Gearbox hosted models through your VIP subscription."
         }
         Some(Plan::ZedFree) | None => {
             if eligible_for_trial {
-                "Subscribe for access to Zed's hosted models. Start with a 14 day free trial."
+                "Subscribe for access to Gearbox hosted models. Start with a 14 day free trial."
             } else {
-                "Subscribe for access to Zed's hosted models."
+                "Subscribe for access to Gearbox hosted models."
             }
         }
     }
@@ -522,7 +522,7 @@ impl RenderOnce for ZedAiConfiguration {
                 .gap_2()
                 .when(!self.compact, |this| this.child(Label::new(description)))
                 .child(
-                    Button::new("sign_in", "Sign In to use Zed AI")
+                    Button::new("sign_in", if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") { "登录以使用 Gearbox AI" } else { "Sign In to use Zed AI" })
                         .start_icon(
                             Icon::new(IconName::Github)
                                 .size(IconSize::Small)
@@ -937,9 +937,9 @@ impl Component for ZedAiConfiguration {
     }
 
     fn description() -> &'static str {
-        "The configuration surface for Zed's hosted AI models, \
+        "The configuration surface for Gearbox hosted AI models, \
         showing the user's connection status, current plan, trial eligibility, \
-        and entry points for enabling the Zed model provider."
+        and entry points for enabling the Gearbox model provider."
     }
 
     fn preview(_window: &mut Window, _cx: &mut App) -> AnyElement {
@@ -1013,7 +1013,7 @@ impl Component for ZedAiConfiguration {
                     }),
                 ),
                 single_example(
-                    "Zed Pro Trial Plan",
+                    "Gearbox Pro Trial Plan",
                     configuration(PreviewConfiguration {
                         plan: Some(Plan::ZedProTrial),
                         is_connected: true,
@@ -1022,7 +1022,7 @@ impl Component for ZedAiConfiguration {
                     }),
                 ),
                 single_example(
-                    "Zed Pro Plan",
+                    "Gearbox Pro Plan",
                     configuration(PreviewConfiguration {
                         plan: Some(Plan::ZedPro),
                         is_connected: true,
@@ -1031,7 +1031,7 @@ impl Component for ZedAiConfiguration {
                     }),
                 ),
                 single_example(
-                    "Business Plan - Zed models enabled",
+                    "Business Plan - Gearbox models enabled",
                     configuration(PreviewConfiguration {
                         plan: Some(Plan::ZedBusiness),
                         is_connected: true,
@@ -1040,7 +1040,7 @@ impl Component for ZedAiConfiguration {
                     }),
                 ),
                 single_example(
-                    "Business Plan - Zed models disabled",
+                    "Business Plan - Gearbox models disabled",
                     configuration(PreviewConfiguration {
                         plan: Some(Plan::ZedBusiness),
                         is_connected: true,

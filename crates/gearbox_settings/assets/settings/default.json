@@ -1057,7 +1057,7 @@
     // The default model to use when creating new threads.
     "default_model": {
       // The provider to use.
-      "provider": "zed.dev",
+      "provider": "gearbox.dev",
       // The model to use.
       "model": "claude-sonnet-4",
       // Whether thinking is enabled.
@@ -1080,7 +1080,7 @@
       //
       // To set parameters for a specific provider and model:
       // {
-      //   "provider": "zed.dev",
+      //   "provider": "gearbox.dev",
       //   "model": "claude-sonnet-4",
       //   "temperature": 1.0
       // }
@@ -2076,7 +2076,7 @@
     "JSONC": [
       "**/.zed/*.json",
       "**/.vscode/**/*.json",
-      "**/{zed,Zed}/{settings,keymap,tasks,debug}.json",
+      "**/{gearbox,Gearbox}/{settings,keymap,tasks,debug}.json",
       "tsconfig*.json",
     ],
     "Markdown": [".rules", ".cursorrules", ".windsurfrules", ".clinerules"],
@@ -2452,7 +2452,7 @@
     "x_ai": {
       "api_url": "https://api.x.ai/v1",
     },
-    "zed.dev": {},
+    "gearbox.dev": {},
   },
   "session": {
     // Whether or not to restore unsaved buffers on restart.
@@ -2615,8 +2615,8 @@
     "delay_ms": 1000,
   },
   // The server to connect to. If the environment variable
-  // ZED_SERVER_URL is set, it will override this setting.
-  "server_url": "https://zed.dev",
+  // GEARBOX_SERVER_URL is set, it will override this setting.
+  "server_url": "https://github.com/ShamirSecret/gearbox-zed",
   // Settings overrides to use when using Gearbox Preview.
   // Mostly useful for developers who are managing multiple instances of Gearbox.
   "preview": {

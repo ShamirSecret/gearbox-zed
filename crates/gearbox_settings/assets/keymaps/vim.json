@@ -518,11 +518,11 @@
       "shift-h": "pane::ActivatePreviousItem", // not a helix default
       "g w": "vim::HelixJumpToWord",
       "g .": "vim::HelixGotoLastModification",
-      "g o": "editor::ToggleSelectedDiffHunks", // Zed specific
-      "g shift-o": "git::ToggleStaged", // Zed specific
-      "g shift-r": "git::Restore", // Zed specific
-      "g u": "git::StageAndNext", // Zed specific
-      "g shift-u": "git::UnstageAndNext", // Zed specific
+      "g o": "editor::ToggleSelectedDiffHunks", // Gearbox specific
+      "g shift-o": "git::ToggleStaged", // Gearbox specific
+      "g shift-r": "git::Restore", // Gearbox specific
+      "g u": "git::StageAndNext", // Gearbox specific
+      "g shift-u": "git::UnstageAndNext", // Gearbox specific
 
       // Window mode
       "space w v": "pane::SplitRight",

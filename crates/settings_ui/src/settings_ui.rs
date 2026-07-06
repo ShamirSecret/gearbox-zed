@@ -68,6 +68,116 @@ const NAVBAR_CONTAINER_TAB_INDEX: isize = 0;
 const NAVBAR_GROUP_TAB_INDEX: isize = 1;
 
 const HEADER_CONTAINER_TAB_INDEX: isize = 2;
+
+fn gearbox_text(text: &'static str) -> &'static str {
+    if std::env::var("GEARBOX_GUI").as_deref() != Ok("1") {
+        return text;
+    }
+
+    match text {
+        "General" => "通用",
+        "Appearance" => "外观",
+        "Keymap" => "快捷键",
+        "Editor" => "编辑器",
+        "Languages & Tools" => "语言和工具",
+        "Search & Files" => "搜索和文件",
+        "Window & Layout" => "窗口和布局",
+        "Panels" => "面板",
+        "Debugger" => "调试器",
+        "Terminal" => "终端",
+        "Version Control" => "版本控制",
+        "Collaboration" => "协作",
+        "AI" => "AI",
+        "Network" => "网络",
+        "Developer" => "开发者",
+        "Feature Flags" => "功能开关",
+        "Instrumentation" => "性能诊断",
+        "General Settings" => "通用设置",
+        "Privacy" => "隐私",
+        "Telemetry" => "遥测",
+        "Security" => "安全",
+        "Theme" => "主题",
+        "Icon Theme" => "图标主题",
+        "Font" => "字体",
+        "Buffer Font" => "编辑器字体",
+        "UI Font" => "界面字体",
+        "Cursor" => "光标",
+        "Tabs" => "标签页",
+        "Toolbar" => "工具栏",
+        "Status Bar" => "状态栏",
+        "Project Panel" => "项目面板",
+        "Outline Panel" => "大纲面板",
+        "Terminal Panel" => "终端面板",
+        "Agent Panel" => "Agent 面板",
+        "Git Panel" => "Git 面板",
+        "Language Servers" => "语言服务器",
+        "Formatters" => "格式化工具",
+        "Tasks" => "任务",
+        "File Scan" => "文件扫描",
+        "Search" => "搜索",
+        "Files" => "文件",
+        "LLM Providers" => "LLM 提供商",
+        "MCP Servers" => "MCP 服务器",
+        "Tool Permissions" => "工具权限",
+        "External Agents" => "外部 Agent",
+        "Skills" => "技能",
+        "Sandbox" => "沙箱",
+        "Profiles" => "配置档案",
+        "Performance Profiler" => "性能分析器",
+        "When Closing With No Tabs" => "没有标签页时关闭",
+        "On Last Window Closed" => "最后一个窗口关闭时",
+        "Use System Path Prompts" => "使用系统路径对话框",
+        "Use System Prompts" => "使用系统确认对话框",
+        "Redact Private Values" => "隐藏私密值",
+        "Configure" => "配置",
+        "Reset to Default" => "恢复默认值",
+        "Overridden by Organization" => "已被组织配置覆盖",
+        "Contact your organization admins to adjust this setting." => {
+            "请联系组织管理员调整此设置。"
+        }
+        _ => text,
+    }
+}
+
+fn gearbox_shared_text(text: &SharedString) -> SharedString {
+    if std::env::var("GEARBOX_GUI").as_deref() != Ok("1") {
+        return text.clone();
+    }
+
+    match text.as_ref() {
+        "LLM Providers" => "LLM 提供商".into(),
+        "MCP Servers" => "MCP 服务器".into(),
+        "Tool Permissions" => "工具权限".into(),
+        "External Agents" => "外部 Agent".into(),
+        "Skills" => "技能".into(),
+        "Sandbox" => "沙箱".into(),
+        "Profiles" => "配置档案".into(),
+        "Configure" => "配置".into(),
+        _ => text.as_ref().replace("Zed", "Gearbox").into(),
+    }
+}
+
+fn gearbox_setting_description(text: &'static str) -> SharedString {
+    if std::env::var("GEARBOX_GUI").as_deref() != Ok("1") {
+        return SharedString::new_static(text);
+    }
+
+    match text {
+        "Collect timing data for foreground and background executor tasks so they can be inspected via `zed: open performance profiler`. May lead to increased memory usage." => {
+            "收集前台和后台执行器任务的耗时数据，便于通过性能分析器检查。可能增加内存占用。".into()
+        }
+        "What to do when using the 'close active item' action with no tabs." => {
+            "没有标签页时执行“关闭当前项目”动作的处理方式。".into()
+        }
+        "What to do when the last window is closed." => "最后一个窗口关闭时的处理方式。".into(),
+        "Use native OS dialogs for 'Open' and 'Save As'." => {
+            "打开和另存为时使用操作系统原生对话框。".into()
+        }
+        "Use native OS dialogs for confirmations." => "确认操作时使用操作系统原生对话框。".into(),
+        "Hide the values of variables in private files." => "隐藏私密文件中的变量值。".into(),
+        _ => text.replace("Zed", "Gearbox").replace("zed", "gearbox").into(),
+    }
+}
 const HEADER_GROUP_TAB_INDEX: isize = 3;
 
 const CONTENT_CONTAINER_TAB_INDEX: isize = 4;
@@ -858,7 +968,11 @@ fn open_settings_editor_with(
         cx.open_window(
             WindowOptions {
                 titlebar: Some(TitlebarOptions {
-                    title: Some("Zed — Settings".into()),
+                    title: Some(if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") {
+                        "Gearbox - 设置".into()
+                    } else {
+                        "Zed — Settings".into()
+                    }),
                     appears_transparent: true,
                     traffic_light_position: Some(point(px(12.0), px(12.0))),
                 }),
@@ -1162,7 +1276,7 @@ impl SettingsPageItem {
 
         match self {
             SettingsPageItem::SectionHeader(header) => {
-                SettingsSectionHeader::new(SharedString::new_static(header)).into_any_element()
+                SettingsSectionHeader::new(SharedString::new_static(gearbox_text(header))).into_any_element()
             }
             SettingsPageItem::SettingItem(setting_item) => {
                 let (field_with_padding, _) =
@@ -1190,12 +1304,12 @@ impl SettingsPageItem {
                                 .relative()
                                 .w_full()
                                 .max_w_1_2()
-                                .child(Label::new(sub_page_link.title.clone()))
+                                .child(Label::new(gearbox_shared_text(&sub_page_link.title)))
                                 .when_some(
                                     sub_page_link.description.as_ref(),
                                     |this, description| {
                                         this.child(
-                                            Label::new(description.clone())
+                                            Label::new(gearbox_shared_text(description))
                                                 .size(LabelSize::Small)
                                                 .color(Color::Muted),
                                         )
@@ -1205,9 +1319,13 @@ impl SettingsPageItem {
                         .child(
                             Button::new(
                                 ("sub-page".into(), sub_page_link.title.clone()),
-                                "Configure",
+                                gearbox_text("Configure"),
                             )
-                            .aria_label(format!("Configure {}", sub_page_link.title))
+                            .aria_label(format!(
+                                "{} {}",
+                                gearbox_text("Configure"),
+                                gearbox_shared_text(&sub_page_link.title)
+                            ))
                             .tab_index(0_isize)
                             .end_icon(
                                 Icon::new(IconName::ChevronRight)
@@ -1326,12 +1444,12 @@ impl SettingsPageItem {
                                 .relative()
                                 .w_full()
                                 .max_w_1_2()
-                                .child(Label::new(action_link.title.clone()))
+                                .child(Label::new(gearbox_shared_text(&action_link.title)))
                                 .when_some(
                                     action_link.description.as_ref(),
                                     |this, description| {
                                         this.child(
-                                            Label::new(description.clone())
+                                            Label::new(gearbox_shared_text(description))
                                                 .size(LabelSize::Small)
                                                 .color(Color::Muted),
                                         )
@@ -1341,7 +1459,7 @@ impl SettingsPageItem {
                         .child(
                             Button::new(
                                 ("action-link".into(), action_link.title.clone()),
-                                action_link.button_text.clone(),
+                                gearbox_shared_text(&action_link.button_text),
                             )
                             .tab_index(0_isize)
                             .end_icon(
@@ -1383,7 +1501,7 @@ fn render_settings_item_layout(
     h_flex()
         .id(title)
         .role(Role::Group)
-        .aria_label(SharedString::new_static(title))
+        .aria_label(SharedString::new_static(gearbox_text(title)))
         .min_w_0()
         .justify_between()
         .child(
@@ -1396,14 +1514,14 @@ fn render_settings_item_layout(
                     h_flex()
                         .w_full()
                         .gap_1()
-                        .child(Label::new(SharedString::new_static(title)))
+                        .child(Label::new(SharedString::new_static(gearbox_text(title))))
                         .when_some(reset_fn, |this, reset_to_default| {
                             this.child(
                                 IconButton::new("reset-to-default-btn", IconName::Undo)
                                     .icon_color(Color::Muted)
                                     .icon_size(IconSize::Small)
-                                    .aria_label("Reset to Default")
-                                    .tooltip(Tooltip::text("Reset to Default"))
+                                    .aria_label(gearbox_text("Reset to Default"))
+                                    .tooltip(Tooltip::text(gearbox_text("Reset to Default")))
                                     .on_click(move |_, window, cx| {
                                         reset_to_default(window, cx);
                                     }),
@@ -1411,14 +1529,18 @@ fn render_settings_item_layout(
                         })
                         .when_some(modified_in, |this, modified_in| {
                             this.child(
-                                Label::new(format!("\u{2014}  Modified in {modified_in}"))
+                                Label::new(if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") {
+                                    format!("\u{2014}  修改于 {modified_in}")
+                                } else {
+                                    format!("\u{2014}  Modified in {modified_in}")
+                                })
                                     .color(Color::Muted)
                                     .size(LabelSize::Small),
                             )
                         }),
                 )
                 .child(
-                    Label::new(SharedString::new_static(description))
+                    Label::new(gearbox_setting_description(description))
                         .size(LabelSize::Small)
                         .color(Color::Muted)
                         .render_code_spans(),
@@ -1475,9 +1597,9 @@ fn render_settings_item(
                     )
                     .tooltip(|_, cx| {
                         Tooltip::with_meta(
-                            "Overridden by Organization",
+                            gearbox_text("Overridden by Organization"),
                             None,
-                            "Contact your organization admins to adjust this setting.",
+                            gearbox_text("Contact your organization admins to adjust this setting."),
                             cx,
                         )
                     }),
@@ -3164,7 +3286,7 @@ impl SettingsWindow {
                                     .map(|(entry_index, entry)| {
                                         TreeViewItem::new(
                                             ("settings-ui-navbar-entry", entry_index),
-                                            entry.title,
+                                            gearbox_text(entry.title),
                                         )
                                         .track_focus(&entry.focus_handle)
                                         .root_item(entry.is_root)
@@ -3482,15 +3604,15 @@ impl SettingsWindow {
             .child(Label::new("/").color(Color::Muted))
             .children(
                 itertools::intersperse(
-                    std::iter::once(self.current_page().title.into()).chain(
+                    std::iter::once(gearbox_text(self.current_page().title).into()).chain(
                         self.sub_page_stack
                             .iter()
                             .enumerate()
                             .flat_map(|(index, page)| {
                                 (index == 0)
-                                    .then(|| page.section_header.clone())
+                                    .then(|| gearbox_shared_text(&page.section_header))
                                     .into_iter()
-                                    .chain(std::iter::once(page.link.title.clone()))
+                                    .chain(std::iter::once(gearbox_shared_text(&page.link.title)))
                             }),
                     ),
                     "/".into(),

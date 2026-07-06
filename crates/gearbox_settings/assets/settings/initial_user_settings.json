@@ -1,7 +1,7 @@
 // Gearbox 设置
 //
 // Gearbox 当前基于 Gearbox 构建，底层设置格式兼容 Gearbox。
-// 配置说明可参考上游文档: https://zed.dev/docs/configuring-zed
+// 配置说明可参考上游文档: https://github.com/ShamirSecret/gearbox-zed
 //
 // 如需查看 Gearbox 的默认设置而不修改个人设置，
 // 可从命令面板运行 `zed: open default settings`
