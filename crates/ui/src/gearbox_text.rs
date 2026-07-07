@@ -463,7 +463,7 @@ fn sentence_token_translation(token: &str) -> Option<String> {
         "copies" => "复制",
         "clipboards" => "剪贴板",
         "scrollbars" => "滚动条",
-        "breadcrumbs" => "面包屑",
+        "breadcrumbs" => "路径导航",
         "multipliers" => "倍率",
         "multiplier" => "倍率",
         "occurrences" => "出现次数",
@@ -642,7 +642,7 @@ fn title_token_translation(token: &str) -> Option<&'static str> {
         "Box" => "框",
         "Branch" => "分支",
         "Breakpoints" => "断点",
-        "Breadcrumbs" => "面包屑",
+        "Breadcrumbs" => "路径导航",
         "Brackets" => "括号",
         "Buffer" => "缓冲区",
         "Buffers" => "缓冲区",
@@ -1416,7 +1416,7 @@ fn exact_translation(text: &str) -> Option<&'static str> {
         "Border style for the minimap's scrollbar thumb." => "缩略图滚动条滑块的边框样式。",
         "How to highlight the current line in the minimap." => "如何在缩略图中高亮当前行。",
         "Maximum number of columns to display in the minimap." => "缩略图中显示的最大列数。",
-        "Show breadcrumbs." => "显示面包屑导航。",
+        "Show breadcrumbs." => "显示路径导航。",
         "Show quick action buttons (e.g., search, selection, editor controls, etc.)." => {
             "显示快速操作按钮（例如搜索、选择、编辑器控件等）。"
         }

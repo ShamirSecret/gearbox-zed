@@ -252,7 +252,7 @@ fn gearbox_text(text: &'static str) -> &'static str {
         "Thumb" => "滑块",
         "Thumb Border" => "滑块边框",
         "Max Width Columns" => "最大宽度列数",
-        "Breadcrumbs" => "面包屑",
+        "Breadcrumbs" => "路径导航",
         "Quick Actions" => "快速操作",
         "Selections Menu" => "选择菜单",
         "Agent Review" => "Agent 审查",
@@ -663,6 +663,29 @@ fn gearbox_setting_description(text: &'static str) -> SharedString {
         "The font fallbacks to use for rendering in text buffers." => {
             "用于文本缓冲区渲染的备用字体。".into()
         }
+        "Files or globs of files that will be excluded by Zed entirely. They will be skipped during file scans, file searches, and not be displayed in the project file tree. Takes precedence over \"File Scan Inclusions\"" => {
+            "Gearbox 将完全排除的文件或文件 glob。它们会在文件扫描和文件搜索中跳过，也不会显示在项目文件树中。优先级高于“文件扫描包含项”。".into()
+        }
+        "Files or globs of files that will be included by Zed, even when ignored by git. This is useful for files that are not tracked by git, but are still important to your project. Note that globs that are overly broad can slow down Zed's file scanning. \"File Scan Exclusions\" takes precedence over these inclusions" => {
+            "Gearbox 将包含的文件或文件 glob，即使它们被 git 忽略。这适用于未被 git 跟踪但对项目仍很重要的文件。请注意，过宽的 glob 会减慢 Gearbox 文件扫描速度。“文件扫描排除项”的优先级高于这些包含项。".into()
+        }
+        "Show file icons in the project panel." => "在项目面板中显示文件图标。".into(),
+        "Whether to show folder icons or chevrons for directories in the project panel." => {
+            "项目面板中的目录是否显示文件夹图标或展开箭头。".into()
+        }
+        "Show the Git status in the project panel." => {
+            "在项目面板中显示 Git 状态。".into()
+        }
+        "Amount of indentation for nested items." => "嵌套项的缩进大小。".into(),
+        "Whether to reveal entries in the project panel automatically when a corresponding project entry becomes active." => {
+            "对应项目条目变为活动状态时，是否在项目面板中自动显示该条目。".into()
+        }
+        "Whether the project panel should open on startup." => {
+            "启动时是否打开项目面板。".into()
+        }
+        "Whether to fold directories automatically and show compact folders when a directory has only one subdirectory inside." => {
+            "当目录内部只有一个子目录时，是否自动折叠目录并显示紧凑文件夹。".into()
+        }
         "Font size for agent response text in the agent panel. Falls back to the regular UI font size." => {
             "Agent 面板中 Agent 回复文本的字体大小。如果未设置，则使用界面字体大小。".into()
         }
@@ -700,7 +723,7 @@ fn gearbox_setting_description(text: &'static str) -> SharedString {
             "终端中鼠标滚轮滚动的倍率。".into()
         }
         "Display the terminal title in breadcrumbs inside the terminal pane." => {
-            "在终端窗格的面包屑中显示终端标题。".into()
+            "在终端窗格的路径导航中显示终端标题。".into()
         }
         "Key-value pairs to add to the terminal's environment." => {
             "添加到终端环境的键值对。".into()
@@ -748,7 +771,7 @@ fn gearbox_setting_description(text: &'static str) -> SharedString {
             "为 false 时，强制禁用垂直滚动条。".into()
         }
         "Border style for the minimap's scrollbar thumb." => "缩略图滚动条滑块的边框样式。".into(),
-        "Show breadcrumbs." => "显示面包屑。".into(),
+        "Show breadcrumbs." => "显示路径导航。".into(),
         "Which level to use to filter out diagnostics displayed in the editor." => {
             "用于筛选编辑器中显示的诊断的级别。".into()
         }
@@ -846,6 +869,85 @@ fn gearbox_setting_description(text: &'static str) -> SharedString {
         "Whether other hints should be shown." => "是否显示其他提示。".into(),
         "Whether and how to display code lenses from language servers." => {
             "是否以及如何显示语言服务器的代码透镜。".into()
+        }
+        "Determines the stepping granularity for debug operations." => {
+            "决定调试操作的单步执行粒度。".into()
+        }
+        "Whether breakpoints should be reused across Zed sessions." => {
+            "是否在 Gearbox 会话之间复用断点。".into()
+        }
+        "Time in milliseconds until timeout error when connecting to a TCP debug adapter." => {
+            "连接 TCP 调试适配器时触发超时错误前等待的毫秒数。".into()
+        }
+        "Whether to log messages between active debug adapters and Zed." => {
+            "是否记录活动调试适配器与 Gearbox 之间的消息。".into()
+        }
+        "Whether to format DAP messages when adding them to debug adapter logger." => {
+            "将 DAP 消息加入调试适配器日志器时是否格式化。".into()
+        }
+        "Whether alternate scroll mode is active by default (converts mouse scroll to arrow keys in apps like Vim)." => {
+            "是否默认启用备用滚动模式，将鼠标滚动转换为方向键输入，适用于 Vim 等应用。".into()
+        }
+        "The minimum APCA perceptual contrast between foreground and background colors (0-106)." => {
+            "前景色与背景色之间的最小 APCA 感知对比度（0-106）。".into()
+        }
+        "Whether the option key behaves as the meta key." => {
+            "Option 键是否作为 Meta 键使用。".into()
+        }
+        "Whether to keep the text selection after copying it to the clipboard." => {
+            "复制到剪贴板后是否保留文本选区。".into()
+        }
+        "Whether to play a sound when the BEL character (`\\a`, `0x07`) is printed" => {
+            "打印 BEL 字符（`\\a`，`0x07`）时是否播放声音。".into()
+        }
+        "Disable all Git integration features in Zed." => {
+            "禁用 Gearbox 的所有 Git 集成功能。".into()
+        }
+        "Show Git status information in the editor." => {
+            "在编辑器中显示 Git 状态信息。".into()
+        }
+        "Show Git diff information in the editor." => {
+            "在编辑器中显示 Git diff 信息。".into()
+        }
+        "Control whether Git status is shown in the editor's gutter." => {
+            "控制是否在编辑器边栏显示 Git 状态。".into()
+        }
+        "Debounce threshold in milliseconds after which changes are reflected in the Git gutter." => {
+            "变更反映到 Git 边栏前的防抖阈值，单位为毫秒。".into()
+        }
+        "Whether or not to show Git blame data for the currently focused line." => {
+            "是否显示当前聚焦行的 Git blame 数据。".into()
+        }
+        "Whether the microphone should be muted when joining a channel or a call." => {
+            "加入频道或通话时是否将麦克风静音。".into()
+        }
+        "Whether your current project should be shared when joining an empty channel." => {
+            "加入空频道时是否共享当前项目。".into()
+        }
+        "Test your microphone and speaker setup" => "测试麦克风和扬声器设置。".into(),
+        "Select output audio device" => "选择输出音频设备。".into(),
+        "Select input audio device" => "选择输入音频设备。".into(),
+        "Whether to disable all AI features in Zed." => {
+            "是否禁用 Gearbox 的所有 AI 功能。".into()
+        }
+        "Which side of the window the threads sidebar appears on." => {
+            "会话侧边栏显示在窗口的哪一侧。".into()
+        }
+        "Configure natively-included model providers." => {
+            "配置内置模型提供商。".into()
+        }
+        "View, add, and remove agents connected through the Agent Client Protocol." => {
+            "查看、添加和移除通过 Agent Client Protocol 连接的 Agent。".into()
+        }
+        "View, add, configure, and remove Model Context Protocol servers." => {
+            "查看、添加、配置和移除 Model Context Protocol 服务器。".into()
+        }
+        "View and manage agent skills installed globally or in project worktrees." => {
+            "查看和管理全局或项目 worktree 中安装的 Agent 技能。".into()
+        }
+        "The proxy to use for network requests." => "网络请求使用的代理。".into(),
+        "The URL of the Zed server to connect to." => {
+            "要连接的 Gearbox 服务器 URL。".into()
         }
         _ => ui::gearbox_translate_setting_description(text),
     }

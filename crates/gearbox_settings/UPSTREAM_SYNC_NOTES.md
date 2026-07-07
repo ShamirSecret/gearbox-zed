@@ -311,6 +311,7 @@ When syncing with upstream Zed, check these files first. The intended rule is:
 ### `crates/settings_ui/src/settings_ui.rs`
 
 - Adds Gearbox Chinese overrides for settings descriptions that are rendered from shared Settings UI metadata.
+- Adds exact Gearbox Chinese overrides for project panel, debugger, terminal, Git, collaboration, AI, and network setting descriptions that otherwise fall back to mixed word-by-word translation.
 - Keeps the translations in the `GEARBOX_GUI=1` display layer so upstream Zed settings behavior remains unchanged.
 
 ### `crates/ui/src/gearbox_text.rs`
