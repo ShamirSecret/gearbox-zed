@@ -238,3 +238,70 @@ When syncing with upstream Zed, check these files first. The intended rule is:
 
 - Routes Settings shared text and fallback descriptions through `ui::gearbox_translate_text`.
 - Keeps the existing Settings-specific exact translations, but lets the shared UI table cover deeper titles, enum labels, and descriptions.
+
+## 2026-07-07 Gearbox Settings Description Localization Follow-up
+
+### `crates/ui/src/gearbox_text.rs`
+
+- Adds multiline display-text localization so runtime-generated settings descriptions can be translated line by line.
+- Adds Gearbox Chinese translations for the deeper language-server settings descriptions shown under Settings > Languages & Tools > LSP.
+- Adds common dropdown labels such as `Find All References` and `Center` to the shared Gearbox GUI translation table.
+
+## 2026-07-07 Gearbox GUI Brand and Sentence Leakage Scan
+
+### `crates/ui/src/gearbox_text.rs`
+
+- Adds `translate_setting_description` for Settings descriptions so non-exact English descriptions use a restricted sentence-level Chinese fallback.
+- Adds a restricted visible-sentence fallback for ordinary GUI labels that look like complete English sentences.
+- Adds Gearbox translations for visible Zed AI, Copilot, update, extension built-in-support, Git support, and source-linking brand strings.
+- Keeps protocol strings, extension ABI identifiers, and service identifiers such as `zed://`, `x-zed-*`, and `zed:extension/*` out of this display translation path.
+
+### `crates/ui/src/ui.rs`
+
+- Exports `gearbox_translate_setting_description` for GUI crates that render Settings descriptions.
+
+### `crates/settings_ui/src/settings_ui.rs`
+
+- Routes Settings description fallback through `ui::gearbox_translate_setting_description` instead of the generic label/title translator.
+
+### `crates/ui/src/components/label/loading_label.rs`
+### `crates/ui/src/components/button/copy_button.rs`
+### `crates/ui/src/components/collab/update_button.rs`
+### `crates/ui/src/styles/typography.rs`
+
+- Routes loading labels, copy-button messages/tooltips, update-button messages, and headline text through the shared Gearbox display translator.
+- `HighlightedLabel` was intentionally not routed through translation because its highlight indices are byte offsets into the original text.
+
+## 2026-07-07 Gearbox GUI Leakage Follow-up
+
+### `crates/workspace/src/notifications.rs`
+
+- Routes message notification titles, secondary content, and primary action labels through the shared Gearbox display translator.
+- This catches notification text that does not directly enter through `Label::new` or `Button::new` call sites.
+
+### `crates/workspace/src/pane_group.rs`
+### `crates/collab_ui/src/notifications/incoming_call_notification.rs`
+
+- Adds Gearbox Chinese wording for dynamic collaboration location/share labels that include usernames and cannot be translated by exact string matching.
+
+### `crates/oauth_callback_server/src/oauth_callback_server.rs`
+
+- Adds Gearbox Chinese OAuth success/failure browser pages when `GEARBOX_GUI=1`.
+- Keeps the Zed wording when running the original GUI path.
+
+### `crates/debugger_ui/src/session/running.rs`
+### `crates/debugger_ui/src/new_process_modal.rs`
+
+- Adds Gearbox Chinese wording for a debugger scenario error and rebrands the debugger command placeholder when `GEARBOX_GUI=1`.
+
+### `crates/collab_ui/src/collab_panel.rs`
+
+- Removes visible `zed.dev/cla` branding from the Gearbox CLA error path.
+
+### `crates/extensions_ui/src/extensions_ui.rs`
+
+- Adds Gearbox Chinese wording for dynamic extension-version compatibility tooltips.
+
+### `crates/ui/src/gearbox_text.rs`
+
+- Adds exact translations for update, portal, Pro/payment, and notification strings that were found in the GUI leakage scan.

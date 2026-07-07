@@ -16,6 +16,11 @@
 pub fn oauth_callback_page(title: &str, message: &str, is_error: bool) -> String {
     let title = html_escape(title);
     let message = html_escape(message);
+    let app_name = if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") {
+        "Gearbox"
+    } else {
+        "Zed"
+    };
     let (icon_bg, icon_svg) = if is_error {
         (
             "#f38ba8",
@@ -33,7 +38,7 @@ pub fn oauth_callback_page(title: &str, message: &str, is_error: bool) -> String
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title} — Zed</title>
+<title>{title} — {app_name}</title>
 <style>
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
   body {{
@@ -307,8 +312,8 @@ mod server {
                     Ok(_) => (
                         200,
                         oauth_callback_page(
-                            "Authorization Successful",
-                            "You can close this tab and return to Zed.",
+                            if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") { "授权成功" } else { "Authorization Successful" },
+                            if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") { "你可以关闭此标签页并返回 Gearbox。" } else { "You can close this tab and return to Zed." },
                             false,
                         ),
                     ),
@@ -317,8 +322,8 @@ mod server {
                         (
                             400,
                             oauth_callback_page(
-                                "Authorization Failed",
-                                "Something went wrong. Please try again from Zed.",
+                                if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") { "授权失败" } else { "Authorization Failed" },
+                                if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") { "出现问题。请从 Gearbox 中重试。" } else { "Something went wrong. Please try again from Zed." },
                                 true,
                             ),
                         )

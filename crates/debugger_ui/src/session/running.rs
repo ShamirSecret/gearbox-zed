@@ -1216,7 +1216,11 @@ impl RunningState {
                 let Err(e) = request_type else {
                     unreachable!();
                 };
-                anyhow::bail!("Zed cannot determine how to run this debug scenario. `build` field was not provided and Debug Adapter won't accept provided configuration because: {e}");
+                if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") {
+                    anyhow::bail!("Gearbox 无法确定如何运行此调试场景。未提供 `build` 字段，并且调试适配器不接受当前配置，原因是：{e}");
+                } else {
+                    anyhow::bail!("Zed cannot determine how to run this debug scenario. `build` field was not provided and Debug Adapter won't accept provided configuration because: {e}");
+                }
             };
 
             Ok(DebugTaskDefinition {

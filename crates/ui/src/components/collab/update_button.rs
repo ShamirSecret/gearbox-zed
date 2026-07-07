@@ -27,7 +27,7 @@ impl UpdateButton {
             icon,
             icon_animate: false,
             icon_color: None,
-            message: message.into(),
+            message: crate::gearbox_text::translate(message),
             tooltip: None,
             disabled: false,
             show_dismiss: false,

@@ -227,7 +227,7 @@ impl Headline {
     pub fn new(text: impl Into<SharedString>) -> Self {
         Self {
             size: HeadlineSize::default(),
-            text: text.into(),
+            text: crate::gearbox_text::translate(text),
             color: Color::default(),
         }
     }

@@ -636,7 +636,7 @@ fn gearbox_setting_description(text: &'static str) -> SharedString {
         "Allow sending requests to Anthropic models that cannot be offered with Zero Data Retention." => {
             "允许向无法提供零数据保留的 Anthropic 模型发送请求。".into()
         }
-        _ => ui::gearbox_translate_text(text),
+        _ => ui::gearbox_translate_setting_description(text),
     }
 }
 const HEADER_GROUP_TAB_INDEX: isize = 3;

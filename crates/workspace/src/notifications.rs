@@ -721,7 +721,7 @@ pub mod simple_message_notification {
         where
             S: Into<SharedString>,
         {
-            self.primary_message = Some(message.into());
+            self.primary_message = Some(ui::gearbox_translate_text(message));
             self
         }
 
@@ -835,7 +835,7 @@ pub mod simple_message_notification {
         where
             S: Into<SharedString>,
         {
-            self.title = Some(title.into());
+            self.title = Some(ui::gearbox_translate_text(title));
             self
         }
 
@@ -846,7 +846,7 @@ pub mod simple_message_notification {
         }
 
         pub fn secondary_content<S: Into<SharedString>>(mut self, text: S) -> Self {
-            self.secondary_content = Some(text.into());
+            self.secondary_content = Some(ui::gearbox_translate_text(text));
             self
         }
 

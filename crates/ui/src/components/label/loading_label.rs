@@ -10,7 +10,7 @@ pub struct LoadingLabel {
 
 impl LoadingLabel {
     pub fn new(text: impl Into<SharedString>) -> Self {
-        let text = text.into();
+        let text = crate::gearbox_text::translate(text);
         LoadingLabel {
             base: Label::new(text.clone()),
             text,

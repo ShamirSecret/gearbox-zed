@@ -10,7 +10,40 @@ pub fn translate(text: impl Into<SharedString>) -> SharedString {
         return SharedString::new_static(translated);
     }
 
+    if let Some(translated) = multiline_translation(text.as_ref()) {
+        return translated;
+    }
+
+    if let Some(translated) = visible_sentence_translation(text.as_ref()) {
+        return translated;
+    }
+
     if let Some(translated) = title_translation(text.as_ref()) {
+        return translated;
+    }
+
+    if is_safe_brand_text(text.as_ref()) {
+        return text.as_ref().replace("Zed", "Gearbox").into();
+    }
+
+    text
+}
+
+pub fn translate_setting_description(text: impl Into<SharedString>) -> SharedString {
+    let text = text.into();
+    if std::env::var("GEARBOX_GUI").as_deref() != Ok("1") {
+        return text;
+    }
+
+    if let Some(translated) = exact_translation(text.as_ref()) {
+        return SharedString::new_static(translated);
+    }
+
+    if let Some(translated) = multiline_translation(text.as_ref()) {
+        return translated;
+    }
+
+    if let Some(translated) = settings_sentence_translation(text.as_ref()) {
         return translated;
     }
 
@@ -28,6 +61,406 @@ fn is_safe_brand_text(text: &str) -> bool {
         && !text.contains(':')
         && !text.contains('@')
         && text.len() <= 120
+}
+
+fn settings_sentence_translation(text: &str) -> Option<SharedString> {
+    if !is_safe_settings_sentence_text(text) {
+        return None;
+    }
+
+    let text = text.trim();
+    let (prefix, rest) = settings_sentence_prefix(text).unwrap_or(("", text));
+    let translated_rest = translate_sentence_fragment(rest);
+    let translated = format!("{prefix}{translated_rest}");
+
+    (translated != text && translated.chars().any(|character| character >= '\u{4e00}'))
+        .then(|| translated.into())
+}
+
+fn visible_sentence_translation(text: &str) -> Option<SharedString> {
+    if !(text.ends_with('.') || text.ends_with('!') || text.ends_with('?')) {
+        return None;
+    }
+
+    settings_sentence_translation(text)
+}
+
+fn is_safe_settings_sentence_text(text: &str) -> bool {
+    !text.is_empty()
+        && text.len() <= 600
+        && text.contains(' ')
+        && text.chars().any(|character| character.is_ascii_alphabetic())
+        && !text.contains("://")
+        && text
+            .chars()
+            .all(|character| !character.is_control() || character == '\n')
+}
+
+fn settings_sentence_prefix(text: &str) -> Option<(&'static str, &str)> {
+    for (english, chinese) in [
+        ("Whether or not to ", "是否"),
+        ("Whether to ", "是否"),
+        ("Whether the ", "是否"),
+        ("Whether ", "是否"),
+        ("Controls whether ", "控制是否"),
+        ("Control when to ", "控制何时"),
+        ("Control ", "控制"),
+        ("Show ", "显示"),
+        ("Use ", "使用"),
+        ("Enable ", "启用"),
+        ("Disable ", "禁用"),
+        ("When enabled, ", "启用后，"),
+        ("When disabled, ", "禁用后，"),
+        ("When false, ", "为 false 时，"),
+        ("When true, ", "为 true 时，"),
+        ("When to ", "何时"),
+        ("Where to ", "在哪里"),
+        ("What to ", "如何"),
+        ("Which ", "哪些"),
+        ("How to ", "如何"),
+        ("How ", "如何"),
+        ("Default ", "默认"),
+        ("Amount of ", ""),
+        ("Number of ", ""),
+        ("Maximum ", "最大"),
+        ("Minimum ", "最小"),
+        ("Files or globs of files that will be ", ""),
+        ("Globs to match ", "用于匹配"),
+        ("A mapping from ", ""),
+        ("The ", ""),
+    ] {
+        if let Some(rest) = text.strip_prefix(english) {
+            return Some((chinese, rest));
+        }
+    }
+
+    None
+}
+
+fn translate_sentence_fragment(text: &str) -> String {
+    let mut text = text.replace("Zed", "Gearbox");
+
+    for (english, chinese) in [
+        ("language servers", "语言服务器"),
+        ("language server", "语言服务器"),
+        ("code intelligence", "代码智能能力"),
+        ("project panel", "项目面板"),
+        ("status bar", "状态栏"),
+        ("titlebar", "标题栏"),
+        ("tab bar", "标签栏"),
+        ("terminal panel", "终端面板"),
+        ("outline panel", "大纲面板"),
+        ("Git panel", "Git 面板"),
+        ("git panel", "Git 面板"),
+        ("file finder", "文件查找器"),
+        ("search results", "搜索结果"),
+        ("line numbers", "行号"),
+        ("current line", "当前行"),
+        ("cursor position", "光标位置"),
+        ("active file", "活动文件"),
+        ("branch name", "分支名称"),
+        ("new features", "新功能"),
+        ("sign in button", "登录按钮"),
+        ("user menu button", "用户菜单按钮"),
+        ("window control buttons", "窗口控制按钮"),
+        ("window decorations", "窗口装饰"),
+        ("file icons", "文件图标"),
+        ("folder icons", "文件夹图标"),
+        ("Git status", "Git 状态"),
+        ("git status", "Git 状态"),
+        ("diagnostic errors", "诊断错误"),
+        ("diagnostic errors/warnings", "诊断错误/警告"),
+        ("error and warning count badges", "错误和警告计数徽标"),
+        ("drag-and-drop operations", "拖放操作"),
+        ("horizontal scrolling", "水平滚动"),
+        ("long file names", "长文件名"),
+        ("open tabs", "打开的标签页"),
+        ("preview tabs", "预览标签页"),
+        ("preview mode", "预览模式"),
+        ("code navigation", "代码导航"),
+        ("single file", "单个文件"),
+        ("bottom dock", "底部停靠区"),
+        ("centered layout", "居中布局"),
+        ("active pane", "活动窗格"),
+        ("zoomed panes", "缩放窗格"),
+        ("left or right", "左侧或右侧"),
+        ("nested items", "嵌套项"),
+        ("newly created files", "新建文件"),
+        ("external sources", "外部来源"),
+        ("linked directories", "链接目录"),
+        ("file scans", "文件扫描"),
+        ("file searches", "文件搜索"),
+        ("project file tree", "项目文件树"),
+        ("split diff view", "拆分 diff 视图"),
+        ("unified mode", "统一模式"),
+        ("case-sensitive search", "区分大小写搜索"),
+        ("case-sensitively", "区分大小写"),
+        ("whole words", "整词"),
+        ("regex search", "正则搜索"),
+        ("ignored files", "被忽略文件"),
+        ("gitignored files", "被 gitignore 忽略的文件"),
+        ("active language button", "活动语言按钮"),
+        ("active encoding", "活动编码"),
+        ("line endings button", "换行符按钮"),
+        ("project diagnostics button", "项目诊断按钮"),
+        ("project search button", "项目搜索按钮"),
+        ("debugger button", "调试器按钮"),
+        ("active file", "活动文件"),
+        ("branch icon", "分支图标"),
+        ("project host and name", "项目主机和名称"),
+        ("user picture", "用户头像"),
+        ("menus", "菜单"),
+        ("support is built-in to Gearbox", "支持已内置于 Gearbox"),
+        ("comes with basic Git support—more features are coming in the future", "内置基础 Git 支持，未来会加入更多功能"),
+        ("supports linking to a source line on GitHub and others", "支持链接到 GitHub 等平台上的源码行"),
+        ("is not compatible with this version of Gearbox", "与当前 Gearbox 版本不兼容"),
+        ("remote instance of Gearbox", "远程 Gearbox 实例"),
+    ] {
+        text = text.replace(english, chinese);
+    }
+
+    let mut translated = String::new();
+    let mut token = String::new();
+    for character in text.chars() {
+        if character.is_ascii_alphanumeric() || character == '_' {
+            token.push(character);
+        } else {
+            flush_sentence_token(&mut translated, &mut token);
+            translated.push(character);
+        }
+    }
+    flush_sentence_token(&mut translated, &mut token);
+
+    translated
+        .replace(" .", "。")
+        .replace(".", "。")
+        .replace(" ,", "，")
+        .replace(",", "，")
+}
+
+fn flush_sentence_token(translated: &mut String, token: &mut String) {
+    if token.is_empty() {
+        return;
+    }
+
+    if let Some(token_translation) = sentence_token_translation(token) {
+        translated.push_str(&token_translation);
+    } else {
+        translated.push_str(token);
+    }
+    token.clear();
+}
+
+fn sentence_token_translation(token: &str) -> Option<String> {
+    let lower = token.to_ascii_lowercase();
+    let translated = match lower.as_str() {
+        "a" | "an" | "the" | "to" | "of" | "in" | "on" | "for" | "from" | "with" | "by"
+        | "as" | "or" | "and" | "that" | "this" | "these" | "those" | "it" | "its" | "is"
+        | "are" | "be" | "been" | "being" => "",
+        "should" => "应",
+        "will" => "会",
+        "can" => "可以",
+        "when" => "当",
+        "while" => "当",
+        "after" => "之后",
+        "before" => "之前",
+        "based" => "基于",
+        "automatically" => "自动",
+        "auto" => "自动",
+        "default" => "默认",
+        "current" => "当前",
+        "active" => "活动",
+        "new" => "新建",
+        "previous" => "之前",
+        "reopening" => "重新打开",
+        "populate" => "填充",
+        "query" => "查询",
+        "under" => "下",
+        "cursor" => "光标",
+        "loop" => "循环",
+        "center" => "居中",
+        "match" => "匹配项",
+        "matches" => "匹配项",
+        "include" => "包含",
+        "ignored" => "被忽略",
+        "files" => "文件",
+        "file" => "文件",
+        "folders" => "文件夹",
+        "folder" => "文件夹",
+        "globs" => "glob 规则",
+        "excluded" => "排除",
+        "included" => "包含",
+        "entirely" => "完全",
+        "skipped" => "跳过",
+        "displayed" => "显示",
+        "display" => "显示",
+        "show" => "显示",
+        "hide" => "隐藏",
+        "open" => "打开",
+        "opened" => "打开",
+        "close" => "关闭",
+        "closed" => "关闭",
+        "closing" => "关闭",
+        "deleted" => "删除",
+        "restore" => "恢复",
+        "scan" => "扫描",
+        "searching" => "搜索",
+        "search" => "搜索",
+        "results" => "结果",
+        "button" => "按钮",
+        "buttons" => "按钮",
+        "indicator" => "指示器",
+        "indicators" => "指示器",
+        "badge" => "徽标",
+        "badges" => "徽标",
+        "icon" => "图标",
+        "icons" => "图标",
+        "name" => "名称",
+        "names" => "名称",
+        "entries" => "条目",
+        "entry" => "条目",
+        "directories" => "目录",
+        "directory" => "目录",
+        "pane" => "窗格",
+        "panes" => "窗格",
+        "panel" => "面板",
+        "panels" => "面板",
+        "tab" => "标签页",
+        "tabs" => "标签页",
+        "bar" => "栏",
+        "layout" => "布局",
+        "mode" => "模式",
+        "view" => "视图",
+        "list" => "列表",
+        "tree" => "树",
+        "flat" => "平铺",
+        "width" => "宽度",
+        "height" => "高度",
+        "size" => "大小",
+        "opacity" => "透明度",
+        "padding" => "内边距",
+        "spacing" => "间距",
+        "indentation" => "缩进",
+        "nested" => "嵌套",
+        "sort" => "排序",
+        "order" => "顺序",
+        "group" => "分组",
+        "collapse" => "折叠",
+        "untracked" => "未跟踪",
+        "diff" => "diff",
+        "status" => "状态",
+        "diagnostics" => "诊断",
+        "warnings" => "警告",
+        "errors" => "错误",
+        "terminal" => "终端",
+        "debugger" => "调试器",
+        "project" => "项目",
+        "editor" => "编辑器",
+        "git" => "Git",
+        "linux" => "Linux",
+        "macos" => "macOS",
+        "windows" => "Windows",
+        "true" => "true",
+        "false" => "false",
+        "left" => "左侧",
+        "right" => "右侧",
+        "top" => "顶部",
+        "bottom" => "底部",
+        "startup" => "启动",
+        "focus" => "聚焦",
+        "hover" => "悬停",
+        "hovers" => "悬停",
+        "flexible" => "弹性",
+        "proportional" => "比例",
+        "sizing" => "尺寸",
+        "docked" => "停靠",
+        "count" => "数量",
+        "pixels" => "像素",
+        "source" => "源",
+        "sources" => "来源",
+        "operations" => "操作",
+        "operation" => "操作",
+        "created" => "创建",
+        "pasting" => "粘贴",
+        "duplicating" => "复制",
+        "dropped" => "拖入",
+        "hidden" => "隐藏",
+        "root" => "根",
+        "only" => "仅",
+        "one" => "一个",
+        "inside" => "内部",
+        "parent" => "父级",
+        "compact" => "紧凑",
+        "bold" => "加粗",
+        "text" => "文本",
+        "scrollbar" => "滚动条",
+        "scrolling" => "滚动",
+        "disabled" => "禁用",
+        "enabled" => "启用",
+        "locked" => "锁定",
+        "long" => "长",
+        "clipped" => "裁剪",
+        "reveal" => "显示",
+        "corresponding" => "对应",
+        "becomes" => "变为",
+        "allow" => "允许",
+        "external" => "外部",
+        "case" => "大小写",
+        "sensitive" => "敏感",
+        "sensitively" => "敏感",
+        "whole" => "完整",
+        "words" => "词语",
+        "regex" => "正则",
+        "content" => "内容",
+        "linked" => "链接",
+        "broad" => "宽泛",
+        "slow" => "减慢",
+        "takes" => "优先",
+        "precedence" => "级别",
+        "inclusions" => "包含项",
+        "exclusions" => "排除项",
+        "narrower" => "更窄",
+        "switches" => "切换",
+        "unified" => "统一",
+        "set" => "设置",
+        "disable" => "禁用",
+        "columns" => "列",
+        "column" => "列",
+        "minimum" => "最小",
+        "maximum" => "最大",
+        _ => {
+            let mut chars = token.chars();
+            let first = chars.next()?;
+            let title_token = first.to_ascii_uppercase().to_string() + chars.as_str();
+            return title_token_translation(&title_token).map(ToString::to_string);
+        }
+    };
+
+    Some(translated.to_string())
+}
+
+fn multiline_translation(text: &str) -> Option<SharedString> {
+    if !text.contains('\n') {
+        return None;
+    }
+
+    let mut translated = String::new();
+    let mut translated_any = false;
+
+    for (index, line) in text.lines().enumerate() {
+        if index > 0 {
+            translated.push('\n');
+        }
+
+        if let Some(line_translation) = exact_translation(line) {
+            translated.push_str(line_translation);
+            translated_any = true;
+        } else {
+            translated.push_str(line);
+        }
+    }
+
+    translated_any.then(|| translated.into())
 }
 
 fn title_translation(text: &str) -> Option<SharedString> {
@@ -535,6 +968,63 @@ fn exact_translation(text: &str) -> Option<&'static str> {
         "Agent Panel" => "Agent 面板",
         "Zed Agent" => "Gearbox Agent",
         "Gearbox Agent" => "Gearbox Agent",
+        "Zed AI" => "Gearbox AI",
+        "Welcome to Zed AI" => "欢迎使用 Gearbox AI",
+        "Use GitHub Copilot in Zed" => "在 Gearbox 中使用 GitHub Copilot",
+        "To use Zed's agent with GitHub Copilot, you need to be logged in to GitHub. Note that your GitHub account must have an active Copilot Chat subscription." => {
+            "要在 Gearbox Agent 中使用 GitHub Copilot，你需要登录 GitHub。注意：你的 GitHub 账户必须拥有有效的 Copilot Chat 订阅。"
+        }
+        "Mix and match Zed's agent with any ACP-compatible agent" => {
+            "将 Gearbox Agent 与任何兼容 ACP 的 Agent 搭配使用"
+        }
+        "An update is required to continue using Zed AI." => {
+            "需要更新后才能继续使用 Gearbox AI。"
+        }
+        "A new version of Zed is available for download." => {
+            "有新的 Gearbox 版本可供下载。"
+        }
+        "Update Zed" => "更新 Gearbox",
+        "Zed needs an xdg-desktop-portal implementation to open files." => {
+            "Gearbox 需要 xdg-desktop-portal 实现才能打开文件。"
+        }
+        "Your are running an unsupported version of Zed. " => {
+            "你正在运行不受支持的 Gearbox 版本。"
+        }
+        "Upgrade to Zed Pro or contact us." => "请升级到 Gearbox Pro 或联系我们。",
+        "Check your payment status or contact us at billing-support@zed.dev to continue using this feature." => {
+            "请检查付款状态或联系我们，以继续使用此功能。"
+        }
+        "You have an outstanding invoice" => "你有一张未支付的账单",
+        "Claude Agent support is built-in to Zed!" => "Claude Agent 支持已内置于 Gearbox！",
+        "Codex CLI support is built-in to Zed!" => "Codex CLI 支持已内置于 Gearbox！",
+        "Gemini CLI support is built-in to Zed!" => "Gemini CLI 支持已内置于 Gearbox！",
+        "Basedpyright (Python language server) support is built-in to Zed!" => {
+            "Basedpyright（Python 语言服务器）支持已内置于 Gearbox！"
+        }
+        "Ruff (linter for Python) support is built-in to Zed!" => {
+            "Ruff（Python linter）支持已内置于 Gearbox！"
+        }
+        "Tailwind CSS support is built-in to Zed!" => "Tailwind CSS 支持已内置于 Gearbox！",
+        "Ty (Python language server) support is built-in to Zed!" => {
+            "Ty（Python 语言服务器）支持已内置于 Gearbox！"
+        }
+        "Zed comes with basic Git support—more features are coming in the future." => {
+            "Gearbox 内置基础 Git 支持，未来会加入更多功能。"
+        }
+        "Shell support is built-in to Zed!" => "Shell 支持已内置于 Gearbox！",
+        "C support is built-in to Zed!" => "C 支持已内置于 Gearbox！",
+        "C++ support is built-in to Zed!" => "C++ 支持已内置于 Gearbox！",
+        "Go support is built-in to Zed!" => "Go 支持已内置于 Gearbox！",
+        "Python support is built-in to Zed!" => "Python 支持已内置于 Gearbox！",
+        "React support is built-in to Zed!" => "React 支持已内置于 Gearbox！",
+        "Rust support is built-in to Zed!" => "Rust 支持已内置于 Gearbox！",
+        "Typescript support is built-in to Zed!" => "TypeScript 支持已内置于 Gearbox！",
+        "Zed supports linking to a source line on GitHub and others." => {
+            "Gearbox 支持链接到 GitHub 等平台上的源码行。"
+        }
+        "Vim support is built-in to Zed!" => "Vim 支持已内置于 Gearbox！",
+        "Zed Default" => "Gearbox 默认",
+        "Zed (Default)" => "Gearbox（默认）",
         "Selected Agent" => "已选择 Agent",
         "External Agents" => "外部 Agent",
         "Add More Agents" => "添加更多 Agent",
@@ -598,6 +1088,8 @@ fn exact_translation(text: &str) -> Option<&'static str> {
         "Go to Declaration" => "跳转到声明",
         "Go to Implementation" => "跳转到实现",
         "Go to References" => "跳转到引用",
+        "Find All References" => "查找所有引用",
+        "Center" => "居中",
         "Rename Symbol" => "重命名符号",
         "Markdown Preview" => "Markdown 预览",
         "Preview" => "预览",
@@ -874,6 +1366,33 @@ fn exact_translation(text: &str) -> Option<&'static str> {
         }
         "Minimum time to wait before pulling diagnostics from the language server(s)." => {
             "从语言服务器拉取诊断前等待的最短时间。"
+        }
+        "Whether to use language servers to provide code intelligence." => {
+            "是否使用语言服务器提供代码智能能力。"
+        }
+        "The list of language servers to use (or disable) for this language." => {
+            "此语言要使用或禁用的语言服务器列表。"
+        }
+        "Whether to perform linked edits of associated ranges, if the LS supports it. For example, when editing opening <html> tag, the contents of the closing </html> tag will be edited as well." => {
+            "如果语言服务器支持，是否对关联范围执行联动编辑。例如编辑开始 <html> 标签时，结束 </html> 标签的内容也会一起编辑。"
+        }
+        "Whether to follow-up empty Go to definition responses from the language server." => {
+            "语言服务器返回空的“跳转到定义”结果时，是否继续使用回退查找。"
+        }
+        "How to scroll the target into view when navigating to a definition or reference." => {
+            "跳转到定义或引用时，如何将目标滚动到视图中。"
+        }
+        "Off: Do not request semantic tokens from language servers." => {
+            "关闭：不从语言服务器请求语义标记。"
+        }
+        "Combined: Use LSP semantic tokens together with tree-sitter highlighting." => {
+            "组合：同时使用 LSP 语义标记和 tree-sitter 高亮。"
+        }
+        "Full: Use LSP semantic tokens exclusively, replacing tree-sitter highlighting." => {
+            "完整：只使用 LSP 语义标记，替代 tree-sitter 高亮。"
+        }
+        "When enabled, use folding ranges from the language server instead of indent-based folding." => {
+            "启用后，使用语言服务器提供的折叠范围，而不是基于缩进的折叠。"
         }
         _ => return None,
     })

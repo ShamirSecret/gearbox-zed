@@ -44,10 +44,10 @@ impl CopyButton {
     pub fn new(id: impl Into<ElementId>, message: impl Into<SharedString>) -> Self {
         Self {
             id: id.into(),
-            message: message.into(),
+            message: crate::gearbox_text::translate(message),
             icon_size: IconSize::Small,
             disabled: false,
-            tooltip_label: "Copy".into(),
+            tooltip_label: crate::gearbox_text::translate("Copy"),
             visible_on_hover: None,
             custom_on_click: None,
         }

@@ -16,7 +16,10 @@ mod traits;
 pub mod utils;
 
 pub use components::*;
-pub use gearbox_text::translate as gearbox_translate_text;
+pub use gearbox_text::{
+    translate as gearbox_translate_text,
+    translate_setting_description as gearbox_translate_setting_description,
+};
 pub use prelude::*;
 pub use styles::*;
 pub use traits::animation_ext::*;

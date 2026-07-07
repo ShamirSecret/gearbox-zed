@@ -1259,9 +1259,15 @@ impl ExtensionsPage {
                                     let version = extension.manifest.version.clone();
                                     move |_, cx| {
                                         Tooltip::simple(
-                                            format!(
-                                                "v{version} is not compatible with this version of Zed.",
-                                            ),
+                                            if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") {
+                                                format!(
+                                                    "v{version} 与当前 Gearbox 版本不兼容。",
+                                                )
+                                            } else {
+                                                format!(
+                                                    "v{version} is not compatible with this version of Zed.",
+                                                )
+                                            },
                                              cx,
                                         )
                                     }

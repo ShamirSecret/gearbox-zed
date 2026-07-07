@@ -1400,7 +1400,11 @@ impl CollabPanel {
                             })
                             .detach_and_prompt_err("Failed to grant write access", window, cx, |e, _, _| {
                                 match e.error_code() {
-                                    ErrorCode::NeedsCla => Some("This user has not yet signed the CLA at https://zed.dev/cla.".into()),
+                                    ErrorCode::NeedsCla => Some(if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") {
+                                        "此用户尚未签署 CLA。".into()
+                                    } else {
+                                        "This user has not yet signed the CLA at https://zed.dev/cla.".into()
+                                    }),
                                     _ => None,
                                 }
                             })
