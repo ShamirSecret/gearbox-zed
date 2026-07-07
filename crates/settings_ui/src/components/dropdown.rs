@@ -7,6 +7,33 @@ use ui::{
     IconPosition, px,
 };
 
+fn gearbox_dropdown_label(label: &str, should_do_title_case: bool) -> String {
+    let label = if should_do_title_case {
+        label.to_title_case()
+    } else {
+        label.to_string()
+    };
+
+    if std::env::var("GEARBOX_GUI").as_deref() != Ok("1") {
+        return label;
+    }
+
+    match label.as_str() {
+        "Empty Tab" => "空白标签页".to_string(),
+        "Last Workspace" => "上次工作区".to_string(),
+        "Last Session" => "上次会话".to_string(),
+        "Launchpad" => "启动页".to_string(),
+        "Always" => "始终".to_string(),
+        "Never" => "从不".to_string(),
+        "On" => "开启".to_string(),
+        "Off" => "关闭".to_string(),
+        "System" => "跟随系统".to_string(),
+        "Light" => "浅色".to_string(),
+        "Dark" => "深色".to_string(),
+        _ => label.replace("Zed", "Gearbox"),
+    }
+}
+
 #[derive(IntoElement)]
 pub struct EnumVariantDropdown<T>
 where
@@ -87,11 +114,7 @@ where
                     let on_change = self.on_change.clone();
                     let current_value = self.current_value;
                     menu = menu.toggleable_entry(
-                        if self.should_do_title_case {
-                            label.to_title_case()
-                        } else {
-                            label.to_string()
-                        },
+                        gearbox_dropdown_label(label, self.should_do_title_case),
                         value == current_value,
                         IconPosition::End,
                         None,
@@ -106,11 +129,7 @@ where
 
         DropdownMenu::new(
             self.id,
-            if self.should_do_title_case {
-                current_value_label.to_title_case()
-            } else {
-                current_value_label.to_string()
-            },
+            gearbox_dropdown_label(current_value_label, self.should_do_title_case),
             context_menu,
         )
         .when_some(self.aria_label, |this, label| this.aria_label(label))

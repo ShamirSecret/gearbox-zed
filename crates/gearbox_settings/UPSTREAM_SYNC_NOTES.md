@@ -106,11 +106,17 @@ When syncing with upstream Zed, check these files first. The intended rule is:
 
 - Localizes the Ollama model picker placeholder only when `GEARBOX_GUI=1`.
 
+### `crates/settings_ui/src/components/dropdown.rs`
+
+- Adds Gearbox-only display translations for common enum dropdown values such as `Last Session`, `Last Workspace`, `Empty Tab`, and simple on/off/system labels.
+- Internal enum values and serialized settings remain unchanged.
+
 ### `crates/settings_ui/src/settings_ui.rs`
 
 - Adds Gearbox display helpers for settings pages, section headers, item titles, descriptions, subpage links, action links, navigation entries, breadcrumbs, and the settings window title.
 - Keeps the upstream settings data model unchanged; translations happen at render time when `GEARBOX_GUI=1`.
 - Dynamically displays `Zed` as `Gearbox` in settings descriptions only when `GEARBOX_GUI=1`.
+- Localizes deeper settings UI labels such as search placeholder, settings-file buttons, user/project/server scope labels, workspace restoration settings, telemetry settings, and scoped settings only when `GEARBOX_GUI=1`.
 
 ### `crates/settings_ui/src/pages/edit_prediction_provider_setup.rs`
 

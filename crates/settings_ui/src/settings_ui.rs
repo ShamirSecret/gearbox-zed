@@ -96,6 +96,15 @@ fn gearbox_text(text: &'static str) -> &'static str {
         "Privacy" => "隐私",
         "Telemetry" => "遥测",
         "Security" => "安全",
+        "Workspace Restoration" => "工作区恢复",
+        "Restore Unsaved Buffers" => "恢复未保存的缓冲区",
+        "Restore On Startup" => "启动时恢复",
+        "Scoped Settings" => "作用域设置",
+        "Preview Channel" => "预览频道",
+        "Settings Profiles" => "设置配置档案",
+        "Telemetry Diagnostics" => "遥测诊断",
+        "Telemetry Metrics" => "遥测指标",
+        "Anthropic Data Retention" => "Anthropic 数据保留",
         "Theme" => "主题",
         "Icon Theme" => "图标主题",
         "Font" => "字体",
@@ -130,6 +139,10 @@ fn gearbox_text(text: &'static str) -> &'static str {
         "Use System Prompts" => "使用系统确认对话框",
         "Redact Private Values" => "隐藏私密值",
         "Configure" => "配置",
+        "Edit in settings.json" => "编辑 settings.json",
+        "User" => "用户",
+        "Project" => "项目",
+        "Server" => "服务器",
         "Reset to Default" => "恢复默认值",
         "Overridden by Organization" => "已被组织配置覆盖",
         "Contact your organization admins to adjust this setting." => {
@@ -175,7 +188,28 @@ fn gearbox_setting_description(text: &'static str) -> SharedString {
         }
         "Use native OS dialogs for confirmations." => "确认操作时使用操作系统原生对话框。".into(),
         "Hide the values of variables in private files." => "隐藏私密文件中的变量值。".into(),
-        _ => text.replace("Zed", "Gearbox").replace("zed", "gearbox").into(),
+        "Whether or not to restore unsaved buffers on restart." => {
+            "重启后是否恢复未保存的缓冲区。".into()
+        }
+        "What to restore from the previous session when opening Zed." => {
+            "打开 Gearbox 时从上一次会话中恢复哪些内容。".into()
+        }
+        "Which settings should be activated only in Preview build of Zed." => {
+            "哪些设置只在 Gearbox Preview 构建中启用。".into()
+        }
+        "Any number of settings profiles that are temporarily applied on top of your existing user settings." => {
+            "可配置任意数量的设置配置档案，临时叠加在现有用户设置之上。".into()
+        }
+        "Send debug information like crash reports." => {
+            "发送崩溃报告等调试信息。".into()
+        }
+        "Send anonymized usage data like what languages you're using Zed with." => {
+            "发送匿名使用数据，例如你在 Gearbox 中使用哪些语言。".into()
+        }
+        "Allow sending requests to Anthropic models that cannot be offered with Zero Data Retention." => {
+            "允许向无法提供零数据保留的 Anthropic 模型发送请求。".into()
+        }
+        _ => text.replace("Zed", "Gearbox").into(),
     }
 }
 const HEADER_GROUP_TAB_INDEX: isize = 3;
@@ -616,12 +650,12 @@ fn init_renderers(cx: &mut App) {
                     settings_window,
                     item,
                     settings_file,
-                    Button::new("open-in-settings-file", "Edit in settings.json")
+                    Button::new("open-in-settings-file", gearbox_text("Edit in settings.json"))
                         .style(ButtonStyle::Outlined)
                         .size(ButtonSize::Medium)
                         .tab_index(0_isize)
                         .tooltip(Tooltip::for_action_title_in(
-                            "Edit in settings.json",
+                            gearbox_text("Edit in settings.json"),
                             &OpenCurrentFile,
                             &settings_window.focus_handle,
                         ))
@@ -1816,9 +1850,9 @@ enum SettingsUiFile {
 impl SettingsUiFile {
     fn setting_type(&self) -> &'static str {
         match self {
-            SettingsUiFile::User => "User",
-            SettingsUiFile::Project(_) => "Project",
-            SettingsUiFile::Server(_) => "Server",
+            SettingsUiFile::User => gearbox_text("User"),
+            SettingsUiFile::Project(_) => gearbox_text("Project"),
+            SettingsUiFile::Server(_) => gearbox_text("Server"),
         }
     }
 
@@ -1880,7 +1914,15 @@ impl SettingsWindow {
         let current_file = SettingsUiFile::User;
         let search_bar = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text("Search settings…", window, cx);
+            editor.set_placeholder_text(
+                if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") {
+                    "搜索设置..."
+                } else {
+                    "Search settings…"
+                },
+                window,
+                cx,
+            );
             editor
         });
         cx.subscribe(&search_bar, |this, _, event: &EditorEvent, cx| {
@@ -3027,11 +3069,11 @@ impl SettingsWindow {
                     }),
             )
             .child(
-                Button::new(edit_in_json_id, "Edit in settings.json")
+                Button::new(edit_in_json_id, gearbox_text("Edit in settings.json"))
                     .tab_index(0_isize)
                     .style(ButtonStyle::OutlinedGhost)
                     .tooltip(Tooltip::for_action_title_in(
-                        "Edit in settings.json",
+                        gearbox_text("Edit in settings.json"),
                         &OpenCurrentFile,
                         &self.focus_handle,
                     ))
@@ -3043,7 +3085,7 @@ impl SettingsWindow {
 
     pub(crate) fn display_name(&self, file: &SettingsUiFile) -> Option<String> {
         match file {
-            SettingsUiFile::User => Some("User".to_string()),
+            SettingsUiFile::User => Some(gearbox_text("User").to_string()),
             SettingsUiFile::Project((worktree_id, path)) => self
                 .worktree_root_dirs
                 .get(&worktree_id)
@@ -3865,7 +3907,7 @@ impl SettingsWindow {
                         .flex_shrink_0()
                         .when(current_sub_page.link.in_json, |this| {
                             this.child(
-                                Button::new("open-in-settings-file", "Edit in settings.json")
+                                Button::new("open-in-settings-file", gearbox_text("Edit in settings.json"))
                                     .tab_index(0_isize)
                                     .style(ButtonStyle::OutlinedGhost)
                                     .tooltip(Tooltip::for_action_title_in(
