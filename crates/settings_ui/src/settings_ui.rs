@@ -627,14 +627,225 @@ fn gearbox_setting_description(text: &'static str) -> SharedString {
         "Any number of settings profiles that are temporarily applied on top of your existing user settings." => {
             "可配置任意数量的设置配置档案，临时叠加在现有用户设置之上。".into()
         }
-        "Send debug information like crash reports." => {
-            "发送崩溃报告等调试信息。".into()
-        }
+        "Send debug information like crash reports." => "发送崩溃报告等调试信息。".into(),
         "Send anonymized usage data like what languages you're using Zed with." => {
             "发送匿名使用数据，例如你在 Gearbox 中使用哪些语言。".into()
         }
         "Allow sending requests to Anthropic models that cannot be offered with Zero Data Retention." => {
             "允许向无法提供零数据保留的 Anthropic 模型发送请求。".into()
+        }
+        "What shell to use when opening a terminal." => "打开终端时使用哪个 shell。".into(),
+        "What working directory to use when launching the terminal." => {
+            "启动终端时使用哪个工作目录。".into()
+        }
+        "Activates the Python virtual environment, if one is found, in the terminal's working directory." => {
+            "如果在终端工作目录中找到 Python 虚拟环境，则自动激活。".into()
+        }
+        "Font size for terminal text. If not set, defaults to buffer font size." => {
+            "终端文本字体大小。如果未设置，则使用缓冲区字体大小。".into()
+        }
+        "Font family for terminal text. If not set, defaults to buffer font family." => {
+            "终端文本字体族。如果未设置，则使用缓冲区字体族。".into()
+        }
+        "Font fallbacks for terminal text. If not set, defaults to buffer font fallbacks." => {
+            "终端文本备用字体。如果未设置，则使用缓冲区备用字体。".into()
+        }
+        "Font family for editor text." => "编辑器文本字体族。".into(),
+        "Font size for editor text." => "编辑器文本字体大小。".into(),
+        "Font weight for editor text (100-900)." => "编辑器文本字体粗细（100-900）。".into(),
+        "Line height for editor text." => "编辑器文本行高。".into(),
+        "Font family for UI elements." => "界面元素字体族。".into(),
+        "Font size for UI elements." => "界面元素字体大小。".into(),
+        "Font weight for UI elements (100-900)." => "界面元素字体粗细（100-900）。".into(),
+        "The OpenType features to enable for rendering in text buffers." => {
+            "为文本缓冲区渲染启用的 OpenType 特性。".into()
+        }
+        "The font fallbacks to use for rendering in text buffers." => {
+            "用于文本缓冲区渲染的备用字体。".into()
+        }
+        "Font size for agent response text in the agent panel. Falls back to the regular UI font size." => {
+            "Agent 面板中 Agent 回复文本的字体大小。如果未设置，则使用界面字体大小。".into()
+        }
+        "Font size for user messages text in the agent panel." => {
+            "Agent 面板中用户消息文本的字体大小。".into()
+        }
+        "Font family for the markdown preview. Falls back to the UI font family." => {
+            "Markdown 预览的字体族。如果未设置，则使用界面字体族。".into()
+        }
+        "Font family for code blocks in the markdown preview. Falls back to the editor font family." => {
+            "Markdown 预览中代码块的字体族。如果未设置，则使用编辑器字体族。".into()
+        }
+        "Font size for the markdown preview. Falls back to the editor font size." => {
+            "Markdown 预览的字体大小。如果未设置，则使用编辑器字体大小。".into()
+        }
+        "Font weight for terminal text in CSS weight units (100-900)." => {
+            "终端文本字体粗细，使用 CSS 粗细单位（100-900）。".into()
+        }
+        "Font features for terminal text." => "终端文本字体特性。".into(),
+        "Line height for terminal text." => "终端文本行高。".into(),
+        "Default cursor shape for the terminal (bar, block, underline, or hollow)." => {
+            "终端默认光标形状（竖线、方块、下划线或空心）。".into()
+        }
+        "Sets the cursor blinking behavior in the terminal." => "设置终端中光标闪烁行为。".into(),
+        "Whether selecting text in the terminal automatically copies to the system clipboard." => {
+            "在终端中选择文本时是否自动复制到系统剪贴板。".into()
+        }
+        "Default width when the terminal is docked to the left or right (in pixels)." => {
+            "终端停靠在左侧或右侧时的默认宽度（像素）。".into()
+        }
+        "Default height when the terminal is docked to the bottom (in pixels)." => {
+            "终端停靠在底部时的默认高度（像素）。".into()
+        }
+        "The multiplier for scrolling in the terminal with the mouse wheel" => {
+            "终端中鼠标滚轮滚动的倍率。".into()
+        }
+        "Display the terminal title in breadcrumbs inside the terminal pane." => {
+            "在终端窗格的面包屑中显示终端标题。".into()
+        }
+        "Key-value pairs to add to the terminal's environment." => {
+            "添加到终端环境的键值对。".into()
+        }
+        "An optional string to override the title of the terminal tab." => {
+            "用于覆盖终端标签页标题的可选字符串。".into()
+        }
+        "Modifier key for adding multiple cursors." => "添加多个光标的修饰键。".into(),
+        "Whether the cursor blinks in the editor." => "编辑器中光标是否闪烁。".into(),
+        "When to hide the mouse cursor." => "何时隐藏鼠标光标。".into(),
+        "Show code action button at start of buffer line." => {
+            "在缓冲区行首显示代码操作按钮。".into()
+        }
+        "Show buffer search result indicators in the scrollbar." => {
+            "在滚动条中显示缓冲区搜索结果指示器。".into()
+        }
+        "Show the terminal button in the status bar." => "在状态栏显示终端按钮。".into(),
+        "Show the project diagnostics button in the status bar." => {
+            "在状态栏显示项目诊断按钮。".into()
+        }
+        "Show the project search button in the status bar." => "在状态栏显示项目搜索按钮。".into(),
+        "Show the debugger button in the status bar." => "在状态栏显示调试器按钮。".into(),
+        "Show the name of the active file in the status bar." => "在状态栏显示当前文件名。".into(),
+        "Show git status indicators on the branch icon in the titlebar." => {
+            "在标题栏的分支图标上显示 Git 状态指示器。".into()
+        }
+        "Show the branch name button in the titlebar." => "在标题栏显示分支名称按钮。".into(),
+        "Show runnable buttons in the gutter." => "在边栏显示可运行项按钮。".into(),
+        "When to show the scrollbar in the editor." => "何时在编辑器中显示滚动条。".into(),
+        "Show cursor positions in the scrollbar." => "在滚动条中显示光标位置。".into(),
+        "Show Git diff indicators in the scrollbar." => "在滚动条中显示 Git Diff 指示器。".into(),
+        "Show selected text occurrences in the scrollbar." => {
+            "在滚动条中显示选中文本的出现位置。".into()
+        }
+        "Show selected symbol occurrences in the scrollbar." => {
+            "在滚动条中显示选中符号的出现位置。".into()
+        }
+        "Which diagnostic indicators to show in the scrollbar." => {
+            "在滚动条中显示哪些诊断指示器。".into()
+        }
+        "When false, forcefully disables the horizontal scrollbar." => {
+            "为 false 时，强制禁用水平滚动条。".into()
+        }
+        "When false, forcefully disables the vertical scrollbar." => {
+            "为 false 时，强制禁用垂直滚动条。".into()
+        }
+        "Border style for the minimap's scrollbar thumb." => "缩略图滚动条滑块的边框样式。".into(),
+        "Show breadcrumbs." => "显示面包屑。".into(),
+        "Which level to use to filter out diagnostics displayed in the editor." => {
+            "用于筛选编辑器中显示的诊断的级别。".into()
+        }
+        "Whether to show warnings or not by default." => "默认是否显示警告。".into(),
+        "Whether to show diagnostics inline or not." => "是否行内显示诊断。".into(),
+        "The delay in milliseconds to show inline diagnostics after the last diagnostic update." => {
+            "最后一次诊断更新后显示行内诊断的延迟（毫秒）。".into()
+        }
+        "The amount of padding between the end of the source line and the start of the inline diagnostic." => {
+            "源代码行末尾与行内诊断开始之间的内边距。".into()
+        }
+        "The minimum column at which to display inline diagnostics." => {
+            "显示行内诊断的最小列号。".into()
+        }
+        "Whether to pull for language server-powered diagnostics or not." => {
+            "是否从语言服务器拉取诊断。".into()
+        }
+        "Minimum time to wait before pulling diagnostics from the language server(s)." => {
+            "从语言服务器拉取诊断前的最小等待时间。".into()
+        }
+        "Use gitignored files when searching." => "搜索时使用被 gitignore 忽略的文件。".into(),
+        "How to display diffs in the editor." => "在编辑器中如何显示 diff。".into(),
+        "Show the project panel button in the status bar." => "在状态栏显示项目面板按钮。".into(),
+        "Show the active language button in the status bar." => "在状态栏显示当前语言按钮。".into(),
+        "Control when to show the active encoding in the status bar." => {
+            "控制何时在状态栏显示当前编码。".into()
+        }
+        "Show the cursor position button in the status bar." => "在状态栏显示光标位置按钮。".into(),
+        "Show the active line endings button in the status bar." => {
+            "在状态栏显示换行符按钮。".into()
+        }
+        "The custom set of icons Zed will associate with files and directories." => {
+            "Gearbox 用于文件和目录的自定义图标集。".into()
+        }
+        "The name of your selected icon theme." => "已选择的图标主题名称。".into(),
+        "Choose whether to use the selected light or dark icon theme or to follow your OS appearance configuration." => {
+            "选择使用浅色或深色图标主题，还是跟随操作系统外观配置。".into()
+        }
+        "The icon theme to use when mode is set to light, or when mode is set to system and it is in light mode." => {
+            "模式为浅色或跟随系统且处于浅色模式时使用的图标主题。".into()
+        }
+        "The icon theme to use when mode is set to dark, or when mode is set to system and it is in dark mode." => {
+            "模式为深色或跟随系统且处于深色模式时使用的图标主题。".into()
+        }
+        "Automatically show a signature help pop-up." => "自动显示签名帮助弹窗。".into(),
+        "Time to wait in milliseconds before showing the informational hover box." => {
+            "显示信息悬停框前的等待时间（毫秒）。".into()
+        }
+        "When to show the minimap in the editor." => "何时在编辑器中显示缩略图。".into(),
+        "Where to show the minimap in the editor." => "在编辑器的哪个位置显示缩略图。".into(),
+        "When to show the minimap thumb." => "何时显示缩略图滑块。".into(),
+        "Maximum number of columns to display in the minimap." => "缩略图中显示的最大列数。".into(),
+        "Show the selections menu in the editor toolbar." => "在编辑器工具栏显示选择菜单。".into(),
+        "Show agent review buttons in the editor toolbar." => {
+            "在编辑器工具栏显示 Agent 审查按钮。".into()
+        }
+        "Show code action buttons in the editor toolbar." => {
+            "在编辑器工具栏显示代码操作按钮。".into()
+        }
+        "Whether edit predictions are shown in normal mode. By default, edit predictions are only shown in insert and replace modes." => {
+            "是否在普通模式下显示编辑预测。默认情况下，编辑预测仅在插入和替换模式下显示。".into()
+        }
+        "How line endings should be handled for new files and during format and save operations." => {
+            "新文件以及格式化和保存操作时如何处理换行符。".into()
+        }
+        "Whether to show tabs and spaces in the editor." => {
+            "是否在编辑器中显示制表符和空格。".into()
+        }
+        "Visible character used to render space characters when show_whitespaces is enabled (default: \"•\")" => {
+            "启用显示空白字符时用于渲染空格的可见字符（默认：\"•\"）。".into()
+        }
+        "Visible character used to render tab characters when show_whitespaces is enabled (default: \"→\")" => {
+            "启用显示空白字符时用于渲染制表符的可见字符（默认：\"→\"）。".into()
+        }
+        "Whether to pop the completions menu while typing in an editor without explicitly requesting it." => {
+            "在编辑器中输入时是否自动弹出补全菜单。".into()
+        }
+        "Whether to display inline and alongside documentation for items in the completions menu." => {
+            "是否在补全菜单中行内和侧边显示文档。".into()
+        }
+        "How many characters has to be in the completions query to automatically show the words-based completions." => {
+            "补全查询中需要多少个字符才能自动显示基于单词的补全。".into()
+        }
+        "When to show the scrollbar in the completion menu." => {
+            "何时在补全菜单中显示滚动条。".into()
+        }
+        "Whether to align detail text in code completions context menus left or right." => {
+            "代码补全上下文菜单中的详细文本是左对齐还是右对齐。".into()
+        }
+        "How to display the LSP item kind (function, method, variable, etc.) of each entry in the completions menu." => {
+            "如何显示补全菜单中每个条目的 LSP 项类型（函数、方法、变量等）。".into()
+        }
+        "Whether type hints should be shown." => "是否显示类型提示。".into(),
+        "Whether parameter hints should be shown." => "是否显示参数提示。".into(),
+        "Whether other hints should be shown." => "是否显示其他提示。".into(),
+        "Whether and how to display code lenses from language servers." => {
+            "是否以及如何显示语言服务器的代码透镜。".into()
         }
         _ => ui::gearbox_translate_setting_description(text),
     }
@@ -1737,7 +1948,8 @@ impl SettingsPageItem {
 
         match self {
             SettingsPageItem::SectionHeader(header) => {
-                SettingsSectionHeader::new(SharedString::new_static(gearbox_text(header))).into_any_element()
+                SettingsSectionHeader::new(SharedString::new_static(gearbox_text(header)))
+                    .into_any_element()
             }
             SettingsPageItem::SettingItem(setting_item) => {
                 let (field_with_padding, _) =
@@ -1995,8 +2207,8 @@ fn render_settings_item_layout(
                                 } else {
                                     format!("\u{2014}  Modified in {modified_in}")
                                 })
-                                    .color(Color::Muted)
-                                    .size(LabelSize::Small),
+                                .color(Color::Muted)
+                                .size(LabelSize::Small),
                             )
                         }),
                 )
@@ -2060,7 +2272,9 @@ fn render_settings_item(
                         Tooltip::with_meta(
                             gearbox_text("Overridden by Organization"),
                             None,
-                            gearbox_text("Contact your organization admins to adjust this setting."),
+                            gearbox_text(
+                                "Contact your organization admins to adjust this setting.",
+                            ),
                             cx,
                         )
                     }),
@@ -4334,17 +4548,22 @@ impl SettingsWindow {
                         .flex_shrink_0()
                         .when(current_sub_page.link.in_json, |this| {
                             this.child(
-                                Button::new("open-in-settings-file", gearbox_text("Edit in settings.json"))
-                                    .tab_index(0_isize)
-                                    .style(ButtonStyle::OutlinedGhost)
-                                    .tooltip(Tooltip::for_action_title_in(
-                                        "Edit in settings.json",
-                                        &OpenCurrentFile,
-                                        &self.focus_handle,
-                                    ))
-                                    .on_click(cx.listener(|this, _, window, cx| {
+                                Button::new(
+                                    "open-in-settings-file",
+                                    gearbox_text("Edit in settings.json"),
+                                )
+                                .tab_index(0_isize)
+                                .style(ButtonStyle::OutlinedGhost)
+                                .tooltip(Tooltip::for_action_title_in(
+                                    "Edit in settings.json",
+                                    &OpenCurrentFile,
+                                    &self.focus_handle,
+                                ))
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
                                         this.open_current_settings_file(window, cx);
-                                    })),
+                                    },
+                                )),
                             )
                         })
                         .when(is_llm_providers_page, |this| {

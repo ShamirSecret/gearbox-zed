@@ -305,3 +305,28 @@ When syncing with upstream Zed, check these files first. The intended rule is:
 ### `crates/ui/src/gearbox_text.rs`
 
 - Adds exact translations for update, portal, Pro/payment, and notification strings that were found in the GUI leakage scan.
+
+## 2026-07-07 Gearbox settings localization coverage
+
+### `crates/settings_ui/src/settings_ui.rs`
+
+- Adds Gearbox Chinese overrides for settings descriptions that are rendered from shared Settings UI metadata.
+- Keeps the translations in the `GEARBOX_GUI=1` display layer so upstream Zed settings behavior remains unchanged.
+
+### `crates/ui/src/gearbox_text.rs`
+
+- Extends the shared Gearbox text translation layer with exact settings strings and sentence-token vocabulary used by the settings UI.
+- Preserves this shared-source override so future upstream syncs can keep Gearbox Chinese settings coverage without renaming upstream internals.
+
+## 2026-07-07 Gearbox GitHub Release Workflow
+
+### `.github/workflows/gearbox_release.yml`
+
+- Adds a Gearbox-only GitHub Actions release workflow instead of modifying Zed's upstream `.github/workflows/release.yml` or `.github/workflows/run_bundling.yml`.
+- Builds `--package gearbox` on GitHub-hosted runners for Linux x86_64, macOS aarch64, macOS x86_64, and Windows x86_64.
+- Uploads platform archives and installer packages as workflow artifacts on every run.
+- Publishes those artifacts to a GitHub Release when the workflow runs from a tag or when `workflow_dispatch` provides `release_tag`.
+- Produces Linux `.deb`, macOS `.dmg`, and Windows Inno Setup `.exe` installer artifacts, while keeping zip/tar archives as fallback assets.
+- Uses GitHub Release assets instead of Zed's blob store, Sentry, Slack, self-hosted runners, official signing, notarization, and store publication steps.
+- Current installers are community Gearbox packages: macOS artifacts are not notarized, Windows artifacts are not code-signed, and Linux only emits a `.deb` package.
+- Keep this workflow separate when syncing upstream so Zed's official release workflow can continue to be compared or copied forward without merge noise.

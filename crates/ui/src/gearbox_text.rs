@@ -89,7 +89,9 @@ fn is_safe_settings_sentence_text(text: &str) -> bool {
     !text.is_empty()
         && text.len() <= 600
         && text.contains(' ')
-        && text.chars().any(|character| character.is_ascii_alphabetic())
+        && text
+            .chars()
+            .any(|character| character.is_ascii_alphabetic())
         && !text.contains("://")
         && text
             .chars()
@@ -211,9 +213,18 @@ fn translate_sentence_fragment(text: &str) -> String {
         ("user picture", "用户头像"),
         ("menus", "菜单"),
         ("support is built-in to Gearbox", "支持已内置于 Gearbox"),
-        ("comes with basic Git support—more features are coming in the future", "内置基础 Git 支持，未来会加入更多功能"),
-        ("supports linking to a source line on GitHub and others", "支持链接到 GitHub 等平台上的源码行"),
-        ("is not compatible with this version of Gearbox", "与当前 Gearbox 版本不兼容"),
+        (
+            "comes with basic Git support—more features are coming in the future",
+            "内置基础 Git 支持，未来会加入更多功能",
+        ),
+        (
+            "supports linking to a source line on GitHub and others",
+            "支持链接到 GitHub 等平台上的源码行",
+        ),
+        (
+            "is not compatible with this version of Gearbox",
+            "与当前 Gearbox 版本不兼容",
+        ),
         ("remote instance of Gearbox", "远程 Gearbox 实例"),
     ] {
         text = text.replace(english, chinese);
@@ -254,9 +265,9 @@ fn flush_sentence_token(translated: &mut String, token: &mut String) {
 fn sentence_token_translation(token: &str) -> Option<String> {
     let lower = token.to_ascii_lowercase();
     let translated = match lower.as_str() {
-        "a" | "an" | "the" | "to" | "of" | "in" | "on" | "for" | "from" | "with" | "by"
-        | "as" | "or" | "and" | "that" | "this" | "these" | "those" | "it" | "its" | "is"
-        | "are" | "be" | "been" | "being" => "",
+        "a" | "an" | "the" | "to" | "of" | "in" | "on" | "for" | "from" | "with" | "by" | "as"
+        | "or" | "and" | "that" | "this" | "these" | "those" | "it" | "its" | "is" | "are"
+        | "be" | "been" | "being" => "",
         "should" => "应",
         "will" => "会",
         "can" => "可以",
@@ -428,6 +439,74 @@ fn sentence_token_translation(token: &str) -> Option<String> {
         "column" => "列",
         "minimum" => "最小",
         "maximum" => "最大",
+        "shell" => "shell",
+        "launching" => "启动",
+        "launch" => "启动",
+        "virtual" => "虚拟",
+        "environment" => "环境",
+        "found" => "找到",
+        "defaults" => "默认值",
+        "buffer" => "缓冲区",
+        "buffers" => "缓冲区",
+        "weight" => "粗细",
+        "family" => "族",
+        "fallbacks" => "回退字体",
+        "fallback" => "回退",
+        "features" => "特性",
+        "rendering" => "渲染",
+        "modifier" => "修饰键",
+        "blinking" => "闪烁",
+        "shape" => "形状",
+        "underline" => "下划线",
+        "block" => "方块",
+        "hollow" => "空心",
+        "copies" => "复制",
+        "clipboards" => "剪贴板",
+        "scrollbars" => "滚动条",
+        "breadcrumbs" => "面包屑",
+        "multipliers" => "倍率",
+        "multiplier" => "倍率",
+        "occurrences" => "出现次数",
+        "occurrence" => "出现次数",
+        "forcefully" => "强制",
+        "disables" => "禁用",
+        "disabling" => "禁用",
+        "minimap" => "缩略图",
+        "thumb" => "滑块",
+        "style" => "样式",
+        "border" => "边框",
+        "level" => "级别",
+        "filter" => "筛选",
+        "filtering" => "筛选",
+        "inline" => "行内",
+        "amount" => "数量",
+        "pull" => "拉取",
+        "pulling" => "拉取",
+        "servers" => "服务器",
+        "server" => "服务器",
+        "wait" => "等待",
+        "use" => "使用",
+        "gitignored" => "被 gitignore 忽略",
+        "tracking" => "跟踪",
+        "tracked" => "跟踪",
+        "important" => "重要",
+        "scanning" => "扫描",
+        "encoding" => "编码",
+        "endings" => "换行符",
+        "ending" => "换行符",
+        "runnables" => "可运行项",
+        "runnable" => "可运行项",
+        "gutter" => "边栏",
+        "toolbar" => "工具栏",
+        "review" => "审查",
+        "agent" => "Agent",
+        "agents" => "Agent",
+        "warning" => "警告",
+        "updated" => "更新",
+        "start" => "开始",
+        "end" => "结束",
+        "between" => "之间",
+        "powered" => "驱动",
         _ => {
             let mut chars = token.chars();
             let first = chars.next()?;
@@ -508,7 +587,9 @@ fn title_translation(text: &str) -> Option<SharedString> {
 fn is_safe_title_text(text: &str) -> bool {
     !text.is_empty()
         && text.len() <= 90
-        && text.chars().any(|character| character.is_ascii_alphabetic())
+        && text
+            .chars()
+            .any(|character| character.is_ascii_alphabetic())
         && text.chars().all(|character| {
             character.is_ascii_alphanumeric()
                 || character.is_ascii_whitespace()
@@ -977,19 +1058,13 @@ fn exact_translation(text: &str) -> Option<&'static str> {
         "Mix and match Zed's agent with any ACP-compatible agent" => {
             "将 Gearbox Agent 与任何兼容 ACP 的 Agent 搭配使用"
         }
-        "An update is required to continue using Zed AI." => {
-            "需要更新后才能继续使用 Gearbox AI。"
-        }
-        "A new version of Zed is available for download." => {
-            "有新的 Gearbox 版本可供下载。"
-        }
+        "An update is required to continue using Zed AI." => "需要更新后才能继续使用 Gearbox AI。",
+        "A new version of Zed is available for download." => "有新的 Gearbox 版本可供下载。",
         "Update Zed" => "更新 Gearbox",
         "Zed needs an xdg-desktop-portal implementation to open files." => {
             "Gearbox 需要 xdg-desktop-portal 实现才能打开文件。"
         }
-        "Your are running an unsupported version of Zed. " => {
-            "你正在运行不受支持的 Gearbox 版本。"
-        }
+        "Your are running an unsupported version of Zed. " => "你正在运行不受支持的 Gearbox 版本。",
         "Upgrade to Zed Pro or contact us." => "请升级到 Gearbox Pro 或联系我们。",
         "Check your payment status or contact us at billing-support@zed.dev to continue using this feature." => {
             "请检查付款状态或联系我们，以继续使用此功能。"
@@ -1203,7 +1278,9 @@ fn exact_translation(text: &str) -> Option<&'static str> {
         "The OpenType features to enable for rendering in text buffers." => {
             "在文本缓冲区渲染时启用的 OpenType 特性。"
         }
-        "The font fallbacks to use for rendering in text buffers." => "文本缓冲区渲染使用的回退字体。",
+        "The font fallbacks to use for rendering in text buffers." => {
+            "文本缓冲区渲染使用的回退字体。"
+        }
         "Font family for UI elements." => "界面元素使用的字体族。",
         "Font size for UI elements." => "界面元素使用的字号。",
         "Font weight for UI elements (100-900)." => "界面元素使用的字重 (100-900)。",
@@ -1214,7 +1291,9 @@ fn exact_translation(text: &str) -> Option<&'static str> {
         "Font size for agent response text in the agent panel. Falls back to the regular UI font size." => {
             "Agent 面板中回复文本使用的字号，未设置时回退到常规界面字号。"
         }
-        "Font size for user messages text in the agent panel." => "Agent 面板中用户消息文本使用的字号。",
+        "Font size for user messages text in the agent panel." => {
+            "Agent 面板中用户消息文本使用的字号。"
+        }
         "Font family for the markdown preview. Falls back to the UI font family." => {
             "Markdown 预览使用的字体族，未设置时回退到界面字体族。"
         }
@@ -1246,17 +1325,25 @@ fn exact_translation(text: &str) -> Option<&'static str> {
         "Display the which-key menu with matching bindings while a multi-stroke binding is pending." => {
             "多键快捷键等待后续输入时，显示匹配按键绑定的 which-key 菜单。"
         }
-        "Delay in milliseconds before the which-key menu appears." => "which-key 菜单显示前的延迟（毫秒）。",
+        "Delay in milliseconds before the which-key menu appears." => {
+            "which-key 菜单显示前的延迟（毫秒）。"
+        }
         "What to do when multibuffer is double-clicked in some of its excerpts." => {
             "在多缓冲区摘录中双击时的处理方式。"
         }
-        "How many lines to expand the multibuffer excerpts by default." => "默认展开多缓冲区摘录的行数。",
+        "How many lines to expand the multibuffer excerpts by default." => {
+            "默认展开多缓冲区摘录的行数。"
+        }
         "How many lines of context to provide in multibuffer excerpts by default." => {
             "多缓冲区摘录默认提供的上下文行数。"
         }
-        "Default depth to expand outline items in the current file." => "当前文件中大纲项默认展开深度。",
+        "Default depth to expand outline items in the current file." => {
+            "当前文件中大纲项默认展开深度。"
+        }
         "How to display diffs in the editor." => "编辑器中显示 diff 的方式。",
-        "Whether the editor will scroll beyond the last line." => "编辑器是否允许滚动超过最后一行。",
+        "Whether the editor will scroll beyond the last line." => {
+            "编辑器是否允许滚动超过最后一行。"
+        }
         "The number of lines to keep above/below the cursor when auto-scrolling." => {
             "自动滚动时在光标上下方保留的行数。"
         }
@@ -1296,7 +1383,9 @@ fn exact_translation(text: &str) -> Option<&'static str> {
             "鼠标移开后隐藏悬停弹层前等待的时间（毫秒）。"
         }
         "Enable drag and drop selection." => "启用拖拽选择。",
-        "Delay in milliseconds before drag and drop selection starts." => "拖拽选择开始前的延迟（毫秒）。",
+        "Delay in milliseconds before drag and drop selection starts." => {
+            "拖拽选择开始前的延迟（毫秒）。"
+        }
         "Show line numbers in the gutter." => "在边栏中显示行号。",
         "Show runnable buttons in the gutter." => "在边栏中显示可运行按钮。",
         "Show breakpoints in the gutter." => "在边栏中显示断点。",
@@ -1309,12 +1398,18 @@ fn exact_translation(text: &str) -> Option<&'static str> {
         "When to show the scrollbar in the editor." => "何时在编辑器中显示滚动条。",
         "Show cursor positions in the scrollbar." => "在滚动条中显示光标位置。",
         "Show Git diff indicators in the scrollbar." => "在滚动条中显示 Git diff 指示器。",
-        "Show buffer search result indicators in the scrollbar." => "在滚动条中显示缓冲区搜索结果指示器。",
+        "Show buffer search result indicators in the scrollbar." => {
+            "在滚动条中显示缓冲区搜索结果指示器。"
+        }
         "Show selected text occurrences in the scrollbar." => "在滚动条中显示选中文本出现位置。",
         "Show selected symbol occurrences in the scrollbar." => "在滚动条中显示选中符号出现位置。",
         "Which diagnostic indicators to show in the scrollbar." => "在滚动条中显示哪些诊断指示器。",
-        "When false, forcefully disables the horizontal scrollbar." => "为 false 时强制禁用水平滚动条。",
-        "When false, forcefully disables the vertical scrollbar." => "为 false 时强制禁用垂直滚动条。",
+        "When false, forcefully disables the horizontal scrollbar." => {
+            "为 false 时强制禁用水平滚动条。"
+        }
+        "When false, forcefully disables the vertical scrollbar." => {
+            "为 false 时强制禁用垂直滚动条。"
+        }
         "When to show the minimap in the editor." => "何时在编辑器中显示缩略图。",
         "Where to show the minimap in the editor." => "在编辑器中的哪个位置显示缩略图。",
         "When to show the minimap thumb." => "何时显示缩略图滑块。",
@@ -1326,11 +1421,15 @@ fn exact_translation(text: &str) -> Option<&'static str> {
             "显示快速操作按钮（例如搜索、选择、编辑器控件等）。"
         }
         "Show the selections menu in the editor toolbar." => "在编辑器工具栏中显示选择菜单。",
-        "Show agent review buttons in the editor toolbar." => "在编辑器工具栏中显示 Agent 评审按钮。",
+        "Show agent review buttons in the editor toolbar." => {
+            "在编辑器工具栏中显示 Agent 评审按钮。"
+        }
         "Show code action buttons in the editor toolbar." => "在编辑器工具栏中显示代码操作按钮。",
         "The default mode when Vim starts." => "Vim 启动时的默认模式。",
         "Toggle relative line numbers in Vim mode." => "在 Vim 模式中切换相对行号。",
-        "Controls when to use system clipboard in Vim mode." => "控制 Vim 模式中何时使用系统剪贴板。",
+        "Controls when to use system clipboard in Vim mode." => {
+            "控制 Vim 模式中何时使用系统剪贴板。"
+        }
         "Enable smartcase searching in Vim mode." => "在 Vim 模式中启用智能大小写搜索。",
         "Duration in milliseconds to highlight yanked text in Vim mode." => {
             "Vim 模式中高亮已复制文本的持续时间（毫秒）。"
@@ -1360,7 +1459,9 @@ fn exact_translation(text: &str) -> Option<&'static str> {
         "The amount of padding between the end of the source line and the start of the inline diagnostic." => {
             "源码行末尾与内联诊断起始位置之间的内边距。"
         }
-        "The minimum column at which to display inline diagnostics." => "显示内联诊断的最小列位置。",
+        "The minimum column at which to display inline diagnostics." => {
+            "显示内联诊断的最小列位置。"
+        }
         "Whether to pull for language server-powered diagnostics or not." => {
             "是否拉取由语言服务器提供的诊断。"
         }
