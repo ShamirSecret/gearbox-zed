@@ -23,6 +23,14 @@ use workspace::{
     find_existing_workspace,
 };
 
+fn gearbox_label(english: &'static str, chinese: &'static str) -> &'static str {
+    if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") {
+        chinese
+    } else {
+        english
+    }
+}
+
 pub use remote_connection::{
     RemoteClientDelegate, RemoteConnectionModal, RemoteConnectionPrompt, SshConnectionHeader,
     connect,
@@ -315,18 +323,27 @@ pub async fn open_remote_project(
                         window.prompt(
                             PromptLevel::Critical,
                             match connection_options {
-                                RemoteConnectionOptions::Ssh(_) => "Failed to connect over SSH",
-                                RemoteConnectionOptions::Wsl(_) => "Failed to connect to WSL",
-                                RemoteConnectionOptions::Docker(_) => {
-                                    "Failed to connect to Dev Container"
+                                RemoteConnectionOptions::Ssh(_) => {
+                                    gearbox_label("Failed to connect over SSH", "无法通过 SSH 连接")
                                 }
+                                RemoteConnectionOptions::Wsl(_) => {
+                                    gearbox_label("Failed to connect to WSL", "无法连接到 WSL")
+                                }
+                                RemoteConnectionOptions::Docker(_) => gearbox_label(
+                                    "Failed to connect to Dev Container",
+                                    "无法连接到开发容器",
+                                ),
                                 #[cfg(any(test, feature = "test-support"))]
-                                RemoteConnectionOptions::Mock(_) => {
-                                    "Failed to connect to mock server"
-                                }
+                                RemoteConnectionOptions::Mock(_) => gearbox_label(
+                                    "Failed to connect to mock server",
+                                    "无法连接到模拟服务器",
+                                ),
                             },
                             Some(&format!("{e:#}")),
-                            &["Retry", "Cancel"],
+                            &[
+                                gearbox_label("Retry", "重试"),
+                                gearbox_label("Cancel", "取消"),
+                            ],
                             cx,
                         )
                     })?
@@ -376,18 +393,27 @@ pub async fn open_remote_project(
                         window.prompt(
                             PromptLevel::Critical,
                             match connection_options {
-                                RemoteConnectionOptions::Ssh(_) => "Failed to connect over SSH",
-                                RemoteConnectionOptions::Wsl(_) => "Failed to connect to WSL",
-                                RemoteConnectionOptions::Docker(_) => {
-                                    "Failed to connect to Dev Container"
+                                RemoteConnectionOptions::Ssh(_) => {
+                                    gearbox_label("Failed to connect over SSH", "无法通过 SSH 连接")
                                 }
+                                RemoteConnectionOptions::Wsl(_) => {
+                                    gearbox_label("Failed to connect to WSL", "无法连接到 WSL")
+                                }
+                                RemoteConnectionOptions::Docker(_) => gearbox_label(
+                                    "Failed to connect to Dev Container",
+                                    "无法连接到开发容器",
+                                ),
                                 #[cfg(any(test, feature = "test-support"))]
-                                RemoteConnectionOptions::Mock(_) => {
-                                    "Failed to connect to mock server"
-                                }
+                                RemoteConnectionOptions::Mock(_) => gearbox_label(
+                                    "Failed to connect to mock server",
+                                    "无法连接到模拟服务器",
+                                ),
                             },
                             Some(&format!("{e:#}")),
-                            &["Retry", "Cancel"],
+                            &[
+                                gearbox_label("Retry", "重试"),
+                                gearbox_label("Cancel", "取消"),
+                            ],
                             cx,
                         )
                     })?

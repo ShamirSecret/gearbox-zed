@@ -993,12 +993,25 @@ fn exact_translation(text: &str) -> Option<&'static str> {
         "User Settings" => "用户设置",
         "Open Settings" => "打开设置",
         "Open Keymap" => "打开快捷键配置",
+        "Open Zed Log" => "打开 Gearbox 日志",
         "Open Folder" => "打开文件夹",
+        "Open Local Folders" => "打开本地文件夹",
+        "Open Remote Folder" => "打开远程文件夹",
         "Open File" => "打开文件",
         "Open Project" => "打开项目",
+        "Open Project in This Window" => "在当前窗口打开项目",
+        "Open Project in New Window" => "在新窗口打开项目",
         "Open Recent" => "打开最近项目",
         "Open in New Window" => "在新窗口打开",
         "Open in This Window" => "在当前窗口打开",
+        "Add Folder to this Project" => "将文件夹添加到此项目",
+        "Add Folders to this Project" => "将文件夹添加到此项目",
+        "As a multi-root folder" => "作为多根文件夹",
+        "Remove Folder" => "移除文件夹",
+        "Remove from Window" => "从窗口中移除",
+        "Remove Folder from Project" => "从项目中移除文件夹",
+        "Remove Project from Window" => "从窗口中移除项目",
+        "Remove from Recent Projects" => "从最近项目中移除",
         "New Window" => "新窗口",
         "New File" => "新建文件",
         "New Folder" => "新建文件夹",
@@ -1068,6 +1081,12 @@ fn exact_translation(text: &str) -> Option<&'static str> {
         "Upgrade to Zed Pro or contact us." => "请升级到 Gearbox Pro 或联系我们。",
         "Check your payment status or contact us at billing-support@zed.dev to continue using this feature." => {
             "请检查付款状态或联系我们，以继续使用此功能。"
+        }
+        "You reached your free usage limit. Upgrade to Zed Pro for more prompts." => {
+            "你已达到免费使用额度。请升级到 Gearbox Pro 以获得更多提示次数。"
+        }
+        "Rating the thread sends all of your current conversation to the Zed team." => {
+            "评价此会话会将当前完整对话发送给 Gearbox 团队。"
         }
         "You have an outstanding invoice" => "你有一张未支付的账单",
         "Claude Agent support is built-in to Zed!" => "Claude Agent 支持已内置于 Gearbox！",
@@ -1148,6 +1167,9 @@ fn exact_translation(text: &str) -> Option<&'static str> {
         "Debugger" => "调试器",
         "Debug" => "调试",
         "Run" => "运行",
+        "Run Command" => "运行命令",
+        "Change Keybinding…" => "更改快捷键...",
+        "Add Keybinding…" => "添加快捷键...",
         "Stop" => "停止",
         "Restart" => "重启",
         "Step Over" => "单步跳过",
@@ -1495,6 +1517,61 @@ fn exact_translation(text: &str) -> Option<&'static str> {
         "When enabled, use folding ranges from the language server instead of indent-based folding." => {
             "启用后，使用语言服务器提供的折叠范围，而不是基于缩进的折叠。"
         }
+        // agent_ui
+        "Authenticating…" => "正在认证…",
+        "Choose one of the following authentication options:" => "请选择以下认证方式之一：",
+        "Couldn't create a sandbox" => "无法创建沙箱",
+        "Current:" => "当前：",
+        "Enter your OAuth client secret, or leave empty for public clients" => {
+            "输入你的 OAuth 客户端密钥，公开客户端可留空"
+        }
+        "Fetching Agent Threads…" => "正在获取 Agent 会话…",
+        "Input:" => "输入：",
+        "Output:" => "输出：",
+        "Subagents Awaiting Permission:" => "等待授权的子 Agent：",
+        // debugger_ui
+        "Debugger:" => "调试器：",
+        "Edit debug.json" => "编辑 debug.json",
+        "Edit in debug.json" => "在 debug.json 中编辑",
+        // language_models
+        "But first, to access models on AWS, you need to:" => "要访问 AWS 上的模型，你需要：",
+        "Default: Discovered from the server" => "默认：从服务器发现",
+        "Default: Model specific" => "默认：因模型而异",
+        "For access keys: Create an IAM user in the AWS console with programmatic access" => {
+            "对于访问密钥：在 AWS 控制台中创建具有编程访问权限的 IAM 用户"
+        }
+        "For Bedrock API Keys: Generate an API key from the" => {
+            "对于 Bedrock API 密钥：从以下位置生成 API 密钥"
+        }
+        "Get llama.cpp" => "获取 llama.cpp",
+        "Grant permissions to the strategy you'll use according to the:" => {
+            "根据以下步骤为你使用的策略授予权限："
+        }
+        "Install llama.cpp from" => "从以下位置安装 llama.cpp",
+        "Loading credentials…" => "正在加载凭据…",
+        "Loading Credentials…" => "正在加载凭据…",
+        "Select the models you would like access to:" => "选择你想要访问的模型：",
+        "Start the server in router mode:" => "以路由器模式启动服务器：",
+        "Start Ollama and download a model:" => "启动 Ollama 并下载模型：",
+        "To find an API key, visit the" => "要查找 API 密钥，请访问",
+        "To get your first model, try running" => "要获取第一个模型，请运行",
+        "To use a local llama.cpp server:" => "使用本地 llama.cpp 服务器：",
+        "To use local Ollama:" => "使用本地 Ollama：",
+        "To use OpenCode models in Gearbox, you need an API key:" => {
+            "要在 Gearbox 中使用 OpenCode 模型，你需要一个 API 密钥："
+        }
+        // recent_projects
+        "Error Creating Dev Container:" => "创建开发容器出错：",
+        "Open devcontainer.json" => "打开 devcontainer.json",
+        "WSL:" => "WSL：",
+        // settings_ui
+        "Fetching and parsing…" => "正在获取并解析…",
+        "Fix in settings.json" => "在 settings.json 中修复",
+        "Result:" => "结果：",
+        // ui / workspace
+        "Connection error: unable to connect to server" => "连接错误：无法连接到服务器",
+        "Restricted mode prevents:" => "受限模式会阻止以下操作：",
+        "Restricted Mode prevents:" => "受限模式会阻止以下操作：",
         _ => return None,
     })
 }

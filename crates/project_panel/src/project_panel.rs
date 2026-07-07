@@ -2465,8 +2465,21 @@ impl ProjectPanel {
             let file_name = entry.path.file_name()?.to_string();
 
             let answer = if !action.skip_prompt {
-                let prompt = format!("Discard changes to {}?", MarkdownInlineCode(&file_name));
-                Some(window.prompt(PromptLevel::Info, &prompt, None, &["Restore", "Cancel"], cx))
+                let prompt = if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") {
+                    format!("丢弃对 {} 的更改？", MarkdownInlineCode(&file_name))
+                } else {
+                    format!("Discard changes to {}?", MarkdownInlineCode(&file_name))
+                };
+                Some(window.prompt(
+                    PromptLevel::Info,
+                    &prompt,
+                    None,
+                    &[
+                        gearbox_label("Restore", "恢复"),
+                        gearbox_label("Cancel", "取消"),
+                    ],
+                    cx,
+                ))
             } else {
                 None
             };

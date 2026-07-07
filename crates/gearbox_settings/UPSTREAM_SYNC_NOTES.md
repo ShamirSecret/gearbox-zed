@@ -331,3 +331,20 @@ When syncing with upstream Zed, check these files first. The intended rule is:
 - Uses GitHub Release assets instead of Zed's blob store, Sentry, Slack, self-hosted runners, official signing, notarization, and store publication steps.
 - Current installers are community Gearbox packages: macOS artifacts are not notarized, Windows artifacts are not code-signed, and Linux only emits a `.deb` package.
 - Keep this workflow separate when syncing upstream so Zed's official release workflow can continue to be compared or copied forward without merge noise.
+
+## 2026-07-07 Gearbox GUI Localization Leakage Sweep
+
+### `crates/ui/src/gearbox_text.rs`
+
+- Adds exact Gearbox Chinese translations for recent-project open/remove actions, keybinding buttons, command run labels, and Agent quota/feedback text.
+- Keeps the translations in the shared display layer so upstream identifiers and action names remain unchanged.
+
+### `crates/recent_projects/src/remote_connections.rs`
+
+- Adds Gearbox-only Chinese wording for remote connection failure prompt titles and retry/cancel buttons when `GEARBOX_GUI=1`.
+- Keeps upstream Zed wording unchanged outside the Gearbox GUI path.
+
+### `crates/project_panel/src/project_panel.rs`
+
+- Adds Gearbox-only Chinese wording for the discard-changes restore prompt and buttons when `GEARBOX_GUI=1`.
+

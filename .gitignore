@@ -61,3 +61,8 @@ crates/docs_preprocessor/actions.json
 
 # Local agent/tool state
 .serena/
+.codegraph/
+.codex/
+.factory/commands/
+.factory/skills/openspec-*/
+openspec/
