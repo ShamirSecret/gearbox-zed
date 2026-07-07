@@ -19,7 +19,7 @@ impl ProjectEmptyState {
         open_project_key_binding: KeyBinding,
     ) -> Self {
         Self {
-            label: label.into(),
+            label: crate::gearbox_text::translate(label),
             focus_handle,
             open_project_key_binding,
             on_open_project: None,

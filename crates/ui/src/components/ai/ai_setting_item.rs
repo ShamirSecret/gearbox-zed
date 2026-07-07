@@ -92,7 +92,7 @@ impl AiSettingItem {
             status,
             source,
             icon: None,
-            label: label.into(),
+            label: crate::gearbox_text::translate(label),
             detail_label: None,
             actions: Vec::new(),
             details: None,

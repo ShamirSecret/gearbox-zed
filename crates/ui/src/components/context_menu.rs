@@ -103,7 +103,7 @@ impl ContextMenuEntry {
     pub fn new(label: impl Into<SharedString>) -> Self {
         ContextMenuEntry {
             toggle: None,
-            label: label.into(),
+            label: crate::gearbox_text::translate(label),
             icon: None,
             custom_icon_path: None,
             custom_icon_svg: None,
@@ -527,7 +527,7 @@ impl ContextMenu {
     ) -> Self {
         self.items.push(ContextMenuItem::Entry(ContextMenuEntry {
             toggle: None,
-            label: label.into(),
+            label: crate::gearbox_text::translate(label),
             handler: Rc::new(move |_, window, cx| handler(window, cx)),
             secondary_handler: None,
             icon: None,
@@ -558,7 +558,7 @@ impl ContextMenu {
     ) -> Self {
         self.items.push(ContextMenuItem::Entry(ContextMenuEntry {
             toggle: None,
-            label: label.into(),
+            label: crate::gearbox_text::translate(label),
             handler: Rc::new(move |_, window, cx| handler(window, cx)),
             secondary_handler: None,
             icon: None,
@@ -571,7 +571,7 @@ impl ContextMenu {
             disabled: false,
             documentation_aside: None,
             end_slot_icon: Some(end_slot_icon),
-            end_slot_title: Some(end_slot_title),
+            end_slot_title: Some(crate::gearbox_text::translate(end_slot_title)),
             end_slot_handler: Some(Rc::new(move |_, window, cx| end_slot_handler(window, cx))),
             show_end_slot_on_hover: false,
         }));
@@ -589,7 +589,7 @@ impl ContextMenu {
     ) -> Self {
         self.items.push(ContextMenuItem::Entry(ContextMenuEntry {
             toggle: None,
-            label: label.into(),
+            label: crate::gearbox_text::translate(label),
             handler: Rc::new(move |_, window, cx| handler(window, cx)),
             secondary_handler: None,
             icon: None,
@@ -602,7 +602,7 @@ impl ContextMenu {
             disabled: false,
             documentation_aside: None,
             end_slot_icon: Some(end_slot_icon),
-            end_slot_title: Some(end_slot_title),
+            end_slot_title: Some(crate::gearbox_text::translate(end_slot_title)),
             end_slot_handler: Some(Rc::new(move |_, window, cx| end_slot_handler(window, cx))),
             show_end_slot_on_hover: true,
         }));
@@ -619,7 +619,7 @@ impl ContextMenu {
     ) -> Self {
         self.items.push(ContextMenuItem::Entry(ContextMenuEntry {
             toggle: Some((position, toggled)),
-            label: label.into(),
+            label: crate::gearbox_text::translate(label),
             handler: Rc::new(move |_, window, cx| handler(window, cx)),
             secondary_handler: None,
             icon: None,
@@ -693,7 +693,8 @@ impl ContextMenu {
     }
 
     pub fn label(mut self, label: impl Into<SharedString>) -> Self {
-        self.items.push(ContextMenuItem::Label(label.into()));
+        self.items
+            .push(ContextMenuItem::Label(crate::gearbox_text::translate(label)));
         self
     }
 
@@ -723,7 +724,7 @@ impl ContextMenu {
             } else {
                 None
             },
-            label: label.into(),
+            label: crate::gearbox_text::translate(label),
             action: Some(action.boxed_clone()),
             handler: Rc::new(move |context, window, cx| {
                 if let Some(context) = &context {
@@ -756,7 +757,7 @@ impl ContextMenu {
     ) -> Self {
         self.items.push(ContextMenuItem::Entry(ContextMenuEntry {
             toggle: None,
-            label: label.into(),
+            label: crate::gearbox_text::translate(label),
             action: Some(action.boxed_clone()),
             handler: Rc::new(move |context, window, cx| {
                 if let Some(context) = &context {
@@ -793,7 +794,7 @@ impl ContextMenu {
     ) -> Self {
         self.items.push(ContextMenuItem::Entry(ContextMenuEntry {
             toggle: None,
-            label: label.into(),
+            label: crate::gearbox_text::translate(label),
             action: Some(action.boxed_clone()),
             handler: Rc::new(move |_, window, cx| {
                 handler(window, cx);
@@ -822,7 +823,7 @@ impl ContextMenu {
         builder: impl Fn(ContextMenu, &mut Window, &mut Context<ContextMenu>) -> ContextMenu + 'static,
     ) -> Self {
         self.items.push(ContextMenuItem::Submenu {
-            label: label.into(),
+            label: crate::gearbox_text::translate(label),
             icon: None,
             icon_color: None,
             builder: Rc::new(builder),
@@ -837,7 +838,7 @@ impl ContextMenu {
         builder: impl Fn(ContextMenu, &mut Window, &mut Context<ContextMenu>) -> ContextMenu + 'static,
     ) -> Self {
         self.items.push(ContextMenuItem::Submenu {
-            label: label.into(),
+            label: crate::gearbox_text::translate(label),
             icon: Some(icon),
             icon_color: None,
             builder: Rc::new(builder),
@@ -853,7 +854,7 @@ impl ContextMenu {
         builder: impl Fn(ContextMenu, &mut Window, &mut Context<ContextMenu>) -> ContextMenu + 'static,
     ) -> Self {
         self.items.push(ContextMenuItem::Submenu {
-            label: label.into(),
+            label: crate::gearbox_text::translate(label),
             icon: Some(icon),
             icon_color: Some(icon_color),
             builder: Rc::new(builder),

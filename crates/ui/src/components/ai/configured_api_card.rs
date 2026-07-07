@@ -16,7 +16,7 @@ impl ConfiguredApiCard {
     pub fn new(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Self {
         Self {
             id: id.into(),
-            label: label.into(),
+            label: crate::gearbox_text::translate(label),
             button_label: None,
             button_tab_index: None,
             tooltip_label: None,

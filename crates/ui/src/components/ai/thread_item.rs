@@ -75,7 +75,7 @@ impl ThreadItem {
             icon_color: None,
             icon_visible: true,
             custom_icon_from_external_svg: None,
-            title: title.into(),
+            title: crate::gearbox_text::translate(title),
             title_slot: None,
             title_label_color: None,
             title_generating: false,

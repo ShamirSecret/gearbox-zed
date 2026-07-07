@@ -201,3 +201,40 @@ When syncing with upstream Zed, check these files first. The intended rule is:
 - Continue expanding settings item title mappings in `crates/settings_ui/src/settings_ui.rs`.
 - Continue localizing deeper Agent panel labels in `crates/agent_ui`.
 - Continue localizing editor/project prompts and confirmation dialogs as they are encountered.
+
+## 2026-07-07 Gearbox Shared GUI Localization Layer
+
+### `crates/ui/src/gearbox_text.rs`
+
+- Adds the shared Gearbox GUI text translation entrypoint used only when `GEARBOX_GUI=1`.
+- Keeps translation display-only: exact UI strings, safe short title phrases, and safe `Zed` to `Gearbox` visible-brand replacement.
+- Avoids changing settings schemas, action identifiers, JSON paths, URLs, or internal type names.
+
+### `crates/ui/src/ui.rs`
+
+- Exports `gearbox_translate_text` so other GUI crates can reuse the shared display-text translation layer.
+
+### `crates/ui/src/components/label/label.rs`
+### `crates/ui/src/components/button/button.rs`
+### `crates/ui/src/components/button/button_link.rs`
+### `crates/ui/src/components/button/toggle_button.rs`
+### `crates/ui/src/components/tooltip.rs`
+### `crates/ui/src/components/context_menu.rs`
+### `crates/ui/src/components/modal.rs`
+### `crates/ui/src/components/project_empty_state.rs`
+### `crates/ui/src/components/tree_view_item.rs`
+### `crates/ui/src/components/chip.rs`
+### `crates/ui/src/components/list/list_header.rs`
+### `crates/ui/src/components/list/list_sub_header.rs`
+### `crates/ui/src/components/list/list_bullet_item.rs`
+### `crates/ui/src/components/ai/configured_api_card.rs`
+### `crates/ui/src/components/ai/thread_item.rs`
+### `crates/ui/src/components/ai/ai_setting_item.rs`
+
+- Routes common label/title/button/menu/tooltip/list/modal strings through the shared Gearbox translation entrypoint.
+- This intentionally centralizes broad GUI localization instead of patching each screen independently.
+
+### `crates/settings_ui/src/settings_ui.rs`
+
+- Routes Settings shared text and fallback descriptions through `ui::gearbox_translate_text`.
+- Keeps the existing Settings-specific exact translations, but lets the shared UI table cover deeper titles, enum labels, and descriptions.

@@ -593,7 +593,7 @@ fn gearbox_shared_text(text: &SharedString) -> SharedString {
         "Sandbox" => "沙箱".into(),
         "Profiles" => "配置档案".into(),
         "Configure" => "配置".into(),
-        _ => text.as_ref().replace("Zed", "Gearbox").into(),
+        _ => ui::gearbox_translate_text(text.clone()),
     }
 }
 
@@ -636,7 +636,7 @@ fn gearbox_setting_description(text: &'static str) -> SharedString {
         "Allow sending requests to Anthropic models that cannot be offered with Zero Data Retention." => {
             "允许向无法提供零数据保留的 Anthropic 模型发送请求。".into()
         }
-        _ => text.replace("Zed", "Gearbox").into(),
+        _ => ui::gearbox_translate_text(text),
     }
 }
 const HEADER_GROUP_TAB_INDEX: isize = 3;
@@ -4799,7 +4799,7 @@ impl SettingsWindow {
     ) {
         self.regex_validation_error = None;
         let sub_page_link = SubPageLink {
-            title: title.into(),
+            title: ui::gearbox_translate_text(title),
             r#type: SubPageType::default(),
             description: None,
             search_aliases: &[],
@@ -4808,7 +4808,12 @@ impl SettingsWindow {
             files: USER,
             render,
         };
-        self.push_sub_page(sub_page_link, section_header.into(), window, cx);
+        self.push_sub_page(
+            sub_page_link,
+            ui::gearbox_translate_text(section_header),
+            window,
+            cx,
+        );
     }
 
     pub(crate) fn skill_creator_page(&self) -> Option<Entity<pages::SkillCreatorPage>> {

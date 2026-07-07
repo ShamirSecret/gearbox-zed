@@ -36,7 +36,7 @@ impl RenderOnce for Title {
 impl Tooltip {
     pub fn simple(title: impl Into<SharedString>, cx: &mut App) -> AnyView {
         cx.new(|_| Self {
-            title: Title::Str(title.into()),
+            title: Title::Str(crate::gearbox_text::translate(title)),
             meta: None,
             key_binding: None,
         })
@@ -44,7 +44,7 @@ impl Tooltip {
     }
 
     pub fn text(title: impl Into<SharedString>) -> impl Fn(&mut Window, &mut App) -> AnyView {
-        let title = title.into();
+        let title = crate::gearbox_text::translate(title);
         move |_, cx| {
             cx.new(|_| Self {
                 title: title.clone().into(),
@@ -59,7 +59,7 @@ impl Tooltip {
         title: T,
         action: &dyn Action,
     ) -> impl Fn(&mut Window, &mut App) -> AnyView + use<T> {
-        let title = title.into();
+        let title = crate::gearbox_text::translate(title);
         let action = action.boxed_clone();
         move |_, cx| {
             cx.new(|cx| Self {
@@ -76,7 +76,7 @@ impl Tooltip {
         action: &dyn Action,
         focus_handle: &FocusHandle,
     ) -> impl Fn(&mut Window, &mut App) -> AnyView + use<Str> {
-        let title = title.into();
+        let title = crate::gearbox_text::translate(title);
         let action = action.boxed_clone();
         let focus_handle = focus_handle.clone();
         move |_, cx| {
@@ -99,7 +99,7 @@ impl Tooltip {
         cx: &mut App,
     ) -> AnyView {
         cx.new(|cx| Self {
-            title: Title::Str(title.into()),
+            title: Title::Str(crate::gearbox_text::translate(title)),
             meta: None,
             key_binding: Some(KeyBinding::for_action(action, cx)),
         })
@@ -113,7 +113,7 @@ impl Tooltip {
         cx: &mut App,
     ) -> AnyView {
         cx.new(|cx| Self {
-            title: title.into().into(),
+            title: crate::gearbox_text::translate(title).into(),
             meta: None,
             key_binding: Some(KeyBinding::for_action_in(action, focus_handle, cx)),
         })
@@ -127,8 +127,8 @@ impl Tooltip {
         cx: &mut App,
     ) -> AnyView {
         cx.new(|cx| Self {
-            title: title.into().into(),
-            meta: Some(meta.into()),
+            title: crate::gearbox_text::translate(title).into(),
+            meta: Some(crate::gearbox_text::translate(meta)),
             key_binding: action.map(|action| KeyBinding::for_action(action, cx)),
         })
         .into()
@@ -142,8 +142,8 @@ impl Tooltip {
         cx: &mut App,
     ) -> AnyView {
         cx.new(|cx| Self {
-            title: title.into().into(),
-            meta: Some(meta.into()),
+            title: crate::gearbox_text::translate(title).into(),
+            meta: Some(crate::gearbox_text::translate(meta)),
             key_binding: action.map(|action| KeyBinding::for_action_in(action, focus_handle, cx)),
         })
         .into()
@@ -151,7 +151,7 @@ impl Tooltip {
 
     pub fn new(title: impl Into<SharedString>) -> Self {
         Self {
-            title: title.into().into(),
+            title: crate::gearbox_text::translate(title).into(),
             meta: None,
             key_binding: None,
         }

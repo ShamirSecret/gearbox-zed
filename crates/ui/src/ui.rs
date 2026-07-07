@@ -9,12 +9,14 @@
 
 pub mod component_prelude;
 mod components;
+mod gearbox_text;
 pub mod prelude;
 mod styles;
 mod traits;
 pub mod utils;
 
 pub use components::*;
+pub use gearbox_text::translate as gearbox_translate_text;
 pub use prelude::*;
 pub use styles::*;
 pub use traits::animation_ext::*;

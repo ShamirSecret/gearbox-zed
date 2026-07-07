@@ -28,7 +28,7 @@ impl Chip {
     /// Creates a new `Chip` component with the specified label.
     pub fn new(label: impl Into<SharedString>) -> Self {
         Self {
-            label: label.into(),
+            label: crate::gearbox_text::translate(label),
             label_color: Color::Default,
             label_size: LabelSize::XSmall,
             icon: None,

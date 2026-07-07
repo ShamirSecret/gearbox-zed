@@ -72,7 +72,7 @@ impl ToggleButtonSimple {
         on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     ) -> Self {
         Self {
-            label: label.into(),
+            label: crate::gearbox_text::translate(label),
             on_click: Box::new(on_click),
             selected: false,
             tooltip: None,
@@ -119,7 +119,7 @@ impl ToggleButtonWithIcon {
         on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     ) -> Self {
         Self {
-            label: label.into(),
+            label: crate::gearbox_text::translate(label),
             icon,
             on_click: Box::new(on_click),
             selected: false,

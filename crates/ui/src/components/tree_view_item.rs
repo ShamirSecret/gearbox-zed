@@ -29,7 +29,7 @@ impl TreeViewItem {
         Self {
             id: id.into(),
             group_name: None,
-            label: label.into(),
+            label: crate::gearbox_text::translate(label),
             expanded: false,
             selected: false,
             disabled: false,

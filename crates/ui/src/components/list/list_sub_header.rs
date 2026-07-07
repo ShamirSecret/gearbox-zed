@@ -13,7 +13,7 @@ pub struct ListSubHeader {
 impl ListSubHeader {
     pub fn new(label: impl Into<SharedString>) -> Self {
         Self {
-            label: label.into(),
+            label: crate::gearbox_text::translate(label),
             start_slot: None,
             end_slot: None,
             inset: false,

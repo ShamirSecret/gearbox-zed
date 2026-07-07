@@ -25,7 +25,7 @@ impl ButtonLink {
     pub fn new(label: impl Into<SharedString>, link: impl Into<String>) -> Self {
         Self {
             link: link.into(),
-            label: label.into(),
+            label: crate::gearbox_text::translate(label),
             label_size: LabelSize::Default,
             label_color: Color::Default,
             no_icon: false,

@@ -12,7 +12,7 @@ pub struct ListBulletItem {
 impl ListBulletItem {
     pub fn new(label: impl Into<SharedString>) -> Self {
         Self {
-            label: label.into(),
+            label: crate::gearbox_text::translate(label),
             label_color: None,
             children: Vec::new(),
         }

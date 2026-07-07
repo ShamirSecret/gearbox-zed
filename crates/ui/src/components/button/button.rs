@@ -102,7 +102,7 @@ impl Button {
     pub fn new(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Self {
         Self {
             base: ButtonLike::new(id),
-            label: label.into(),
+            label: crate::gearbox_text::translate(label),
             label_color: None,
             label_size: None,
             selected_label: None,
@@ -163,7 +163,7 @@ impl Button {
 
     /// Sets the label used when the button is in a selected state.
     pub fn selected_label<L: Into<SharedString>>(mut self, label: impl Into<Option<L>>) -> Self {
-        self.selected_label = label.into().map(Into::into);
+        self.selected_label = label.into().map(crate::gearbox_text::translate);
         self
     }
 

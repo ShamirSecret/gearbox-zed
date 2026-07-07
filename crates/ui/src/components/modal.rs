@@ -422,7 +422,7 @@ pub struct SectionHeader {
 impl SectionHeader {
     pub fn new(label: impl Into<SharedString>) -> Self {
         Self {
-            label: label.into(),
+            label: crate::gearbox_text::translate(label),
             end_slot: None,
         }
     }
