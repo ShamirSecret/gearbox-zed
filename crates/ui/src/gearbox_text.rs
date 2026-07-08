@@ -242,11 +242,7 @@ fn translate_sentence_fragment(text: &str) -> String {
     }
     flush_sentence_token(&mut translated, &mut token);
 
-    translated
-        .replace(" .", "。")
-        .replace(".", "。")
-        .replace(" ,", "，")
-        .replace(",", "，")
+    localize_sentence_punctuation(&translated)
 }
 
 fn flush_sentence_token(translated: &mut String, token: &mut String) {
@@ -260,6 +256,62 @@ fn flush_sentence_token(translated: &mut String, token: &mut String) {
         translated.push_str(token);
     }
     token.clear();
+}
+
+fn localize_sentence_punctuation(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let characters = text.char_indices().collect::<Vec<_>>();
+
+    for (index, &(byte_index, character)) in characters.iter().enumerate() {
+        match character {
+            '.' if is_sentence_period(&characters, index) => output.push('。'),
+            ',' if is_phrase_comma(&characters, index) => output.push('，'),
+            _ => output.push_str(&text[byte_index..byte_index + character.len_utf8()]),
+        }
+    }
+
+    output
+}
+
+fn is_sentence_period(characters: &[(usize, char)], index: usize) -> bool {
+    let previous = previous_character(characters, index);
+    let next = next_character(characters, index);
+
+    if previous.is_some_and(is_ascii_identifier_character)
+        && next.is_some_and(is_ascii_identifier_character)
+    {
+        return false;
+    }
+
+    next.is_none_or(|character| character.is_whitespace())
+}
+
+fn is_phrase_comma(characters: &[(usize, char)], index: usize) -> bool {
+    let previous = previous_character(characters, index);
+    let next = next_character(characters, index);
+
+    if previous.is_some_and(|character| character.is_ascii_digit())
+        && next.is_some_and(|character| character.is_ascii_digit())
+    {
+        return false;
+    }
+
+    next.is_none_or(|character| character.is_whitespace())
+}
+
+fn previous_character(characters: &[(usize, char)], index: usize) -> Option<char> {
+    index
+        .checked_sub(1)
+        .and_then(|previous_index| characters.get(previous_index))
+        .map(|(_, character)| *character)
+}
+
+fn next_character(characters: &[(usize, char)], index: usize) -> Option<char> {
+    characters.get(index + 1).map(|(_, character)| *character)
+}
+
+fn is_ascii_identifier_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || character == '_' || character == '-'
 }
 
 fn sentence_token_translation(token: &str) -> Option<String> {
@@ -1574,4 +1626,25 @@ fn exact_translation(text: &str) -> Option<&'static str> {
         "Restricted Mode prevents:" => "受限模式会阻止以下操作：",
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn localizes_sentence_punctuation_without_rewriting_identifiers_or_numbers() {
+        assert_eq!(
+            localize_sentence_punctuation("Use package.json version 1.0."),
+            "Use package.json version 1.0。"
+        );
+        assert_eq!(
+            localize_sentence_punctuation("One, two, and three."),
+            "One， two， and three。"
+        );
+        assert_eq!(
+            localize_sentence_punctuation("Index 1,000 files."),
+            "Index 1,000 files。"
+        );
+    }
 }

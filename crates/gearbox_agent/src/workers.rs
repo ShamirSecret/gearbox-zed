@@ -177,7 +177,7 @@ impl WorkerAdapter for CommandWorker {
         let packet_path =
             store.write_worker_file(&task.id, "packet.json", &format!("{packet_json}\n"))?;
 
-        let prompt = worker_prompt(&packet);
+        let prompt = worker_prompt(&packet)?;
         let prompt_path = store.write_worker_file(&task.id, "prompt.md", &prompt)?;
 
         if config.skip_worker || config.worker_command.is_none() {
@@ -248,8 +248,11 @@ impl WorkerAdapter for CommandWorker {
     }
 }
 
-fn worker_prompt(packet: &WorkerPacket) -> String {
-    format!(
+fn worker_prompt(packet: &WorkerPacket) -> Result<String> {
+    let packet_json =
+        serde_json::to_string_pretty(packet).context("failed to serialize worker prompt packet")?;
+
+    Ok(format!(
         r#"# Gear worker packet
 
 You are a `{}` worker controlled by Gearbox Gear. Treat this packet as the contract.
@@ -266,9 +269,8 @@ Return a concise report with:
 - known_failures
 - next_steps
 "#,
-        packet.worker,
-        serde_json::to_string_pretty(packet).unwrap_or_else(|_| "{}".to_string())
-    )
+        packet.worker, packet_json
+    ))
 }
 
 fn write_result(store: &StateStore, task_id: &str, result: &WorkerResult) -> Result<()> {

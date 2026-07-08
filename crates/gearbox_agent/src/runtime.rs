@@ -899,7 +899,10 @@ mod tests {
         let event_sink = {
             let events = events.clone();
             Arc::new(move |event: &Event| {
-                events.lock().unwrap().push(event.message.clone());
+                events
+                    .lock()
+                    .expect("events mutex poisoned")
+                    .push(event.message.clone());
             }) as EventSink
         };
 
@@ -929,7 +932,7 @@ mod tests {
         assert!(outcome.artifacts_root.join("plan.md").exists());
         let verification = fs::read_to_string(outcome.artifacts_root.join("verification.md"))?;
         assert!(verification.contains("verify-ok"));
-        let events = events.lock().unwrap();
+        let events = events.lock().expect("events mutex poisoned");
         assert!(events.iter().any(|event| event == "Spec artifact created"));
         assert!(events.iter().any(|event| event == "Verification passed"));
         assert!(

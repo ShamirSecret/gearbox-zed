@@ -396,3 +396,22 @@ When syncing with upstream Zed, check these files first. The intended rule is:
 ### `crates/ui/src/components/ai/agent_setup_button.rs`
 
 - Updates Gearbox GUI text so upstream Zed agent surfaces display as `Agent`, leaving the new `Gear` label available for the Gear agent entry.
+
+## 2026-07-08 Gear Runtime and GUI Fixes
+
+### `crates/agent/Cargo.toml`
+### `crates/agent/src/tests/mod.rs`
+
+- Records the shared-agent integration files touched by the Gear native agent split.
+- `crates/agent/Cargo.toml` depends on `gearbox_agent` so the Gear native agent can call the Gear runtime orchestrator.
+- `crates/agent/src/tests/mod.rs` updates native agent connection tests for explicit native agent identity metadata and the additional Gear native connection.
+
+### `crates/gearbox_agent/src/workers.rs`
+### `crates/gearbox_agent/src/runtime.rs`
+
+- Keeps worker prompt packet serialization fallible instead of silently writing `{}` when serialization fails.
+- Adds clearer test failure context for Gear runtime event collection lock failures.
+
+### `crates/ui/src/gearbox_text.rs`
+
+- Narrows Gearbox GUI sentence punctuation localization so identifiers and numeric versions such as `package.json`, `1.0`, and `1,000` are not rewritten by broad display translation.
