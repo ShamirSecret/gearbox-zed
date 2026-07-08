@@ -4791,6 +4791,11 @@ mod internal_tests {
 
         let workspace = tempfile::tempdir().unwrap();
         std::fs::write(workspace.path().join("README.md"), "# Gear test\n").unwrap();
+        std::fs::write(
+            workspace.path().join("package.json"),
+            r#"{"scripts":{"build":"echo build-ok"}}"#,
+        )
+        .unwrap();
 
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree("/", json!({ "a": {} })).await;
@@ -4838,6 +4843,15 @@ mod internal_tests {
             "GOAL_SATISFIED: unknown\nSUMMARY: The run reached its verification limit.\nREPAIR_REQUEST: none",
         );
         fake_model.end_last_completion_stream();
+        for _ in 0..5 {
+            if !wait_for_optional_fake_completion(fake_model, cx, 20).await {
+                break;
+            }
+            fake_model.send_last_completion_stream_text_chunk(
+                "GOAL_SATISFIED: unknown\nSUMMARY: Continue using deterministic verification.\nREPAIR_REQUEST: none",
+            );
+            fake_model.end_last_completion_stream();
+        }
         prompt_task.await.unwrap();
         cx.run_until_parked();
 
