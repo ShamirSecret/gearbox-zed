@@ -38,6 +38,15 @@ pub fn detect(
     override_commands: &[String],
     install_dependencies: bool,
 ) -> Result<LanguageDetection> {
+    detect_with_request(workspace, override_commands, install_dependencies, "")
+}
+
+pub fn detect_with_request(
+    workspace: &Path,
+    override_commands: &[String],
+    install_dependencies: bool,
+    request: &str,
+) -> Result<LanguageDetection> {
     let mut evidence = Vec::new();
 
     if exists(workspace, "package.json") {
@@ -115,12 +124,50 @@ pub fn detect(
         });
     }
 
+    if looks_like_typescript_web_app_request(request) {
+        let commands = if override_commands.is_empty() {
+            typescript_scaffold_verification_commands(install_dependencies)
+        } else {
+            override_commands.to_vec()
+        };
+        return Ok(LanguageDetection {
+            profile: LanguageProfile::TypeScript,
+            product_type: "web_app".to_string(),
+            evidence: vec!["prompt:web_app".to_string()],
+            verification_commands: commands,
+        });
+    }
+
     Ok(LanguageDetection {
         profile: LanguageProfile::Unknown,
         product_type: "small_product".to_string(),
         evidence,
         verification_commands: override_commands.to_vec(),
     })
+}
+
+fn looks_like_typescript_web_app_request(request: &str) -> bool {
+    let request = request.to_ascii_lowercase();
+    let asks_for_app = [
+        "app",
+        "web app",
+        "website",
+        "dashboard",
+        "page",
+        "site",
+        "frontend",
+        "react",
+        "vite",
+        "页面",
+        "网站",
+        "应用",
+        "前端",
+        "仪表盘",
+    ]
+    .iter()
+    .any(|keyword| request.contains(keyword));
+
+    asks_for_app && !request.contains("cli") && !request.contains("command line")
 }
 
 fn exists(workspace: &Path, relative_path: &str) -> bool {
@@ -152,6 +199,21 @@ fn typescript_verification_commands(
     }
 
     Ok(commands)
+}
+
+fn typescript_scaffold_verification_commands(install_dependencies: bool) -> Vec<String> {
+    let mut commands = Vec::new();
+    if install_dependencies {
+        commands.push(guarded_package_json_command("npm install"));
+    }
+    commands.push(guarded_package_json_command("npm run build"));
+    commands
+}
+
+fn guarded_package_json_command(command: &str) -> String {
+    format!(
+        "if test -f package.json; then {command}; else echo 'package.json was not generated'; exit 1; fi"
+    )
 }
 
 fn python_verification_commands(workspace: &Path) -> Vec<String> {
@@ -234,6 +296,41 @@ mod tests {
 
         assert_eq!(detection.profile, LanguageProfile::Rust);
         assert_eq!(detection.verification_commands, vec!["echo ok".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn empty_workspace_web_app_request_uses_typescript_default_stack() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+
+        let detection = detect_with_request(
+            temp_dir.path(),
+            &[],
+            true,
+            "Build a tiny habit tracker web app",
+        )?;
+
+        assert_eq!(detection.profile, LanguageProfile::TypeScript);
+        assert_eq!(detection.product_type, "web_app");
+        assert_eq!(detection.evidence, vec!["prompt:web_app".to_string()]);
+        assert_eq!(
+            detection.verification_commands,
+            vec![
+                "if test -f package.json; then npm install; else echo 'package.json was not generated'; exit 1; fi".to_string(),
+                "if test -f package.json; then npm run build; else echo 'package.json was not generated'; exit 1; fi".to_string(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn empty_workspace_cli_request_stays_unknown_without_files() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+
+        let detection = detect_with_request(temp_dir.path(), &[], false, "Build a small CLI tool")?;
+
+        assert_eq!(detection.profile, LanguageProfile::Unknown);
+        assert_eq!(detection.verification_commands, Vec::<String>::new());
         Ok(())
     }
 }

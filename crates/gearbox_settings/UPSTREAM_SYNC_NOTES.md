@@ -415,3 +415,41 @@ When syncing with upstream Zed, check these files first. The intended rule is:
 ### `crates/ui/src/gearbox_text.rs`
 
 - Narrows Gearbox GUI sentence punctuation localization so identifiers and numeric versions such as `package.json`, `1.0`, and `1,000` are not rewritten by broad display translation.
+
+## 2026-07-08 Gear Fix Plan Follow-up and Milestone 3 Start
+
+### `crates/ui/src/gearbox_text.rs`
+
+- Preserves meaning for fallback settings prefixes such as `Amount of`, `Number of`, and `A mapping from` instead of dropping those words.
+- Keeps common abbreviation punctuation such as `e.g.,`, `i.e.`, and `etc.` out of Chinese sentence punctuation localization.
+- Replaces visible `Zed` branding only as a standalone word so names such as `ZedGraph` are not rewritten.
+
+### `crates/agent/src/agent.rs`
+
+- Warns when `GEARBOX_GEAR_WORKER` contains an unknown worker kind instead of silently treating the value as `opencode`.
+- Adds testable Gear worker env parsing coverage for explicit worker command, legacy `GEARBOX_OPENCODE_COMMAND` fallback, and invalid worker kind fallback.
+
+### `crates/gearbox/src/main.rs`
+### `crates/gearbox/src/zed.rs`
+
+- Adds Gearbox runtime environment aliases for user-facing Gearbox app switches while retaining upstream `ZED_*` fallbacks:
+  - `GEARBOX_EXPERIMENTAL_A11Y`
+  - `GEARBOX_STATELESS`
+  - `GEARBOX_GENERATE_MINIDUMPS`
+  - `GEARBOX_WINDOW_DECORATIONS`
+  - `GEARBOX_ALLOW_EMULATED_GPU`
+- Keeps build-time/upstream compatibility variables such as `ZED_BUNDLE`, `ZED_BUILD_ID`, and `ZED_COMMIT_SHA` unchanged.
+
+### `crates/gearbox_agent/src/languages.rs`
+### `crates/gearbox_agent/src/product.rs`
+### `crates/gearbox_agent/src/runtime.rs`
+### `crates/gearbox_agent/src/workers.rs`
+
+- Starts Milestone 3 by treating empty-workspace Web/App prompts as TypeScript Web App generation targets.
+- Writes TypeScript Web App default stack guidance into generated spec and plan artifacts.
+- Adds guarded npm build verification commands for new TypeScript scaffold targets.
+- Includes task input artifact paths in worker packets so workers can read the generated spec and plan before editing.
+
+### `docs/gearbox-gear-agent-plan.md`
+
+- Updates current progress to reflect that the goal-pursuit runtime loop exists and the next active track is TypeScript Web App sample generation.

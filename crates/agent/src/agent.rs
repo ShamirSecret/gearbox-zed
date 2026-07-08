@@ -2561,14 +2561,28 @@ fn gear_workspace_for_session(session: &Session, agent: &NativeAgent, cx: &App) 
 }
 
 fn gear_worker_config_from_env() -> WorkerConfig {
-    let worker_kind = std::env::var("GEARBOX_GEAR_WORKER")
-        .ok()
-        .and_then(|worker| WorkerKind::parse(&worker))
-        .unwrap_or_default();
-    let worker_command = std::env::var("GEARBOX_GEAR_WORKER_COMMAND")
-        .ok()
-        .or_else(|| std::env::var("GEARBOX_OPENCODE_COMMAND").ok())
-        .map(|command| command.trim().to_string())
+    gear_worker_config_from_values(
+        trimmed_env_value("GEARBOX_GEAR_WORKER").as_deref(),
+        trimmed_env_value("GEARBOX_GEAR_WORKER_COMMAND").as_deref(),
+        trimmed_env_value("GEARBOX_OPENCODE_COMMAND").as_deref(),
+    )
+}
+
+fn gear_worker_config_from_values(
+    worker: Option<&str>,
+    worker_command: Option<&str>,
+    opencode_command: Option<&str>,
+) -> WorkerConfig {
+    let worker_kind = match worker {
+        Some(worker) => WorkerKind::parse(worker).unwrap_or_else(|| {
+            log::warn!("Ignoring unknown GEARBOX_GEAR_WORKER value `{worker}`; using opencode");
+            WorkerKind::default()
+        }),
+        None => WorkerKind::default(),
+    };
+    let worker_command = worker_command
+        .or(opencode_command)
+        .map(str::to_string)
         .filter(|command| !command.is_empty());
 
     WorkerConfig {
@@ -2577,6 +2591,13 @@ fn gear_worker_config_from_env() -> WorkerConfig {
         skip_worker: false,
         require_worker: false,
     }
+}
+
+fn trimmed_env_value(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn gear_verification_commands_from_env() -> Vec<String> {
@@ -4110,6 +4131,34 @@ mod internal_tests {
             disable_model_invocation: false,
             embedded_body: None,
         }
+    }
+
+    #[test]
+    fn gear_worker_config_uses_explicit_worker_and_command_precedence() {
+        let config = gear_worker_config_from_values(
+            Some("claude-code"),
+            Some("gear worker"),
+            Some("legacy opencode"),
+        );
+
+        assert_eq!(config.worker_kind, WorkerKind::Claude);
+        assert_eq!(config.worker_command.as_deref(), Some("gear worker"));
+    }
+
+    #[test]
+    fn gear_worker_config_falls_back_to_legacy_opencode_command() {
+        let config = gear_worker_config_from_values(None, None, Some("opencode run"));
+
+        assert_eq!(config.worker_kind, WorkerKind::Opencode);
+        assert_eq!(config.worker_command.as_deref(), Some("opencode run"));
+    }
+
+    #[test]
+    fn gear_worker_config_warns_and_uses_default_for_unknown_worker() {
+        let config = gear_worker_config_from_values(Some("unknown-worker"), None, None);
+
+        assert_eq!(config.worker_kind, WorkerKind::Opencode);
+        assert_eq!(config.worker_command, None);
     }
 
     async fn setup_native_agent_session(

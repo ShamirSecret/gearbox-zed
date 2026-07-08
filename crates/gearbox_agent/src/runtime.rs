@@ -3,7 +3,7 @@ use std::{path::PathBuf, sync::Arc};
 use anyhow::{Context as _, Result, bail};
 use serde_json::json;
 
-use crate::languages::{LanguageDetection, detect};
+use crate::languages::{LanguageDetection, detect_with_request};
 use crate::product;
 use crate::state::{
     Budget, Event, EventKind, Goal, GoalStatus, Scope, Session, StateStore, Task, TaskInputs,
@@ -75,10 +75,11 @@ impl Orchestrator {
             options.max_files_changed,
         );
         let max_iterations = options.max_iterations.max(1);
-        let detection = detect(
+        let detection = detect_with_request(
             &workspace,
             &options.verification_commands,
             options.install_dependencies,
+            &options.request,
         )?;
         let now = timestamp();
 

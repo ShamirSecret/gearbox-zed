@@ -1,9 +1,10 @@
-use crate::languages::LanguageDetection;
+use crate::languages::{LanguageDetection, LanguageProfile};
 use crate::state::{Goal, Task};
 use crate::tools::{DiffSnapshot, ScopeCheck, ShellCommandResult};
 use crate::workers::WorkerResult;
 
 pub fn spec(goal: &Goal, detection: &LanguageDetection) -> String {
+    let generation_guidance = generation_guidance(detection);
     format!(
         r#"# Spec
 
@@ -34,6 +35,10 @@ pub fn spec(goal: &Goal, detection: &LanguageDetection) -> String {
 ## Acceptance Criteria
 
 {}
+
+## Generation Guidance
+
+{}
 "#,
         goal.request,
         goal.product_type,
@@ -47,11 +52,13 @@ pub fn spec(goal: &Goal, detection: &LanguageDetection) -> String {
             .iter()
             .map(|criterion| format!("- {criterion}"))
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n"),
+        generation_guidance
     )
 }
 
 pub fn plan(goal: &Goal, tasks: &[Task], detection: &LanguageDetection) -> String {
+    let generation_guidance = generation_guidance(detection);
     let task_lines = tasks
         .iter()
         .map(|task| format!("- `{}`: {} ({:?})", task.id, task.title, task.kind))
@@ -80,18 +87,52 @@ Goal: `{}`
 ## Default Build Path
 
 - Confirm the workspace facts with deterministic tools.
+- Follow the generation guidance below before writing code.
 - Send bounded implementation work to the configured worker adapter.
 - Inspect diff after the worker returns.
 - Run Gear-owned verification commands.
 - Create a repair task if verification fails.
 - Produce final delivery notes.
 
+## Generation Guidance
+
+{}
+
 ## Verification Commands
 
 {}
 "#,
-        goal.id, task_lines, commands
+        goal.id, task_lines, generation_guidance, commands
     )
+}
+
+fn generation_guidance(detection: &LanguageDetection) -> String {
+    if detection.profile == LanguageProfile::TypeScript && detection.product_type == "web_app" {
+        let existing_project = detection
+            .evidence
+            .iter()
+            .any(|evidence| evidence == "package.json");
+        if existing_project {
+            return [
+                "- Preserve the existing TypeScript/Web stack detected from the workspace.",
+                "- Prefer existing package scripts and project layout.",
+                "- Ensure README.md documents install, run, build, and test commands.",
+            ]
+            .join("\n");
+        }
+
+        return [
+            "- Default stack: Vite + React + TypeScript with npm scripts.",
+            "- Use plain CSS unless the prompt explicitly asks for another styling system.",
+            "- Scaffold at minimum: package.json, index.html, src/main.tsx, src/App.tsx, src/styles.css, tsconfig.json, vite.config.ts, README.md.",
+            "- package.json must include dev, build, and preview scripts.",
+            "- README.md must document install, local run, build, and known limits.",
+        ]
+        .join("\n");
+    }
+
+    "- Use the smallest local runnable implementation that matches the detected language profile."
+        .to_string()
 }
 
 pub fn verification(results: &[ShellCommandResult]) -> String {

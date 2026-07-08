@@ -23,7 +23,7 @@ pub fn translate(text: impl Into<SharedString>) -> SharedString {
     }
 
     if is_safe_brand_text(text.as_ref()) {
-        return text.as_ref().replace("Zed", "Gearbox").into();
+        return replace_zed_brand(text.as_ref()).into();
     }
 
     text
@@ -48,19 +48,49 @@ pub fn translate_setting_description(text: impl Into<SharedString>) -> SharedStr
     }
 
     if is_safe_brand_text(text.as_ref()) {
-        return text.as_ref().replace("Zed", "Gearbox").into();
+        return replace_zed_brand(text.as_ref()).into();
     }
 
     text
 }
 
 fn is_safe_brand_text(text: &str) -> bool {
-    text.contains("Zed")
+    text_contains_zed_brand(text)
         && !text.contains('/')
         && !text.contains('\\')
         && !text.contains(':')
         && !text.contains('@')
         && text.len() <= 120
+}
+
+fn text_contains_zed_brand(text: &str) -> bool {
+    text.match_indices("Zed")
+        .any(|(index, _)| is_zed_brand_boundary(text, index))
+}
+
+fn replace_zed_brand(text: &str) -> String {
+    let mut translated = String::with_capacity(text.len());
+    let mut cursor = 0;
+
+    for (index, _) in text.match_indices("Zed") {
+        if !is_zed_brand_boundary(text, index) {
+            continue;
+        }
+        translated.push_str(&text[cursor..index]);
+        translated.push_str("Gearbox");
+        cursor = index + "Zed".len();
+    }
+
+    translated.push_str(&text[cursor..]);
+    translated
+}
+
+fn is_zed_brand_boundary(text: &str, index: usize) -> bool {
+    let previous = text[..index].chars().next_back();
+    let next = text[index + "Zed".len()..].chars().next();
+
+    !previous.is_some_and(is_ascii_identifier_character)
+        && !next.is_some_and(is_ascii_identifier_character)
 }
 
 fn settings_sentence_translation(text: &str) -> Option<SharedString> {
@@ -122,13 +152,13 @@ fn settings_sentence_prefix(text: &str) -> Option<(&'static str, &str)> {
         ("How to ", "如何"),
         ("How ", "如何"),
         ("Default ", "默认"),
-        ("Amount of ", ""),
-        ("Number of ", ""),
+        ("Amount of ", "数量："),
+        ("Number of ", "数量："),
         ("Maximum ", "最大"),
         ("Minimum ", "最小"),
-        ("Files or globs of files that will be ", ""),
+        ("Files or globs of files that will be ", "将被"),
         ("Globs to match ", "用于匹配"),
-        ("A mapping from ", ""),
+        ("A mapping from ", "映射："),
         ("The ", ""),
     ] {
         if let Some(rest) = text.strip_prefix(english) {
@@ -140,7 +170,7 @@ fn settings_sentence_prefix(text: &str) -> Option<(&'static str, &str)> {
 }
 
 fn translate_sentence_fragment(text: &str) -> String {
-    let mut text = text.replace("Zed", "Gearbox");
+    let mut text = replace_zed_brand(text);
 
     for (english, chinese) in [
         ("language servers", "语言服务器"),
@@ -264,8 +294,8 @@ fn localize_sentence_punctuation(text: &str) -> String {
 
     for (index, &(byte_index, character)) in characters.iter().enumerate() {
         match character {
-            '.' if is_sentence_period(&characters, index) => output.push('。'),
-            ',' if is_phrase_comma(&characters, index) => output.push('，'),
+            '.' if is_sentence_period(text, &characters, index) => output.push('。'),
+            ',' if is_phrase_comma(text, &characters, index) => output.push('，'),
             _ => output.push_str(&text[byte_index..byte_index + character.len_utf8()]),
         }
     }
@@ -273,9 +303,13 @@ fn localize_sentence_punctuation(text: &str) -> String {
     output
 }
 
-fn is_sentence_period(characters: &[(usize, char)], index: usize) -> bool {
+fn is_sentence_period(text: &str, characters: &[(usize, char)], index: usize) -> bool {
     let previous = previous_character(characters, index);
     let next = next_character(characters, index);
+
+    if is_known_abbreviation_period(text, characters[index].0) {
+        return false;
+    }
 
     if previous.is_some_and(is_ascii_identifier_character)
         && next.is_some_and(is_ascii_identifier_character)
@@ -286,9 +320,13 @@ fn is_sentence_period(characters: &[(usize, char)], index: usize) -> bool {
     next.is_none_or(|character| character.is_whitespace())
 }
 
-fn is_phrase_comma(characters: &[(usize, char)], index: usize) -> bool {
+fn is_phrase_comma(text: &str, characters: &[(usize, char)], index: usize) -> bool {
     let previous = previous_character(characters, index);
     let next = next_character(characters, index);
+
+    if is_known_abbreviation_comma(text, characters[index].0) {
+        return false;
+    }
 
     if previous.is_some_and(|character| character.is_ascii_digit())
         && next.is_some_and(|character| character.is_ascii_digit())
@@ -312,6 +350,22 @@ fn next_character(characters: &[(usize, char)], index: usize) -> Option<char> {
 
 fn is_ascii_identifier_character(character: char) -> bool {
     character.is_ascii_alphanumeric() || character == '_' || character == '-'
+}
+
+fn is_known_abbreviation_period(text: &str, byte_index: usize) -> bool {
+    let prefix = text[..byte_index + '.'.len_utf8()].to_ascii_lowercase();
+    [
+        "e.g.", "i.e.", "etc.", "vs.", "mr.", "mrs.", "ms.", "dr.", "prof.",
+    ]
+    .iter()
+    .any(|abbreviation| prefix.ends_with(abbreviation))
+}
+
+fn is_known_abbreviation_comma(text: &str, byte_index: usize) -> bool {
+    let prefix = text[..byte_index].to_ascii_lowercase();
+    ["e.g.", "i.e.", "etc."]
+        .iter()
+        .any(|abbreviation| prefix.ends_with(abbreviation))
 }
 
 fn sentence_token_translation(token: &str) -> Option<String> {
@@ -1646,5 +1700,41 @@ mod tests {
             localize_sentence_punctuation("Index 1,000 files."),
             "Index 1,000 files。"
         );
+    }
+
+    #[test]
+    fn preserves_abbreviation_punctuation() {
+        assert_eq!(
+            localize_sentence_punctuation("Use e.g., search, filters."),
+            "Use e.g., search， filters。"
+        );
+        assert_eq!(
+            localize_sentence_punctuation("Use i.e. exact names."),
+            "Use i.e. exact names。"
+        );
+        assert_eq!(
+            localize_sentence_punctuation("Read docs etc. before editing."),
+            "Read docs etc. before editing。"
+        );
+    }
+
+    #[test]
+    fn preserves_meaningful_sentence_prefixes() {
+        let translated = settings_sentence_translation("Amount of padding between items.")
+            .expect("sentence should be translated");
+        assert!(translated.as_ref().starts_with("数量："));
+
+        let translated =
+            settings_sentence_translation("A mapping from languages to file extensions.")
+                .expect("sentence should be translated");
+        assert!(translated.as_ref().starts_with("映射："));
+    }
+
+    #[test]
+    fn replaces_only_standalone_zed_brand_text() {
+        assert_eq!(replace_zed_brand("Zed settings"), "Gearbox settings");
+        assert_eq!(replace_zed_brand("Zed's settings"), "Gearbox's settings");
+        assert_eq!(replace_zed_brand("ZedGraph settings"), "ZedGraph settings");
+        assert_eq!(replace_zed_brand("OpenZed setting"), "OpenZed setting");
     }
 }

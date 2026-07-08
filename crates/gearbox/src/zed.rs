@@ -109,6 +109,21 @@ const DOCS_URL: &str = "https://github.com/ShamirSecret/gearbox-zed/";
 const STATUS_URL: &str = "https://github.com/ShamirSecret/gearbox-zed";
 const MERCH_URL: &str = "https://github.com/ShamirSecret/gearbox-zed";
 
+fn gearbox_env_var(gearbox_name: &str, zed_name: &str) -> Option<String> {
+    std::env::var(gearbox_name)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::env::var(zed_name)
+                .ok()
+                .filter(|value| !value.is_empty())
+        })
+}
+
+fn gearbox_env_set(gearbox_name: &str, zed_name: &str) -> bool {
+    gearbox_env_var(gearbox_name, zed_name).is_some()
+}
+
 pub struct CrashHandler(pub Arc<crashes::Client>);
 
 impl gpui::Global for CrashHandler {}
@@ -342,14 +357,15 @@ pub fn build_window_options(display_uuid: Option<Uuid>, cx: &mut App) -> WindowO
             .find(|display| display.uuid().ok() == Some(uuid))
     });
     let app_id = ReleaseChannel::global(cx).app_id();
-    let window_decorations = match std::env::var("ZED_WINDOW_DECORATIONS") {
-        Ok(val) if val == "server" => gpui::WindowDecorations::Server,
-        Ok(val) if val == "client" => gpui::WindowDecorations::Client,
-        _ => match WorkspaceSettings::get_global(cx).window_decorations {
-            settings::WindowDecorations::Server => gpui::WindowDecorations::Server,
-            settings::WindowDecorations::Client => gpui::WindowDecorations::Client,
-        },
-    };
+    let window_decorations =
+        match gearbox_env_var("GEARBOX_WINDOW_DECORATIONS", "ZED_WINDOW_DECORATIONS") {
+            Some(val) if val == "server" => gpui::WindowDecorations::Server,
+            Some(val) if val == "client" => gpui::WindowDecorations::Client,
+            _ => match WorkspaceSettings::get_global(cx).window_decorations {
+                settings::WindowDecorations::Server => gpui::WindowDecorations::Server,
+                settings::WindowDecorations::Client => gpui::WindowDecorations::Client,
+            },
+        };
 
     let use_system_window_tabs = WorkspaceSettings::get_global(cx).use_system_window_tabs;
 
@@ -701,7 +717,9 @@ fn show_software_emulation_warning_if_needed(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    if specs.is_software_emulated && std::env::var("ZED_ALLOW_EMULATED_GPU").is_err() {
+    if specs.is_software_emulated
+        && !gearbox_env_set("GEARBOX_ALLOW_EMULATED_GPU", "ZED_ALLOW_EMULATED_GPU")
+    {
         let (graphics_api, docs_url, open_url) = if cfg!(target_os = "windows") {
             (
                 "DirectX",
@@ -723,7 +741,7 @@ fn show_software_emulation_warning_if_needed(
             will result in awful performance.
 
             For troubleshooting see: {}
-            Set ZED_ALLOW_EMULATED_GPU=1 env var to permanently override.
+            Set GEARBOX_ALLOW_EMULATED_GPU=1 env var to permanently override.
             "#},
             graphics_api, specs.device_name, docs_url
         );

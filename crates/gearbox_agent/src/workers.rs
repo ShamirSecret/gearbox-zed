@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::state::{Scope, StateStore, Task};
+use crate::state::{Scope, StateStore, Task, TaskInputs};
 use crate::tools::{CancellationToken, run_shell_command_with_env_and_cancellation};
 
 #[derive(Clone, Debug)]
@@ -61,6 +61,7 @@ pub struct WorkerPacket {
     pub worker: String,
     pub goal: String,
     pub scope: Scope,
+    pub inputs: TaskInputs,
     pub constraints: Vec<String>,
     pub required_outputs: Vec<String>,
     pub verification: VerificationContract,
@@ -149,9 +150,11 @@ impl WorkerAdapter for CommandWorker {
             worker: self.name().to_string(),
             goal: goal.to_string(),
             scope: task.scope.clone(),
+            inputs: task.inputs.clone(),
             constraints: vec![
                 "Stay inside the allowed paths when they are provided.".to_string(),
                 "Prefer the package manager already used by the project.".to_string(),
+                "Read the provided spec and plan artifacts before changing code.".to_string(),
                 "Leave runnable local instructions in the final output.".to_string(),
             ],
             required_outputs: vec![

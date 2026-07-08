@@ -75,11 +75,29 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn build_application() -> Application {
     let platform = gpui_platform::current_platform(false);
-    if std::env::var("ZED_EXPERIMENTAL_A11Y").as_deref() == Ok("1") {
+    if gearbox_env_enabled("GEARBOX_EXPERIMENTAL_A11Y", "ZED_EXPERIMENTAL_A11Y") {
         Application::with_platform(platform)
     } else {
         Application::new_inaccessible(platform)
     }
+}
+
+fn gearbox_env_var(gearbox_name: &str, zed_name: &str) -> Option<String> {
+    env::var(gearbox_name)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| env::var(zed_name).ok().filter(|value| !value.is_empty()))
+}
+
+fn gearbox_env_enabled(gearbox_name: &str, zed_name: &str) -> bool {
+    matches!(
+        gearbox_env_var(gearbox_name, zed_name).as_deref(),
+        Some("1" | "true")
+    )
+}
+
+fn gearbox_env_set(gearbox_name: &str, zed_name: &str) -> bool {
+    gearbox_env_var(gearbox_name, zed_name).is_some()
 }
 
 fn files_not_created_on_launch(errors: HashMap<io::ErrorKind, Vec<&Path>>) {
@@ -358,6 +376,7 @@ fn main() {
     let (open_listener, mut open_rx) = OpenListener::new();
 
     let failed_single_instance_check = if *zed_env_vars::ZED_STATELESS
+        || gearbox_env_set("GEARBOX_STATELESS", "ZED_STATELESS")
         || *release_channel::RELEASE_CHANNEL == ReleaseChannel::Dev
     {
         false
@@ -384,8 +403,8 @@ fn main() {
     }
 
     let should_install_crash_handler = matches!(
-        env::var("ZED_GENERATE_MINIDUMPS").as_deref(),
-        Ok("true" | "1")
+        gearbox_env_var("GEARBOX_GENERATE_MINIDUMPS", "ZED_GENERATE_MINIDUMPS").as_deref(),
+        Some("true" | "1")
     ) || *release_channel::RELEASE_CHANNEL
         != ReleaseChannel::Dev;
 
