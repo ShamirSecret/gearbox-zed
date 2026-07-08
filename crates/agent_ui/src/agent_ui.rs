@@ -406,6 +406,7 @@ where
         AgentIdOrLegacyAgent::AgentId(agent_id) => Ok(agent_id),
         AgentIdOrLegacyAgent::LegacyAgent(Agent::Custom { id }) => Ok(id),
         AgentIdOrLegacyAgent::LegacyAgent(Agent::NativeAgent) => Ok(Agent::NativeAgent.id()),
+        AgentIdOrLegacyAgent::LegacyAgent(Agent::GearAgent) => Ok(Agent::GearAgent.id()),
         #[cfg(any(test, feature = "test-support"))]
         AgentIdOrLegacyAgent::LegacyAgent(Agent::Stub) => Ok(Agent::Stub.id()),
     }
@@ -425,6 +426,8 @@ pub enum Agent {
     #[default]
     #[serde(alias = "NativeAgent", alias = "TextThread")]
     NativeAgent,
+    #[serde(alias = "GearAgent")]
+    GearAgent,
     #[serde(alias = "Custom")]
     Custom {
         #[serde(rename = "name")]
@@ -439,6 +442,9 @@ impl From<AgentId> for Agent {
         if id.as_ref() == agent::ZED_AGENT_ID.as_ref() {
             return Self::NativeAgent;
         }
+        if id.as_ref() == agent::GEAR_AGENT_ID.as_ref() {
+            return Self::GearAgent;
+        }
         #[cfg(any(test, feature = "test-support"))]
         if id.as_ref() == "stub" {
             return Self::Stub;
@@ -451,6 +457,7 @@ impl Agent {
     pub fn id(&self) -> AgentId {
         match self {
             Self::NativeAgent => agent::ZED_AGENT_ID.clone(),
+            Self::GearAgent => agent::GEAR_AGENT_ID.clone(),
             Self::Custom { id } => id.clone(),
             #[cfg(any(test, feature = "test-support"))]
             Self::Stub => "stub".into(),
@@ -458,18 +465,19 @@ impl Agent {
     }
 
     pub fn is_native(&self) -> bool {
-        matches!(self, Self::NativeAgent)
+        matches!(self, Self::NativeAgent | Self::GearAgent)
     }
 
     pub fn label(&self) -> SharedString {
         match self {
             Self::NativeAgent => {
                 if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") {
-                    "Gearbox Agent".into()
+                    "Agent".into()
                 } else {
                     "Zed Agent".into()
                 }
             }
+            Self::GearAgent => "Gear".into(),
             Self::Custom { id, .. } => id.0.clone(),
             #[cfg(any(test, feature = "test-support"))]
             Self::Stub => "Stub Agent".into(),
@@ -479,6 +487,7 @@ impl Agent {
     pub fn icon(&self) -> Option<IconName> {
         match self {
             Self::NativeAgent => None,
+            Self::GearAgent => Some(IconName::Sparkle),
             Self::Custom { .. } => Some(IconName::Sparkle),
             #[cfg(any(test, feature = "test-support"))]
             Self::Stub => None,
@@ -492,6 +501,7 @@ impl Agent {
     ) -> Rc<dyn agent_servers::AgentServer> {
         match self {
             Self::NativeAgent => Rc::new(agent::NativeAgentServer::new(fs, thread_store)),
+            Self::GearAgent => Rc::new(agent::NativeAgentServer::gear(fs, thread_store)),
             Self::Custom { id: name } => {
                 Rc::new(agent_servers::CustomAgentServer::new(name.clone()))
             }
@@ -1234,6 +1244,14 @@ mod tests {
             Agent::NativeAgent,
         );
         assert_eq!(
+            serde_json::from_str::<Agent>(r#""GearAgent""#).unwrap(),
+            Agent::GearAgent,
+        );
+        assert_eq!(
+            serde_json::from_str::<Agent>(r#""gear_agent""#).unwrap(),
+            Agent::GearAgent,
+        );
+        assert_eq!(
             serde_json::from_str::<Agent>(r#"{"Custom":{"name":"my-agent"}}"#).unwrap(),
             Agent::Custom {
                 id: "my-agent".into(),
@@ -1256,6 +1274,10 @@ mod tests {
         let action = serde_json::from_str::<NewExternalAgentThread>(r#"{"agent":"NativeAgent"}"#)
             .expect("should deserialize legacy native agent payload");
         assert_eq!(action.agent, Agent::NativeAgent.id());
+
+        let action = serde_json::from_str::<NewExternalAgentThread>(r#"{"agent":"GearAgent"}"#)
+            .expect("should deserialize gear agent payload");
+        assert_eq!(action.agent, Agent::GearAgent.id());
 
         assert!(serde_json::from_str::<NewExternalAgentThread>(r#"{}"#).is_err());
     }

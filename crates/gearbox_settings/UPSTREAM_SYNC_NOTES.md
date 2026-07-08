@@ -13,11 +13,13 @@ When syncing with upstream Zed, check these files first. The intended rule is:
 
 - Adds `crates/gearbox` as the copied Gearbox GUI crate.
 - Adds `crates/gearbox_settings` as the Gearbox-only settings/keymap asset crate.
+- Adds `crates/gearbox_agent` as the Gearbox-only Gear runtime CLI prototype crate.
 - Adds `gearbox_settings` to workspace dependencies.
+- Adds `gearbox_agent` to workspace dependencies.
 
 ### `Cargo.lock`
 
-- Updated by Cargo after adding the `gearbox` and `gearbox_settings` workspace crates.
+- Updated by Cargo after adding the `gearbox`, `gearbox_settings`, and `gearbox_agent` workspace crates.
 
 ### `crates/settings/src/settings.rs`
 
@@ -364,3 +366,32 @@ When syncing with upstream Zed, check these files first. The intended rule is:
 
 - Switches the Snap app entry and command from `zed` to `gearbox`.
 - Keeps internal `ZED_BUNDLE_TYPE` unchanged because it is still an application runtime environment key.
+
+## 2026-07-07 Gearbox Native Agent Split
+
+### `crates/agent/src/agent.rs`
+### `crates/agent/src/native_agent_server.rs`
+
+- Adds a second native agent identity, `Gear`, alongside the existing upstream native agent identity.
+- Keeps the upstream native connection path as `Zed Agent` internally while allowing Gearbox GUI surfaces to display it as `Agent`.
+- Gives the Gear native server its own agent id and telemetry id.
+- Routes Gear prompts through `gearbox_agent::runtime::Orchestrator`, using the ACP/native thread shell only for session hosting and UI rendering.
+- Persists native session work directories so Gear runs in the project workspace instead of the process current directory.
+- Streams Gear runtime events into the native ACP thread so the Gearbox GUI shows Gear-owned progress instead of only the final worker report.
+- Wires GUI cancel to a Gear cancellation token so Gear orchestrator, worker, and verification commands can stop from the native Agent Panel cancel action.
+- Passes the Gear runtime's default iteration limit from the GUI so Gear runs as a bounded goal-pursuit loop instead of a one-shot worker wrapper.
+
+### `crates/agent_ui/src/agent_ui.rs`
+### `crates/agent_ui/src/agent_panel.rs`
+### `crates/agent_ui/src/agent_connection_store.rs`
+### `crates/agent_ui/src/conversation_view/thread_view.rs`
+### `crates/agent_ui/src/mention_set.rs`
+
+- Adds `Agent::GearAgent` as a native GUI agent option that appears only when `GEARBOX_GUI=1`.
+- Keeps the original native agent visible in Gearbox GUI as `Agent`, and adds `Gear` as the second native agent in the agent picker and `list_agents_and_models` output.
+- Updates native connection access to avoid tuple-field assumptions now that native connections carry explicit identity metadata.
+
+### `crates/ui/src/gearbox_text.rs`
+### `crates/ui/src/components/ai/agent_setup_button.rs`
+
+- Updates Gearbox GUI text so upstream Zed agent surfaces display as `Agent`, leaving the new `Gear` label available for the Gear agent entry.

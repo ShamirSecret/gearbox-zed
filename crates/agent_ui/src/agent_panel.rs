@@ -4629,7 +4629,7 @@ impl AgentPanel {
             cx.weak_entity(),
             window.window_handle(),
         )) as Rc<dyn agent::SiblingThreadHost>;
-        native_connection.0.update(cx, |native_agent, _cx| {
+        native_connection.agent().update(cx, |native_agent, _cx| {
             native_agent.set_sibling_thread_host(host);
         });
     }
@@ -4722,6 +4722,7 @@ impl agent::SiblingThreadHost for AgentPanelSiblingHost {
             let agent_choice = match request.agent_id.as_deref() {
                 None => None,
                 Some(id) if id == agent::ZED_AGENT_ID.as_ref() => Some(Agent::NativeAgent),
+                Some(id) if id == agent::GEAR_AGENT_ID.as_ref() => Some(Agent::GearAgent),
                 Some(id) => {
                     // Reject unknown agent ids up front so the model gets a
                     // structured error pointing at `list_agents_and_models`,
@@ -4896,12 +4897,21 @@ impl agent::SiblingThreadHost for AgentPanelSiblingHost {
             }
             models
         };
+        let gear_models = native_models.clone();
         agents.push(agent::AvailableAgent {
             id: agent::ZED_AGENT_ID.to_string(),
             name: Agent::NativeAgent.label(),
             is_native: true,
             models: native_models,
         });
+        if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") {
+            agents.push(agent::AvailableAgent {
+                id: agent::GEAR_AGENT_ID.to_string(),
+                name: Agent::GearAgent.label(),
+                is_native: true,
+                models: gear_models,
+            });
+        }
 
         let project = panel.read(cx).project.clone();
         let agent_server_store = project.read(cx).agent_server_store().clone();
@@ -5819,7 +5829,7 @@ impl AgentPanel {
                 Some(ContextMenu::build(window, cx, |menu, _window, cx| {
                     menu.context(focus_handle.clone())
                         .item(
-                            ContextMenuEntry::new("Zed Agent")
+                            ContextMenuEntry::new(Agent::NativeAgent.label())
                                 .when(
                                     !showing_terminal && is_agent_selected(Agent::NativeAgent),
                                     |this| this.action(Box::new(NewThread)),
@@ -5849,6 +5859,39 @@ impl AgentPanel {
                                     }
                                 }),
                         )
+                        .when(std::env::var("GEARBOX_GUI").as_deref() == Ok("1"), |menu| {
+                            menu.item(
+                                ContextMenuEntry::new(Agent::GearAgent.label())
+                                    .when(
+                                        !showing_terminal && is_agent_selected(Agent::GearAgent),
+                                        |this| this.action(Box::new(NewThread)),
+                                    )
+                                    .icon(IconName::Sparkle)
+                                    .icon_color(Color::Muted)
+                                    .handler({
+                                        let workspace = workspace.clone();
+                                        move |window, cx| {
+                                            if let Some(workspace) = workspace.upgrade() {
+                                                workspace.update(cx, |workspace, cx| {
+                                                    if let Some(panel) =
+                                                        workspace.panel::<AgentPanel>(cx)
+                                                    {
+                                                        panel.update(cx, |panel, cx| {
+                                                            panel.selected_agent = Agent::GearAgent;
+                                                            panel.activate_new_thread(
+                                                                true,
+                                                                AgentThreadSource::AgentPanel,
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        });
+                                                    }
+                                                });
+                                            }
+                                        }
+                                    }),
+                            )
+                        })
                         .when(supports_terminal, |menu| {
                             menu.item(
                                 ContextMenuEntry::new("Terminal")
@@ -11031,6 +11074,10 @@ mod tests {
             Agent::NativeAgent,
         );
         assert_eq!(
+            serde_json::from_str::<Agent>(r#""GearAgent""#).unwrap(),
+            Agent::GearAgent,
+        );
+        assert_eq!(
             serde_json::from_str::<Agent>(r#"{"Custom":{"name":"my-agent"}}"#).unwrap(),
             Agent::Custom {
                 id: "my-agent".into(),
@@ -11049,6 +11096,10 @@ mod tests {
             Agent::NativeAgent,
         );
         assert_eq!(
+            serde_json::from_str::<Agent>(r#""gear_agent""#).unwrap(),
+            Agent::GearAgent,
+        );
+        assert_eq!(
             serde_json::from_str::<Agent>(r#"{"custom":{"name":"my-agent"}}"#).unwrap(),
             Agent::Custom {
                 id: "my-agent".into(),
@@ -11059,6 +11110,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&Agent::NativeAgent).unwrap(),
             r#""native_agent""#,
+        );
+        assert_eq!(
+            serde_json::to_string(&Agent::GearAgent).unwrap(),
+            r#""gear_agent""#,
         );
         assert_eq!(
             serde_json::to_string(&Agent::Custom {

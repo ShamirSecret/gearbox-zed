@@ -618,7 +618,7 @@ impl MentionSet {
             let agent = connection.await?;
             let agent = agent.downcast::<agent::NativeAgentConnection>().unwrap();
             let summary = agent
-                .0
+                .agent()
                 .update(cx, |agent, cx| {
                     agent.thread_summary(id, project.clone(), cx)
                 })

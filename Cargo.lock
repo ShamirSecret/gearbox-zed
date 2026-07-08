@@ -264,6 +264,7 @@ dependencies = [
  "feature_flags",
  "fs",
  "futures 0.3.32",
+ "gearbox_agent",
  "git",
  "gpui",
  "gpui_tokio",
@@ -7328,6 +7329,19 @@ dependencies = [
  "zlog",
  "zlog_settings",
  "ztracing",
+]
+
+[[package]]
+name = "gearbox_agent"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "serde",
+ "serde_json",
+ "smol",
+ "tempfile",
 ]
 
 [[package]]

@@ -35,6 +35,7 @@ db.workspace = true
 feature_flags.workspace = true
 fs.workspace = true
 futures.workspace = true
+gearbox_agent.workspace = true
 git.workspace = true
 gpui.workspace = true
 handlebars = { workspace = true, features = ["rust-embed"] }

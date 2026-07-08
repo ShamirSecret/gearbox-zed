@@ -47,6 +47,9 @@ use fs::Fs;
 use futures::channel::{mpsc, oneshot};
 use futures::future::Shared;
 use futures::{FutureExt as _, StreamExt as _, future};
+use gearbox_agent::runtime::{DEFAULT_MAX_ITERATIONS, Orchestrator, RunOptions};
+use gearbox_agent::tools::CancellationToken;
+use gearbox_agent::workers::WorkerConfig;
 use gpui::{
     App, AppContext, AsyncApp, Context, Entity, EntityId, SharedString, Subscription, Task,
     TaskExt, WeakEntity,
@@ -63,6 +66,7 @@ use prompt_store::{ProjectContext, RULES_FILE_NAMES, RulesFileContext, WorktreeC
 use serde::{Deserialize, Serialize};
 use settings::{LanguageModelSelection, Settings as _, update_settings_file};
 use std::any::Any;
+use std::fs as std_fs;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock};
@@ -205,6 +209,8 @@ struct Session {
     thread: Entity<Thread>,
     /// The ACP thread that handles protocol communication
     acp_thread: Entity<acp_thread::AcpThread>,
+    work_dirs: Option<PathList>,
+    gear_cancellation_token: Option<CancellationToken>,
     project_id: EntityId,
     pending_save: Task<Result<()>>,
     _subscriptions: Vec<Subscription>,
@@ -720,6 +726,9 @@ impl NativeAgent {
     fn new_session(
         &mut self,
         project: Entity<Project>,
+        work_dirs: PathList,
+        agent_id: AgentId,
+        telemetry_id: SharedString,
         cx: &mut Context<Self>,
     ) -> Entity<AcpThread> {
         let project_id = self.get_or_create_project_state(&project, cx);
@@ -744,7 +753,15 @@ impl NativeAgent {
             )
         });
 
-        self.register_session(thread, project_id, 1, cx)
+        self.register_session(
+            thread,
+            project_id,
+            1,
+            Some(work_dirs),
+            agent_id,
+            telemetry_id,
+            cx,
+        )
     }
 
     fn register_session(
@@ -752,9 +769,16 @@ impl NativeAgent {
         thread_handle: Entity<Thread>,
         project_id: EntityId,
         ref_count: usize,
+        work_dirs: Option<PathList>,
+        agent_id: AgentId,
+        telemetry_id: SharedString,
         cx: &mut Context<Self>,
     ) -> Entity<AcpThread> {
-        let connection = Rc::new(NativeAgentConnection(cx.entity()));
+        let connection = Rc::new(NativeAgentConnection::with_identity(
+            cx.entity(),
+            agent_id,
+            telemetry_id,
+        ));
 
         let thread = thread_handle.read(cx);
         let session_id = thread.id().clone();
@@ -770,7 +794,7 @@ impl NativeAgent {
             let mut acp_thread = acp_thread::AcpThread::new(
                 parent_session_id,
                 title,
-                None,
+                work_dirs.clone(),
                 connection,
                 project.clone(),
                 action_log.clone(),
@@ -823,6 +847,8 @@ impl NativeAgent {
             Session {
                 thread: thread_handle,
                 acp_thread: acp_thread.clone(),
+                work_dirs,
+                gear_cancellation_token: None,
                 project_id,
                 _subscriptions: subscriptions,
                 pending_save: Task::ready(Ok(())),
@@ -1607,6 +1633,18 @@ impl NativeAgent {
         project: Entity<Project>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<AcpThread>>> {
+        self.open_thread_with_identity(id, project, None, ZED_AGENT_ID.clone(), "zed".into(), cx)
+    }
+
+    pub fn open_thread_with_identity(
+        &mut self,
+        id: acp::SessionId,
+        project: Entity<Project>,
+        work_dirs: Option<PathList>,
+        agent_id: AgentId,
+        telemetry_id: SharedString,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<AcpThread>>> {
         if let Some(session) = self.sessions.get_mut(&id) {
             session.ref_count += 1;
             return Task::ready(Ok(session.acp_thread.clone()));
@@ -1640,7 +1678,15 @@ impl NativeAgent {
                                 .pending_sessions
                                 .remove(&id)
                                 .map_or(1, |pending| pending.ref_count);
-                            this.register_session(thread.clone(), project_id, ref_count, cx)
+                            this.register_session(
+                                thread.clone(),
+                                project_id,
+                                ref_count,
+                                work_dirs,
+                                agent_id,
+                                telemetry_id,
+                                cx,
+                            )
                         })
                         .map_err(Arc::new)?;
                     let events = thread.update(cx, |thread, cx| thread.replay(cx));
@@ -1911,7 +1957,7 @@ impl NativeAgent {
                 }
             })?;
 
-            let connection = this.upgrade().map(NativeAgentConnection);
+            let connection = this.upgrade().map(NativeAgentConnection::new);
             cx.update(|cx| {
                 NativeAgentConnection::handle_thread_events(
                     response_stream,
@@ -1947,7 +1993,7 @@ impl NativeAgent {
                 acp_thread.update_token_usage(None, cx);
             });
 
-            let connection = this.upgrade().map(NativeAgentConnection);
+            let connection = this.upgrade().map(NativeAgentConnection::new);
             cx.update(|cx| {
                 NativeAgentConnection::handle_thread_events(
                     response_stream,
@@ -2051,7 +2097,7 @@ impl NativeAgent {
 
             let response_stream = thread.update(cx, |thread, cx| thread.send_existing(cx))?;
 
-            let connection = this.upgrade().map(NativeAgentConnection);
+            let connection = this.upgrade().map(NativeAgentConnection::new);
             cx.update(|cx| {
                 NativeAgentConnection::handle_thread_events(
                     response_stream,
@@ -2067,11 +2113,45 @@ impl NativeAgent {
 
 /// Wrapper struct that implements the AgentConnection trait
 #[derive(Clone)]
-pub struct NativeAgentConnection(pub Entity<NativeAgent>);
+pub struct NativeAgentConnection {
+    agent: Entity<NativeAgent>,
+    agent_id: AgentId,
+    telemetry_id: SharedString,
+}
+
+impl NativeAgentConnection {
+    pub fn new(agent: Entity<NativeAgent>) -> Self {
+        Self::with_identity(agent, ZED_AGENT_ID.clone(), "zed".into())
+    }
+
+    pub fn gear(agent: Entity<NativeAgent>) -> Self {
+        Self::with_identity(agent, GEAR_AGENT_ID.clone(), "gear".into())
+    }
+
+    pub(crate) fn with_identity(
+        agent: Entity<NativeAgent>,
+        agent_id: AgentId,
+        telemetry_id: SharedString,
+    ) -> Self {
+        Self {
+            agent,
+            agent_id,
+            telemetry_id,
+        }
+    }
+
+    pub fn agent(&self) -> &Entity<NativeAgent> {
+        &self.agent
+    }
+
+    fn is_gear(&self) -> bool {
+        self.agent_id.as_ref() == GEAR_AGENT_ID.as_ref()
+    }
+}
 
 impl NativeAgentConnection {
     pub fn thread(&self, session_id: &acp::SessionId, cx: &App) -> Option<Entity<Thread>> {
-        self.0
+        self.agent
             .read(cx)
             .sessions
             .get(session_id)
@@ -2084,12 +2164,12 @@ impl NativeAgentConnection {
     /// conversation submit) so that the skills directory is observed
     /// only when the user is actually engaging with the panel.
     pub fn ensure_skills_scan_started(&self, cx: &mut App) {
-        self.0
+        self.agent
             .update(cx, |agent, cx| agent.ensure_skills_scan_started(cx));
     }
 
     pub fn refresh_skills_for_project(&self, project: Entity<Project>, cx: &mut App) {
-        self.0.update(cx, |agent, cx| {
+        self.agent.update(cx, |agent, cx| {
             let project_id = agent.get_or_create_project_state(&project, cx);
             agent.ensure_skills_scan_started(cx);
             if let Some(state) = agent.projects.get_mut(&project_id) {
@@ -2103,7 +2183,7 @@ impl NativeAgentConnection {
         session_id: &acp::SessionId,
         cx: &App,
     ) -> Vec<NativeAvailableSkill> {
-        self.0
+        self.agent
             .read(cx)
             .session_project_state(session_id)
             .map(|state| {
@@ -2122,7 +2202,7 @@ impl NativeAgentConnection {
         project: Entity<Project>,
         cx: &mut App,
     ) -> Task<Result<Entity<Thread>>> {
-        self.0
+        self.agent
             .update(cx, |this, cx| this.load_thread(id, project, cx))
     }
 
@@ -2133,7 +2213,7 @@ impl NativeAgentConnection {
         f: impl 'static
         + FnOnce(Entity<Thread>, &mut App) -> Result<mpsc::UnboundedReceiver<Result<ThreadEvent>>>,
     ) -> Task<Result<acp::PromptResponse>> {
-        let Some((thread, acp_thread)) = self.0.update(cx, |agent, _cx| {
+        let Some((thread, acp_thread)) = self.agent.update(cx, |agent, _cx| {
             agent
                 .sessions
                 .get_mut(&session_id)
@@ -2246,7 +2326,7 @@ impl NativeAgentConnection {
                                 {
                                     if let Some(connection) = &connection {
                                         cx.update(|cx| {
-                                            connection.0.update(cx, |agent, _| {
+                                            connection.agent.update(cx, |agent, _| {
                                                 agent.models.notify_model_selection_changed();
                                             });
                                         });
@@ -2283,6 +2363,266 @@ impl NativeAgentConnection {
             anyhow::Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))
         })
     }
+
+    fn send_gear_prompt(
+        &self,
+        client_user_message_id: acp_thread::ClientUserMessageId,
+        params: acp::PromptRequest,
+        cx: &mut App,
+    ) -> Task<Result<acp::PromptResponse>> {
+        let session_id = params.session_id.clone();
+        let prompt_blocks = params.prompt;
+        let request = gear_request_from_prompt(&prompt_blocks);
+        let cancellation_token = CancellationToken::new();
+
+        if request.trim().is_empty() {
+            return Task::ready(Err(anyhow!("Gear prompt cannot be empty")));
+        }
+
+        let session = self.agent.update(cx, |agent, cx| {
+            let session = agent
+                .sessions
+                .get(&session_id)
+                .context("Gear session not found")?;
+            let state = agent
+                .projects
+                .get(&session.project_id)
+                .context("Gear project state not found")?;
+            let workspace = gear_workspace_for_session(session, agent, cx)?;
+            let path_style = state.project.read(cx).path_style(cx);
+            anyhow::Ok((
+                session.acp_thread.clone(),
+                session.thread.clone(),
+                workspace,
+                path_style,
+            ))
+        });
+        let (acp_thread, thread, workspace, path_style) = match session {
+            Ok(session) => session,
+            Err(error) => return Task::ready(Err(error)),
+        };
+
+        self.agent.update(cx, |agent, _cx| {
+            if let Some(session) = agent.sessions.get_mut(&session_id) {
+                session.gear_cancellation_token = Some(cancellation_token.clone());
+            }
+        });
+
+        acp_thread.update(cx, |acp_thread, cx| {
+            for block in prompt_blocks.iter().cloned() {
+                acp_thread.push_user_content_block(Some(client_user_message_id.clone()), block, cx);
+            }
+        });
+        thread.update(cx, |thread, cx| {
+            thread.push_acp_user_block(
+                client_user_message_id,
+                prompt_blocks.clone(),
+                path_style,
+                cx,
+            );
+        });
+
+        let (event_tx, event_rx) = async_channel::unbounded::<String>();
+        let run_cancellation_token = cancellation_token.clone();
+        let run_task = cx.background_spawn(async move {
+            let event_sink = {
+                let event_tx = event_tx.clone();
+                Arc::new(move |event: &gearbox_agent::state::Event| {
+                    event_tx.try_send(gear_event_status_markdown(event)).ok();
+                }) as gearbox_agent::runtime::EventSink
+            };
+            let outcome = Orchestrator::run(RunOptions {
+                request,
+                workspace,
+                verification_commands: gear_verification_commands_from_env(),
+                worker: gear_worker_config_from_env(),
+                allowed_paths: Vec::new(),
+                forbidden_paths: Vec::new(),
+                max_files_changed: 40,
+                install_dependencies: false,
+                event_sink: Some(event_sink),
+                cancellation_token: Some(run_cancellation_token),
+                max_iterations: DEFAULT_MAX_ITERATIONS,
+            })?;
+            let final_report =
+                std_fs::read_to_string(&outcome.final_report_path).with_context(|| {
+                    format!(
+                        "failed to read Gear final report {}",
+                        outcome.final_report_path.display()
+                    )
+                })?;
+            anyhow::Ok((outcome, final_report))
+        });
+
+        let agent = self.agent.clone();
+        let cancellation_session_id = session_id.clone();
+        cx.spawn(async move |cx| {
+            while let Ok(message) = event_rx.recv().await {
+                push_gear_assistant_markdown(&acp_thread, &thread, message, cx);
+            }
+
+            let response = match run_task.await {
+                Ok((outcome, final_report)) => {
+                    let message = gear_response_markdown(&outcome, &final_report);
+                    push_gear_assistant_markdown(&acp_thread, &thread, message, cx);
+                    Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))
+                }
+                Err(_) if cancellation_token.is_cancelled() => {
+                    push_gear_assistant_markdown(
+                        &acp_thread,
+                        &thread,
+                        "Gear run cancelled.\n\n".to_string(),
+                        cx,
+                    );
+                    Ok(acp::PromptResponse::new(acp::StopReason::Cancelled))
+                }
+                Err(error) => {
+                    let message = format!("# Gear run failed\n\n```text\n{error:#}\n```");
+                    push_gear_assistant_markdown(&acp_thread, &thread, message, cx);
+                    Err(error)
+                }
+            };
+
+            clear_gear_cancellation_token(
+                &agent,
+                &cancellation_session_id,
+                &cancellation_token,
+                cx,
+            );
+            response
+        })
+    }
+}
+
+fn clear_gear_cancellation_token(
+    agent: &Entity<NativeAgent>,
+    session_id: &acp::SessionId,
+    cancellation_token: &CancellationToken,
+    cx: &mut AsyncApp,
+) {
+    agent.update(cx, |agent, _cx| {
+        if let Some(session) = agent.sessions.get_mut(session_id) {
+            let should_clear = session
+                .gear_cancellation_token
+                .as_ref()
+                .is_some_and(|token| token.is_same(cancellation_token));
+            if should_clear {
+                session.gear_cancellation_token = None;
+            }
+        }
+    });
+}
+
+fn push_gear_assistant_markdown(
+    acp_thread: &Entity<AcpThread>,
+    thread: &Entity<Thread>,
+    message: String,
+    cx: &mut AsyncApp,
+) {
+    let block = acp::ContentBlock::Text(acp::TextContent::new(message));
+    acp_thread.update(cx, |acp_thread, cx| {
+        acp_thread.push_assistant_content_block(block.clone(), false, cx);
+    });
+    thread.update(cx, |thread, cx| {
+        thread.push_acp_agent_block(block, cx);
+    });
+}
+
+fn gear_request_from_prompt(prompt: &[acp::ContentBlock]) -> String {
+    prompt
+        .iter()
+        .filter_map(|block| match block {
+            acp::ContentBlock::Text(text) => Some(text.text.trim()),
+            _ => None,
+        })
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn gear_workspace_for_session(session: &Session, agent: &NativeAgent, cx: &App) -> Result<PathBuf> {
+    if let Some(path) = session.work_dirs.as_ref().and_then(|work_dirs| {
+        work_dirs
+            .paths()
+            .iter()
+            .find(|path| !path.as_os_str().is_empty())
+    }) {
+        return Ok(path.clone());
+    }
+
+    let state = agent
+        .projects
+        .get(&session.project_id)
+        .context("Gear project state not found")?;
+    let Some(worktree) = state.project.read(cx).visible_worktrees(cx).next() else {
+        return Err(anyhow!("Gear requires an open local worktree"));
+    };
+    Ok(worktree.read(cx).abs_path().to_path_buf())
+}
+
+fn gear_worker_config_from_env() -> WorkerConfig {
+    let opencode_command = std::env::var("GEARBOX_OPENCODE_COMMAND")
+        .ok()
+        .map(|command| command.trim().to_string())
+        .filter(|command| !command.is_empty());
+
+    WorkerConfig {
+        opencode_command,
+        skip_worker: false,
+        require_worker: false,
+    }
+}
+
+fn gear_verification_commands_from_env() -> Vec<String> {
+    std::env::var("GEARBOX_GEAR_VERIFY_COMMANDS")
+        .ok()
+        .map(|commands| {
+            commands
+                .lines()
+                .map(str::trim)
+                .filter(|command| !command.is_empty())
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn gear_event_status_markdown(event: &gearbox_agent::state::Event) -> String {
+    let task = event
+        .task_id
+        .as_ref()
+        .map(|task_id| format!(" `{task_id}`"))
+        .unwrap_or_default();
+    let path = event
+        .data
+        .get("path")
+        .or_else(|| event.data.get("verification_path"))
+        .or_else(|| event.data.get("final_report_path"))
+        .and_then(|value| value.as_str())
+        .map(|path| format!(" (`{path}`)"))
+        .unwrap_or_default();
+
+    if task.is_empty() {
+        format!("Gear: {}{path}\n\n", event.message)
+    } else {
+        format!("Gear:{task} {}{path}\n\n", event.message)
+    }
+}
+
+fn gear_response_markdown(
+    outcome: &gearbox_agent::runtime::RunOutcome,
+    final_report: &str,
+) -> String {
+    format!(
+        "# Gear run complete\n\n- Goal: `{}`\n- Session: `{}`\n- Status: `{}`\n- Artifacts: `{}`\n- Events: `{}`\n- Final report: `{}`\n\n{}",
+        outcome.goal_id,
+        outcome.session_id,
+        outcome.status.as_str(),
+        outcome.artifacts_root.display(),
+        outcome.events_path.display(),
+        outcome.final_report_path.display(),
+        final_report.trim(),
+    )
 }
 
 struct Command<'a> {
@@ -2386,7 +2726,7 @@ struct NativeAgentModelSelector {
 impl acp_thread::AgentModelSelector for NativeAgentModelSelector {
     fn list_models(&self, cx: &mut App) -> Task<Result<acp_thread::AgentModelList>> {
         log::debug!("NativeAgentConnection::list_models called");
-        let list = self.connection.0.read(cx).models.model_list.clone();
+        let list = self.connection.agent.read(cx).models.model_list.clone();
         Task::ready(if list.is_empty() {
             Err(anyhow::anyhow!("No models available"))
         } else {
@@ -2402,7 +2742,7 @@ impl acp_thread::AgentModelSelector for NativeAgentModelSelector {
         );
         let Some(thread) = self
             .connection
-            .0
+            .agent
             .read(cx)
             .sessions
             .get(&self.session_id)
@@ -2411,7 +2751,13 @@ impl acp_thread::AgentModelSelector for NativeAgentModelSelector {
             return Task::ready(Err(anyhow!("Session not found")));
         };
 
-        let Some(model) = self.connection.0.read(cx).models.model_from_id(&model_id) else {
+        let Some(model) = self
+            .connection
+            .agent
+            .read(cx)
+            .models
+            .model_from_id(&model_id)
+        else {
             return Task::ready(Err(anyhow!("Invalid model ID {}", model_id)));
         };
 
@@ -2441,7 +2787,7 @@ impl acp_thread::AgentModelSelector for NativeAgentModelSelector {
         });
 
         update_settings_file(
-            self.connection.0.read(cx).fs.clone(),
+            self.connection.agent.read(cx).fs.clone(),
             cx,
             move |settings, cx| {
                 let provider = model.provider_id().0.to_string();
@@ -2467,7 +2813,7 @@ impl acp_thread::AgentModelSelector for NativeAgentModelSelector {
     fn selected_model(&self, cx: &mut App) -> Task<Result<acp_thread::AgentModelInfo>> {
         let Some(thread) = self
             .connection
-            .0
+            .agent
             .read(cx)
             .sessions
             .get(&self.session_id)
@@ -2497,7 +2843,7 @@ impl acp_thread::AgentModelSelector for NativeAgentModelSelector {
 
     fn toggle_favorite_model(&self, model_id: AgentModelId, should_be_favorite: bool, cx: &App) {
         let selection = model_id_to_selection(&model_id, cx);
-        let fs = self.connection.0.read(cx).fs.clone();
+        let fs = self.connection.agent.read(cx).fs.clone();
         update_settings_file(fs, cx, move |settings, _| {
             let agent = settings.agent.get_or_insert_default();
             if should_be_favorite {
@@ -2509,7 +2855,7 @@ impl acp_thread::AgentModelSelector for NativeAgentModelSelector {
     }
 
     fn watch(&self, cx: &mut App) -> Option<watch::Receiver<()>> {
-        Some(self.connection.0.read(cx).models.watch())
+        Some(self.connection.agent.read(cx).models.watch())
     }
 
     fn should_render_footer(&self) -> bool {
@@ -2556,14 +2902,15 @@ fn model_id_to_selection(model_id: &AgentModelId, cx: &App) -> LanguageModelSele
 }
 
 pub static ZED_AGENT_ID: LazyLock<AgentId> = LazyLock::new(|| AgentId::new("Zed Agent"));
+pub static GEAR_AGENT_ID: LazyLock<AgentId> = LazyLock::new(|| AgentId::new("Gear"));
 
 impl acp_thread::AgentConnection for NativeAgentConnection {
     fn agent_id(&self) -> AgentId {
-        ZED_AGENT_ID.clone()
+        self.agent_id.clone()
     }
 
     fn telemetry_id(&self) -> SharedString {
-        "zed".into()
+        self.telemetry_id.clone()
     }
 
     fn new_session(
@@ -2573,9 +2920,15 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
         cx: &mut App,
     ) -> Task<Result<Entity<acp_thread::AcpThread>>> {
         log::debug!("Creating new thread for project at: {work_dirs:?}");
-        Task::ready(Ok(self
-            .0
-            .update(cx, |agent, cx| agent.new_session(project, cx))))
+        Task::ready(Ok(self.agent.update(cx, |agent, cx| {
+            agent.new_session(
+                project,
+                work_dirs,
+                self.agent_id.clone(),
+                self.telemetry_id.clone(),
+                cx,
+            )
+        })))
     }
 
     fn supports_load_session(&self) -> bool {
@@ -2586,12 +2939,20 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
         self: Rc<Self>,
         session_id: acp::SessionId,
         project: Entity<Project>,
-        _work_dirs: PathList,
+        work_dirs: PathList,
         _title: Option<SharedString>,
         cx: &mut App,
     ) -> Task<Result<Entity<acp_thread::AcpThread>>> {
-        self.0
-            .update(cx, |agent, cx| agent.open_thread(session_id, project, cx))
+        self.agent.update(cx, |agent, cx| {
+            agent.open_thread_with_identity(
+                session_id,
+                project,
+                Some(work_dirs),
+                self.agent_id.clone(),
+                self.telemetry_id.clone(),
+                cx,
+            )
+        })
     }
 
     fn supports_close_session(&self) -> bool {
@@ -2603,7 +2964,7 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
         session_id: &acp::SessionId,
         cx: &mut App,
     ) -> Task<Result<()>> {
-        self.0
+        self.agent
             .update(cx, |agent, cx| agent.close_session(session_id, cx))
     }
 
@@ -2656,8 +3017,11 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
 
     fn cancel(&self, session_id: &acp::SessionId, cx: &mut App) {
         log::info!("Cancelling on session: {}", session_id);
-        self.0.update(cx, |agent, cx| {
+        self.agent.update(cx, |agent, cx| {
             if let Some(session) = agent.sessions.get(session_id) {
+                if let Some(cancellation_token) = session.gear_cancellation_token.as_ref() {
+                    cancellation_token.cancel();
+                }
                 session
                     .thread
                     .update(cx, |thread, cx| thread.cancel(cx))
@@ -2671,7 +3035,7 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
         session_id: &acp::SessionId,
         cx: &App,
     ) -> Option<Rc<dyn acp_thread::AgentSessionTruncate>> {
-        self.0.read_with(cx, |agent, _cx| {
+        self.agent.read_with(cx, |agent, _cx| {
             agent.sessions.get(session_id).map(|session| {
                 Rc::new(NativeAgentSessionTruncate {
                     thread: session.thread.clone(),
@@ -2686,7 +3050,7 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
         session_id: &acp::SessionId,
         cx: &App,
     ) -> Option<Rc<dyn acp_thread::AgentSessionSetTitle>> {
-        self.0.read_with(cx, |agent, _cx| {
+        self.agent.read_with(cx, |agent, _cx| {
             agent
                 .sessions
                 .get(session_id)
@@ -2700,7 +3064,7 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
     }
 
     fn session_list(&self, cx: &mut App) -> Option<Rc<dyn AgentSessionList>> {
-        let thread_store = self.0.read(cx).thread_store.clone();
+        let thread_store = self.agent.read(cx).thread_store.clone();
         Some(Rc::new(NativeAgentSessionList::new(thread_store, cx)) as _)
     }
 
@@ -2724,9 +3088,13 @@ impl acp_thread::AgentSessionClientUserMessageIds for NativeAgentConnection {
         log::info!("Received prompt request for session: {}", session_id);
         log::debug!("Prompt blocks count: {}", params.prompt.len());
 
-        let Some(project_state) = self.0.read(cx).session_project_state(&session_id) else {
+        if self.is_gear() {
+            return self.send_gear_prompt(client_user_message_id, params, cx);
+        }
+
+        let Some(project_state) = self.agent.read(cx).session_project_state(&session_id) else {
             log::error!("Session not found in prompt: {}", session_id);
-            if self.0.read(cx).sessions.contains_key(&session_id) {
+            if self.agent.read(cx).sessions.contains_key(&session_id) {
                 log::error!(
                     "Session found in sessions map, but not in project state: {}",
                     session_id
@@ -2737,7 +3105,7 @@ impl acp_thread::AgentSessionClientUserMessageIds for NativeAgentConnection {
 
         if let Some(parsed_command) = Command::parse(&params.prompt) {
             if parsed_command.is_unqualified(COMPACT_COMMAND_NAME) {
-                return self.0.update(cx, |agent, cx| {
+                return self.agent.update(cx, |agent, cx| {
                     agent.send_compact_command(client_user_message_id, session_id, cx)
                 });
             }
@@ -2754,7 +3122,7 @@ impl acp_thread::AgentSessionClientUserMessageIds for NativeAgentConnection {
                 })
             {
                 let skill = skill.clone();
-                return self.0.update(cx, |agent, cx| {
+                return self.agent.update(cx, |agent, cx| {
                     agent.send_skill_invocation(
                         client_user_message_id,
                         session_id.clone(),
@@ -2794,7 +3162,7 @@ impl acp_thread::AgentSessionClientUserMessageIds for NativeAgentConnection {
                 let prompt_name = prompt.prompt.name.clone();
                 let server_id = prompt.server_id.clone();
 
-                return self.0.update(cx, |agent, cx| {
+                return self.agent.update(cx, |agent, cx| {
                     agent.send_mcp_prompt(
                         client_user_message_id,
                         session_id.clone(),
@@ -2842,7 +3210,7 @@ impl acp_thread::AgentSessionClientUserMessageIds for NativeAgentConnection {
                     });
                 if let Some(skill) = resolved {
                     let skill = skill.clone();
-                    return self.0.update(cx, |agent, cx| {
+                    return self.agent.update(cx, |agent, cx| {
                         agent.send_skill_invocation(
                             client_user_message_id,
                             session_id.clone(),
@@ -2880,7 +3248,7 @@ impl acp_thread::AgentTelemetry for NativeAgentConnection {
         session_id: &acp::SessionId,
         cx: &mut App,
     ) -> Task<Result<serde_json::Value>> {
-        let Some(session) = self.0.read(cx).sessions.get(session_id) else {
+        let Some(session) = self.agent.read(cx).sessions.get(session_id) else {
             return Task::ready(Err(anyhow!("Session not found")));
         };
 
@@ -3063,7 +3431,15 @@ impl NativeThreadEnvironment {
                     .get(&parent_session_id)
                     .map(|s| s.project_id)
                     .context("parent session not found")?;
-                Ok(agent.register_session(subagent_thread.clone(), project_id, 1, cx))
+                Ok(agent.register_session(
+                    subagent_thread.clone(),
+                    project_id,
+                    1,
+                    None,
+                    ZED_AGENT_ID.clone(),
+                    "zed".into(),
+                    cx,
+                ))
             })??;
 
         let depth = current_depth + 1;
@@ -3743,7 +4119,7 @@ mod internal_tests {
         let project = Project::test(fs.clone(), [Path::new("/a")], cx).await;
         let thread_store = cx.new(|cx| ThreadStore::new(cx));
         let agent = cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs, cx));
-        let connection = Rc::new(NativeAgentConnection(agent.clone()));
+        let connection = Rc::new(NativeAgentConnection::new(agent.clone()));
         let acp_thread = cx
             .update(|cx| {
                 connection.clone().new_session(
@@ -3787,7 +4163,7 @@ mod internal_tests {
         let agent =
             cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs.clone(), cx));
 
-        let connection = NativeAgentConnection(agent.clone());
+        let connection = NativeAgentConnection::new(agent.clone());
         let acp_thread = cx
             .update(|cx| {
                 Rc::new(connection.clone()).new_session(
@@ -3864,6 +4240,63 @@ mod internal_tests {
         model.end_completion_stream(&request);
         cx.run_until_parked();
         prompt_task.await.unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_gear_prompt_runs_gearbox_orchestrator(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("README.md"), "# Gear test\n").unwrap();
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/", json!({ "a": {} })).await;
+        let project = Project::test(fs.clone(), [Path::new("/a")], cx).await;
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        let agent = cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs, cx));
+        let connection = Rc::new(NativeAgentConnection::gear(agent));
+
+        let acp_thread = cx
+            .update(|cx| {
+                connection.clone().new_session(
+                    project.clone(),
+                    PathList::new(&[workspace.path()]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let session_id = cx.update(|cx| acp_thread.read(cx).session_id().clone());
+
+        let prompt_task = cx.update(|cx| {
+            connection.prompt(
+                acp::PromptRequest::new(session_id, vec!["Build a tiny notes app MVP".into()]),
+                cx,
+            )
+        });
+        prompt_task.await.unwrap();
+        cx.run_until_parked();
+
+        let gearbox_root = workspace.path().join(".gearbox-agent");
+        assert!(gearbox_root.join("sessions").is_dir());
+        assert!(gearbox_root.join("goals").is_dir());
+
+        let final_report = std::fs::read_dir(gearbox_root.join("artifacts"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path().join("final-report.md"))
+            .find(|path| path.exists())
+            .expect("Gear should write a final report artifact");
+        let final_report = std::fs::read_to_string(final_report).unwrap();
+        assert!(!final_report.trim().is_empty());
+
+        let goal = std::fs::read_dir(gearbox_root.join("goals"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| std::fs::read_to_string(entry.path()).unwrap())
+            .find(|content| content.contains("Build a tiny notes app MVP"))
+            .expect("Gear should persist the original request in the goal ledger");
+        assert!(goal.contains("\"request\""));
     }
 
     #[gpui::test]
@@ -4384,7 +4817,7 @@ mod internal_tests {
             cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs.clone(), cx));
 
         // Creating a session registers the project and triggers context building.
-        let connection = NativeAgentConnection(agent.clone());
+        let connection = NativeAgentConnection::new(agent.clone());
         let _acp_thread = cx
             .update(|cx| {
                 Rc::new(connection).new_session(
@@ -4481,7 +4914,7 @@ mod internal_tests {
             agent.update(cx, |agent, cx| agent.ensure_skills_scan_started(cx));
         });
 
-        let connection = NativeAgentConnection(agent.clone());
+        let connection = NativeAgentConnection::new(agent.clone());
         let _acp_thread = cx
             .update(|cx| {
                 Rc::new(connection).new_session(
@@ -4546,7 +4979,7 @@ mod internal_tests {
             agent.update(cx, |agent, cx| agent.ensure_skills_scan_started(cx));
         });
 
-        let connection = NativeAgentConnection(agent.clone());
+        let connection = NativeAgentConnection::new(agent.clone());
         let acp_thread = cx
             .update(|cx| {
                 Rc::new(connection.clone()).new_session(
@@ -4646,7 +5079,7 @@ mod internal_tests {
             agent.update(cx, |agent, cx| agent.ensure_skills_scan_started(cx));
         });
 
-        let connection = NativeAgentConnection(agent.clone());
+        let connection = NativeAgentConnection::new(agent.clone());
         let _acp_thread = cx
             .update(|cx| {
                 Rc::new(connection).new_session(
@@ -4744,7 +5177,7 @@ mod internal_tests {
             agent.update(cx, |agent, cx| agent.ensure_skills_scan_started(cx));
         });
 
-        let connection = NativeAgentConnection(agent.clone());
+        let connection = NativeAgentConnection::new(agent.clone());
         let _acp_thread = cx
             .update(|cx| {
                 Rc::new(connection).new_session(
@@ -4821,7 +5254,7 @@ mod internal_tests {
             agent.update(cx, |agent, cx| agent.ensure_skills_scan_started(cx));
         });
 
-        let connection = NativeAgentConnection(agent.clone());
+        let connection = NativeAgentConnection::new(agent.clone());
         let _acp_thread = cx
             .update(|cx| {
                 Rc::new(connection).new_session(
@@ -4965,7 +5398,7 @@ mod internal_tests {
         // Open a parent session through the connection, the same way
         // production does. This triggers project-context refresh which
         // populates `state.skills` for the project.
-        let connection = NativeAgentConnection(agent.clone());
+        let connection = NativeAgentConnection::new(agent.clone());
         let _parent_acp = cx
             .update(|cx| {
                 Rc::new(connection).new_session(
@@ -5014,7 +5447,15 @@ mod internal_tests {
         // Run the subagent through the production registration path.
         // This is what installs the `SkillTool` on the thread.
         let _subagent_acp = agent.update(cx, |agent, cx| {
-            agent.register_session(subagent_thread.clone(), parent_project_id, 1, cx)
+            agent.register_session(
+                subagent_thread.clone(),
+                parent_project_id,
+                1,
+                None,
+                ZED_AGENT_ID.clone(),
+                "zed".into(),
+                cx,
+            )
         });
 
         // Verify the subagent thread has the `SkillTool` installed —
@@ -5075,7 +5516,7 @@ mod internal_tests {
         let agent =
             cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs.clone(), cx));
 
-        let connection = NativeAgentConnection(agent.clone());
+        let connection = NativeAgentConnection::new(agent.clone());
         let acp_thread = cx
             .update(|cx| {
                 Rc::new(connection.clone()).new_session(
@@ -5180,7 +5621,7 @@ mod internal_tests {
         let agent =
             cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs.clone(), cx));
 
-        let connection = NativeAgentConnection(agent.clone());
+        let connection = NativeAgentConnection::new(agent.clone());
         let acp_thread = cx
             .update(|cx| {
                 Rc::new(connection.clone()).new_session(
@@ -5272,7 +5713,7 @@ mod internal_tests {
         let agent =
             cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs.clone(), cx));
 
-        let connection = NativeAgentConnection(agent.clone());
+        let connection = NativeAgentConnection::new(agent.clone());
         let _acp_thread = cx
             .update(|cx| {
                 Rc::new(connection).new_session(
@@ -5547,7 +5988,7 @@ mod internal_tests {
         fs.insert_tree("/", json!({ "a": {}  })).await;
         let project = Project::test(fs.clone(), [], cx).await;
         let thread_store = cx.new(|cx| ThreadStore::new(cx));
-        let connection = NativeAgentConnection(
+        let connection = NativeAgentConnection::new(
             cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs.clone(), cx)),
         );
 
@@ -5625,7 +6066,7 @@ mod internal_tests {
         // Create the agent and connection
         let agent =
             cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs.clone(), cx));
-        let connection = NativeAgentConnection(agent.clone());
+        let connection = NativeAgentConnection::new(agent.clone());
 
         // Create a thread/session
         let acp_thread = cx
@@ -5722,7 +6163,7 @@ mod internal_tests {
         let thread_store = cx.new(|cx| ThreadStore::new(cx));
         let agent =
             cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs.clone(), cx));
-        let connection = NativeAgentConnection(agent.clone());
+        let connection = NativeAgentConnection::new(agent.clone());
 
         let acp_thread = cx
             .update(|cx| {
@@ -5813,7 +6254,7 @@ mod internal_tests {
         let thread_store = cx.new(|cx| ThreadStore::new(cx));
         let agent =
             cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs.clone(), cx));
-        let connection = Rc::new(NativeAgentConnection(agent.clone()));
+        let connection = Rc::new(NativeAgentConnection::new(agent.clone()));
 
         let acp_thread = cx
             .update(|cx| {
@@ -5865,7 +6306,7 @@ mod internal_tests {
         let thread_store = cx.new(|cx| ThreadStore::new(cx));
         let agent = cx
             .update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
-        let connection = Rc::new(NativeAgentConnection(agent.clone()));
+        let connection = Rc::new(NativeAgentConnection::new(agent.clone()));
 
         // Register a thinking model.
         let thinking_model = Arc::new(FakeLanguageModel::with_id_and_thinking(
@@ -5967,7 +6408,7 @@ mod internal_tests {
         let thread_store = cx.new(|cx| ThreadStore::new(cx));
         let agent = cx
             .update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
-        let connection = Rc::new(NativeAgentConnection(agent.clone()));
+        let connection = Rc::new(NativeAgentConnection::new(agent.clone()));
 
         // Register a model where id() != name(), like real Anthropic models
         // (e.g. id="claude-sonnet-4-5-thinking-latest", name="Claude Sonnet 4.5 Thinking").
@@ -6080,7 +6521,7 @@ mod internal_tests {
         let thread_store = cx.new(|cx| ThreadStore::new(cx));
         let agent = cx
             .update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
-        let connection = Rc::new(NativeAgentConnection(agent.clone()));
+        let connection = Rc::new(NativeAgentConnection::new(agent.clone()));
 
         let model = Arc::new(FakeLanguageModel::with_id_and_thinking(
             "fake-corp",
@@ -6288,7 +6729,7 @@ mod internal_tests {
         let thread_store = cx.new(|cx| ThreadStore::new(cx));
         let agent = cx
             .update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
-        let connection = Rc::new(NativeAgentConnection(agent.clone()));
+        let connection = Rc::new(NativeAgentConnection::new(agent.clone()));
 
         let acp_thread = cx
             .update(|cx| {
@@ -6469,7 +6910,7 @@ mod internal_tests {
         let thread_store = cx.new(|cx| ThreadStore::new(cx));
         let agent = cx
             .update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
-        let connection = Rc::new(NativeAgentConnection(agent.clone()));
+        let connection = Rc::new(NativeAgentConnection::new(agent.clone()));
 
         let acp_thread = cx
             .update(|cx| {
@@ -6549,7 +6990,7 @@ mod internal_tests {
         let thread_store = cx.new(|cx| ThreadStore::new(cx));
         let agent = cx
             .update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
-        let connection = Rc::new(NativeAgentConnection(agent.clone()));
+        let connection = Rc::new(NativeAgentConnection::new(agent.clone()));
 
         let acp_thread = cx
             .update(|cx| {
@@ -6632,7 +7073,7 @@ mod internal_tests {
         let thread_store = cx.new(|cx| ThreadStore::new(cx));
         let agent = cx
             .update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
-        let connection = Rc::new(NativeAgentConnection(agent.clone()));
+        let connection = Rc::new(NativeAgentConnection::new(agent.clone()));
 
         let acp_thread = cx
             .update(|cx| {
@@ -6776,7 +7217,7 @@ mod internal_tests {
         let thread_store = cx.new(|cx| ThreadStore::new(cx));
         let agent = cx
             .update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
-        let connection = Rc::new(NativeAgentConnection(agent.clone()));
+        let connection = Rc::new(NativeAgentConnection::new(agent.clone()));
 
         let acp_thread = cx
             .update(|cx| {

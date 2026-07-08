@@ -694,7 +694,9 @@ impl ContextMenu {
 
     pub fn label(mut self, label: impl Into<SharedString>) -> Self {
         self.items
-            .push(ContextMenuItem::Label(crate::gearbox_text::translate(label)));
+            .push(ContextMenuItem::Label(crate::gearbox_text::translate(
+                label,
+            )));
         self
     }
 

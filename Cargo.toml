@@ -231,6 +231,7 @@ members = [
     "crates/x_ai",
     "crates/zed",
     "crates/gearbox",
+    "crates/gearbox_agent",
     "crates/zed_actions",
     "crates/windows_resources",
     "crates/zed_credentials_provider",
@@ -348,6 +349,7 @@ git_ui = { path = "crates/git_ui" }
 go_to_line = { path = "crates/go_to_line" }
 google_ai = { path = "crates/google_ai" }
 gearbox_settings = { path = "crates/gearbox_settings" }
+gearbox_agent = { path = "crates/gearbox_agent" }
 grammars = { path = "crates/grammars" }
 gpui = { path = "crates/gpui", default-features = false }
 gpui_shared_string = { path = "crates/gpui_shared_string" }

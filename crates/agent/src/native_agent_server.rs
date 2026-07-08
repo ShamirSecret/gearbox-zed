@@ -3,8 +3,9 @@ use std::{any::Any, rc::Rc, sync::Arc};
 use agent_servers::{AgentServer, AgentServerDelegate};
 use anyhow::Result;
 use fs::Fs;
-use gpui::{App, Entity, Task};
+use gpui::{App, Entity, SharedString, Task};
 use project::{AgentId, Project};
+use ui::IconName;
 
 use crate::{NativeAgent, NativeAgentConnection, ThreadStore, templates::Templates};
 
@@ -12,21 +13,40 @@ use crate::{NativeAgent, NativeAgentConnection, ThreadStore, templates::Template
 pub struct NativeAgentServer {
     fs: Arc<dyn Fs>,
     thread_store: Entity<ThreadStore>,
+    agent_id: AgentId,
+    telemetry_id: SharedString,
+    logo: IconName,
 }
 
 impl NativeAgentServer {
     pub fn new(fs: Arc<dyn Fs>, thread_store: Entity<ThreadStore>) -> Self {
-        Self { fs, thread_store }
+        Self {
+            fs,
+            thread_store,
+            agent_id: crate::ZED_AGENT_ID.clone(),
+            telemetry_id: "zed".into(),
+            logo: IconName::ZedAgent,
+        }
+    }
+
+    pub fn gear(fs: Arc<dyn Fs>, thread_store: Entity<ThreadStore>) -> Self {
+        Self {
+            fs,
+            thread_store,
+            agent_id: crate::GEAR_AGENT_ID.clone(),
+            telemetry_id: "gear".into(),
+            logo: IconName::Sparkle,
+        }
     }
 }
 
 impl AgentServer for NativeAgentServer {
     fn agent_id(&self) -> AgentId {
-        crate::ZED_AGENT_ID.clone()
+        self.agent_id.clone()
     }
 
     fn logo(&self) -> ui::IconName {
-        ui::IconName::ZedAgent
+        self.logo
     }
 
     fn connect(
@@ -38,6 +58,8 @@ impl AgentServer for NativeAgentServer {
         log::debug!("NativeAgentServer::connect");
         let fs = self.fs.clone();
         let thread_store = self.thread_store.clone();
+        let agent_id = self.agent_id.clone();
+        let telemetry_id = self.telemetry_id.clone();
         cx.spawn(async move |cx| {
             log::debug!("Creating templates for native agent");
             let templates = Templates::new();
@@ -46,7 +68,7 @@ impl AgentServer for NativeAgentServer {
             let agent = cx.update(|cx| NativeAgent::new(thread_store, templates, fs, cx));
 
             // Create the connection wrapper
-            let connection = NativeAgentConnection(agent);
+            let connection = NativeAgentConnection::with_identity(agent, agent_id, telemetry_id);
             log::debug!("NativeAgentServer connection established successfully");
 
             Ok(Rc::new(connection) as Rc<dyn acp_thread::AgentConnection>)

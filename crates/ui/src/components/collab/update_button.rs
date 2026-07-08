@@ -90,23 +90,44 @@ impl UpdateButton {
     }
 
     pub fn checking() -> Self {
-        Self::new(IconName::LoadCircle, if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") { "正在检查 Gearbox 更新..." } else { "Checking for Zed Updates…" })
-            .icon_animate(true)
-            .disabled(true)
+        Self::new(
+            IconName::LoadCircle,
+            if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") {
+                "正在检查 Gearbox 更新..."
+            } else {
+                "Checking for Zed Updates…"
+            },
+        )
+        .icon_animate(true)
+        .disabled(true)
     }
 
     pub fn downloading(version: impl Into<SharedString>, progress: Option<f32>) -> Self {
-        Self::new(IconName::Download, if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") { "正在下载 Gearbox 更新..." } else { "Downloading Zed Update…" })
-            .tooltip(version)
-            .progress(progress)
-            .disabled(true)
+        Self::new(
+            IconName::Download,
+            if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") {
+                "正在下载 Gearbox 更新..."
+            } else {
+                "Downloading Zed Update…"
+            },
+        )
+        .tooltip(version)
+        .progress(progress)
+        .disabled(true)
     }
 
     pub fn installing(version: impl Into<SharedString>) -> Self {
-        Self::new(IconName::LoadCircle, if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") { "正在安装 Gearbox 更新..." } else { "Installing Zed Update…" })
-            .icon_animate(true)
-            .tooltip(version)
-            .disabled(true)
+        Self::new(
+            IconName::LoadCircle,
+            if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") {
+                "正在安装 Gearbox 更新..."
+            } else {
+                "Installing Zed Update…"
+            },
+        )
+        .icon_animate(true)
+        .tooltip(version)
+        .disabled(true)
     }
 
     pub fn updated(version: impl Into<SharedString>) -> Self {

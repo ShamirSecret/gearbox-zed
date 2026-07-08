@@ -903,7 +903,7 @@ impl ThreadView {
         {
             let project_id = thread.read(cx).project().entity_id();
             subscriptions.push(cx.subscribe(
-                &native_connection.0,
+                native_connection.agent(),
                 move |this: &mut Self, _agent, event: &SkillLoadingIssuesUpdated, cx| {
                     if event.project_id != project_id {
                         return;
