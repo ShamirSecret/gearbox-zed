@@ -790,10 +790,18 @@ fn evaluate_goal(
         };
     }
     if verification_passed {
+        let summary = if *worker_status == WorkerStatus::Succeeded {
+            format!("Goal completed after {iteration} Gear iteration(s).")
+        } else {
+            format!(
+                "Goal completed after {iteration} Gear iteration(s); verification passed while worker status was {}.",
+                worker_status.as_str()
+            )
+        };
         return GoalEvaluation {
             status: GoalStatus::Complete,
             should_continue: false,
-            summary: format!("Goal completed after {iteration} Gear iteration(s)."),
+            summary,
         };
     }
     if iteration < max_iterations {
@@ -895,7 +903,7 @@ mod tests {
     use anyhow::Result;
 
     use super::*;
-    use crate::workers::WorkerKind;
+    use crate::workers::{WorkerKind, WorkerStatus};
 
     #[test]
     fn run_creates_ledger_artifacts_and_verification() -> Result<()> {
@@ -975,9 +983,27 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|event| event == "Goal completed after 1 Gear iteration(s).")
+                .any(|event| event.contains("Goal completed after 1 Gear iteration(s)"))
         );
         Ok(())
+    }
+
+    #[test]
+    fn evaluation_mentions_non_required_worker_failure_when_verification_passes() {
+        let scope_check = crate::tools::ScopeCheck::default();
+        let evaluation = evaluate_goal(
+            true,
+            &WorkerStatus::Failed,
+            false,
+            &scope_check,
+            1,
+            DEFAULT_MAX_ITERATIONS,
+        );
+
+        assert_eq!(evaluation.status, GoalStatus::Complete);
+        assert!(!evaluation.should_continue);
+        assert!(evaluation.summary.contains("verification passed"));
+        assert!(evaluation.summary.contains("worker status was failed"));
     }
 
     #[test]

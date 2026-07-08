@@ -200,10 +200,19 @@ impl Render for SecurityModal {
                     )
                     .child(
                         v_flex()
-                            .child(Label::new("Restricted Mode prevents:").color(Color::Muted))
-                            .child(ListBulletItem::new("Project settings from being applied"))
-                            .child(ListBulletItem::new("Language servers from running"))
-                            .child(ListBulletItem::new("MCP Server integrations from installing")),
+                            .child(
+                                Label::new(ui::gearbox_translate_text("Restricted Mode prevents:"))
+                                    .color(Color::Muted),
+                            )
+                            .child(ListBulletItem::new(ui::gearbox_translate_text(
+                                "Project settings from being applied",
+                            )))
+                            .child(ListBulletItem::new(ui::gearbox_translate_text(
+                                "Language servers from running",
+                            )))
+                            .child(ListBulletItem::new(ui::gearbox_translate_text(
+                                "MCP Server integrations from installing",
+                            ))),
                     )
                     .map(|this| {
                         let Some(trust_label) = trust_label else {
@@ -226,7 +235,7 @@ impl Render for SecurityModal {
                                             "trust-parents",
                                             ToggleState::from(self.trust_parents),
                                         )
-                                        .label("Trust all projects in")
+                                        .label(ui::gearbox_translate_text("Trust all projects in"))
                                         .on_click(cx.listener(
                                             |security_modal, state: &ToggleState, _, cx| {
                                                 let trust_parents = state.selected();
@@ -273,7 +282,10 @@ impl Render for SecurityModal {
                     .gap_1()
                     .justify_end()
                     .child(
-                        Button::new("rm", "Stay in Restricted Mode")
+                        Button::new(
+                            "rm",
+                            ui::gearbox_translate_text("Stay in Restricted Mode"),
+                        )
                             .key_binding(
                                 KeyBinding::for_action(
                                     &ToggleWorktreeSecurity,
@@ -288,7 +300,7 @@ impl Render for SecurityModal {
                             })),
                     )
                     .child(
-                        Button::new("tc", "Trust and Continue")
+                        Button::new("tc", ui::gearbox_translate_text("Trust and Continue"))
                             .style(ButtonStyle::Filled)
                             .layer(ui::ElevationIndex::ModalSurface)
                             .key_binding(

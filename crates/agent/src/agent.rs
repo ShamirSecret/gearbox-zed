@@ -2576,9 +2576,6 @@ async fn generate_gear_coordinator_brief(
     let Some(model) = model else {
         return None;
     };
-    if model.provider_id().0.as_ref() == "fake" {
-        return None;
-    }
 
     let request = LanguageModelRequest {
         intent: Some(CompletionIntent::UserPrompt),
@@ -2641,7 +2638,23 @@ fn is_gear_executable_goal(request: &str) -> bool {
 
     let normalized = request
         .trim_matches(|character: char| {
-            character.is_whitespace() || character.is_ascii_punctuation()
+            character.is_whitespace()
+                || character.is_ascii_punctuation()
+                || matches!(
+                    character,
+                    '。' | '，'
+                        | '、'
+                        | '；'
+                        | '：'
+                        | '？'
+                        | '！'
+                        | '（'
+                        | '）'
+                        | '“'
+                        | '”'
+                        | '‘'
+                        | '’'
+                )
         })
         .to_lowercase();
     if normalized.is_empty() {
@@ -2691,10 +2704,9 @@ fn is_gear_executable_goal(request: &str) -> bool {
         "继续",
     ];
 
-    request.chars().count() >= 12
-        || ACTION_WORDS
-            .iter()
-            .any(|action_word| normalized.contains(action_word))
+    ACTION_WORDS
+        .iter()
+        .any(|action_word| normalized.contains(action_word))
 }
 
 fn gear_workspace_for_session(session: &Session, agent: &NativeAgent, cx: &App) -> Result<PathBuf> {
@@ -2741,12 +2753,13 @@ fn gear_worker_config_from_values(
         .or(opencode_command)
         .map(str::to_string)
         .filter(|command| !command.is_empty());
+    let require_worker = worker_command.is_some();
 
     WorkerConfig {
         worker_kind,
         worker_command,
         skip_worker: false,
-        require_worker: false,
+        require_worker,
     }
 }
 
@@ -4300,6 +4313,7 @@ mod internal_tests {
 
         assert_eq!(config.worker_kind, WorkerKind::Claude);
         assert_eq!(config.worker_command.as_deref(), Some("gear worker"));
+        assert!(config.require_worker);
     }
 
     #[test]
@@ -4308,6 +4322,7 @@ mod internal_tests {
 
         assert_eq!(config.worker_kind, WorkerKind::Opencode);
         assert_eq!(config.worker_command.as_deref(), Some("opencode run"));
+        assert!(config.require_worker);
     }
 
     #[test]
@@ -4316,6 +4331,14 @@ mod internal_tests {
 
         assert_eq!(config.worker_kind, WorkerKind::Opencode);
         assert_eq!(config.worker_command, None);
+        assert!(!config.require_worker);
+    }
+
+    #[test]
+    fn gear_executable_goal_ignores_greetings_and_long_small_talk() {
+        assert!(!is_gear_executable_goal("你好。"));
+        assert!(!is_gear_executable_goal("我昨天看了一部很有趣的电影。"));
+        assert!(is_gear_executable_goal("请帮我修复这个 bug。"));
     }
 
     async fn setup_native_agent_session(
@@ -4478,11 +4501,25 @@ mod internal_tests {
             })
             .await
             .unwrap();
+        let model = cx.update(|cx| {
+            LanguageModelRegistry::read_global(cx)
+                .default_model()
+                .map(|default_model| default_model.model)
+                .expect("default test model should be available")
+        });
+        let fake_model = model.as_fake();
+
         let prompt_task = cx.update(|cx| {
             acp_thread.update(cx, |thread, cx| {
                 thread.send(vec!["Build a tiny notes app MVP".into()], cx)
             })
         });
+        let prompt_task = cx.foreground_executor().spawn(prompt_task);
+        cx.run_until_parked();
+        fake_model.send_last_completion_stream_text_chunk(
+            "Build a compact notes MVP, verify artifacts, and keep the scope small.",
+        );
+        fake_model.end_last_completion_stream();
         prompt_task.await.unwrap();
         cx.run_until_parked();
 
@@ -4532,8 +4569,9 @@ mod internal_tests {
             })
             .await
             .unwrap();
-        let prompt_task = cx
-            .update(|cx| acp_thread.update(cx, |thread, cx| thread.send(vec!["你好".into()], cx)));
+        let prompt_task = cx.update(|cx| {
+            acp_thread.update(cx, |thread, cx| thread.send(vec!["你好。".into()], cx))
+        });
         prompt_task.await.unwrap();
         cx.run_until_parked();
 

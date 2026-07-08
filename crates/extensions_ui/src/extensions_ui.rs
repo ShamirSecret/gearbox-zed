@@ -1567,18 +1567,21 @@ impl ExtensionsPage {
         vim: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let docs_url_button = Button::new("open_docs", "View Documentation")
-            .end_icon(Icon::new(IconName::ArrowUpRight).size(IconSize::Small))
-            .on_click({
-                move |_event, _window, cx| {
-                    telemetry::event!(
-                        "Documentation Viewed",
-                        source = "Feature Upsell",
-                        url = docs_url,
-                    );
-                    cx.open_url(&docs_url)
-                }
-            });
+        let docs_url_button = Button::new(
+            "open_docs",
+            ui::gearbox_translate_text("View Documentation"),
+        )
+        .end_icon(Icon::new(IconName::ArrowUpRight).size(IconSize::Small))
+        .on_click({
+            move |_event, _window, cx| {
+                telemetry::event!(
+                    "Documentation Viewed",
+                    source = "Feature Upsell",
+                    url = docs_url,
+                );
+                cx.open_url(&docs_url)
+            }
+        });
 
         div()
             .pt_4()
@@ -1939,12 +1942,15 @@ impl Render for ExtensionsPage {
                             .justify_between()
                             .child(Headline::new("Extensions").size(HeadlineSize::Large))
                             .child(
-                                Button::new("install-dev-extension", "Install Dev Extension")
-                                    .style(ButtonStyle::Outlined)
-                                    .size(ButtonSize::Medium)
-                                    .on_click(|_event, window, cx| {
-                                        window.dispatch_action(Box::new(InstallDevExtension), cx)
-                                    }),
+                                Button::new(
+                                    "install-dev-extension",
+                                    ui::gearbox_translate_text("Install Dev Extension"),
+                                )
+                                .style(ButtonStyle::Outlined)
+                                .size(ButtonSize::Medium)
+                                .on_click(|_event, window, cx| {
+                                    window.dispatch_action(Box::new(InstallDevExtension), cx)
+                                }),
                             ),
                     )
                     .child(

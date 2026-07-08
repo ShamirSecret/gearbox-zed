@@ -418,11 +418,24 @@ When syncing with upstream Zed, check these files first. The intended rule is:
 
 ## 2026-07-08 Gear Fix Plan Follow-up and Milestone 3 Start
 
+### `crates/command_palette/src/command_palette.rs`
+### `crates/debugger_ui/src/debugger_panel.rs`
+### `crates/extensions_ui/src/extensions_ui.rs`
+### `crates/extensions_ui/src/extension_version_selector.rs`
+### `crates/recent_projects/src/remote_servers.rs`
+### `crates/ui/src/components/project_empty_state.rs`
+### `crates/workspace/src/security_modal.rs`
+
+- Routes the first Gearbox localization audit batch through `ui::gearbox_translate_text` / `crate::gearbox_text::translate` for user-visible labels and buttons while preserving upstream action IDs, telemetry event names, URLs, and non-Gearbox English behavior.
+- Covers project empty state, restricted mode, command palette run button, debugger empty state, extension documentation/dev-install labels, extension compatibility labels, and remote server/dev-container actions.
+
 ### `crates/ui/src/gearbox_text.rs`
 
 - Preserves meaning for fallback settings prefixes such as `Amount of`, `Number of`, and `A mapping from` instead of dropping those words.
 - Keeps common abbreviation punctuation such as `e.g.,`, `i.e.`, and `etc.` out of Chinese sentence punctuation localization.
 - Replaces visible `Zed` branding only as a standalone word so names such as `ZedGraph` are not rewritten.
+- Expands sentence and title token translations from `GEARBOX_L10N_AUDIT.md` to reduce mixed English/Chinese settings descriptions.
+- Adds exact translations for the first localization audit batch and regression tests for high-frequency settings sentence tokens.
 
 ### `crates/agent/src/agent.rs`
 
@@ -458,3 +471,24 @@ When syncing with upstream Zed, check these files first. The intended rule is:
 ### `docs/gearbox-gear-agent-plan.md`
 
 - Updates current progress to reflect that the goal-pursuit runtime loop exists, GUI selected model metadata and an initial provider-backed coordinator brief now reach the runtime, and the next active track is per-iteration provider-backed review plus TypeScript Web App sample generation.
+
+## 2026-07-08 Gear Detailed Bug Fixes
+
+### `crates/agent/src/agent.rs`
+
+- Tightens Gear prompt routing so Chinese punctuation is trimmed before small-talk checks and long casual text no longer starts a Gear runtime goal solely because of length.
+- Treats configured Gear worker commands as required workers so worker failures are surfaced instead of being silently ignored when verification passes.
+- Removes the production `"fake"` provider id bypass from coordinator brief generation; GPUI tests now drive fake model streams explicitly.
+
+### `crates/gearbox_agent/src/runtime.rs`
+
+- Keeps the MVP verification-passed completion policy, but includes skipped/failed worker status in the final goal summary when the worker was not required.
+
+### `crates/ui/src/gearbox_text.rs`
+
+- Preserves useful spacing for mixed English/Chinese title translations while keeping fully translated Chinese titles compact.
+- Adds title/exact translation coverage for common Agent, profile, call, repository, provider, permission, checkpoint, and subagent labels surfaced by `GEARBOX_DETAILED_BUGS.md`.
+
+### `crates/gearbox/build.rs`
+
+- Rebrands the visible Linux pkg-config diagnostic prefix from `zed build.rs` to `gearbox build.rs`.

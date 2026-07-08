@@ -374,9 +374,29 @@ fn sentence_token_translation(token: &str) -> Option<String> {
         "a" | "an" | "the" | "to" | "of" | "in" | "on" | "for" | "from" | "with" | "by" | "as"
         | "or" | "and" | "that" | "this" | "these" | "those" | "it" | "its" | "is" | "are"
         | "be" | "been" | "being" => "",
+        "not" => "不",
+        "cannot" => "无法",
+        "if" => "如果",
+        "all" => "所有",
+        "any" => "任何",
+        "never" => "从不",
+        "always" => "始终",
+        "first" => "首次",
+        "over" => "超过",
+        "during" => "期间",
+        "without" => "无需",
+        "than" => "比",
+        "more" => "更多",
+        "less" => "更少",
+        "both" => "两者",
+        "some" => "部分",
+        "other" => "其他",
+        "your" => "你的",
+        "many" => "多少",
         "should" => "应",
         "will" => "会",
         "can" => "可以",
+        "may" => "可能",
         "when" => "当",
         "while" => "当",
         "after" => "之后",
@@ -609,10 +629,16 @@ fn sentence_token_translation(token: &str) -> Option<String> {
         "agents" => "Agent",
         "warning" => "警告",
         "updated" => "更新",
+        "updates" => "更新",
+        "update" => "更新",
         "start" => "开始",
         "end" => "结束",
         "between" => "之间",
         "powered" => "驱动",
+        "provide" => "提供",
+        "provides" => "提供",
+        "requiring" => "需要",
+        "request" => "请求",
         _ => {
             let mut chars = token.chars();
             let first = chars.next()?;
@@ -716,9 +742,27 @@ fn flush_title_token(
     if translated_token != token {
         *translated_any = true;
     }
-    translated.push_str(translated_token);
+    push_title_token(translated, translated_token);
     token.clear();
     Some(())
+}
+
+fn push_title_token(translated: &mut String, token: &str) {
+    if should_separate_title_tokens(translated, token) {
+        translated.push(' ');
+    }
+    translated.push_str(token);
+}
+
+fn should_separate_title_tokens(translated: &str, token: &str) -> bool {
+    let Some(previous) = translated.chars().next_back() else {
+        return false;
+    };
+    let Some(next) = token.chars().next() else {
+        return false;
+    };
+
+    previous.is_ascii_alphanumeric() != next.is_ascii_alphanumeric()
 }
 
 fn title_token_translation(token: &str) -> Option<&'static str> {
@@ -730,7 +774,9 @@ fn title_token_translation(token: &str) -> Option<&'static str> {
         "Advanced" => "高级",
         "Agent" => "Agent",
         "AI" => "AI",
+        "All" => "全部",
         "Allowed" => "允许",
+        "Always" => "始终",
         "And" => "",
         "Anthropic" => "Anthropic",
         "Appearance" => "外观",
@@ -738,6 +784,7 @@ fn title_token_translation(token: &str) -> Option<&'static str> {
         "Auto" => "自动",
         "Autoclose" => "自动闭合",
         "Autoscroll" => "自动滚动",
+        "Awaiting" => "等待",
         "Background" => "背景",
         "Base" => "基础",
         "Behavior" => "行为",
@@ -754,8 +801,11 @@ fn title_token_translation(token: &str) -> Option<&'static str> {
         "Buffers" => "缓冲区",
         "Calls" => "通话",
         "Channel" => "频道",
+        "Change" => "切换",
+        "Checkpoint" => "检查点",
         "Click" => "点击",
         "Clicks" => "点击",
+        "Clear" => "清除",
         "Clipboard" => "剪贴板",
         "Close" => "关闭",
         "Closing" => "关闭",
@@ -769,6 +819,7 @@ fn title_token_translation(token: &str) -> Option<&'static str> {
         "Comment" => "注释",
         "Completions" => "补全",
         "Configure" => "配置",
+        "Confirmation" => "确认",
         "Content" => "内容",
         "Context" => "上下文",
         "Contrast" => "对比度",
@@ -812,6 +863,7 @@ fn title_token_translation(token: &str) -> Option<&'static str> {
         "Fetch" => "获取",
         "File" => "文件",
         "Files" => "文件",
+        "First" => "首次",
         "Flags" => "开关",
         "Folds" => "折叠",
         "Font" => "字体",
@@ -849,6 +901,7 @@ fn title_token_translation(token: &str) -> Option<&'static str> {
         "Key" => "键",
         "Keybindings" => "按键绑定",
         "Keymap" => "快捷键方案",
+        "Keep" => "保留",
         "Language" => "语言",
         "Languages" => "语言",
         "Last" => "最后",
@@ -880,12 +933,14 @@ fn title_token_translation(token: &str) -> Option<&'static str> {
         "Multibuffer" => "多缓冲区",
         "Name" => "名称",
         "Network" => "网络",
+        "Never" => "从不",
         "Newline" => "换行",
         "No" => "无",
         "Normal" => "普通",
         "Number" => "数字",
         "Numbers" => "行号",
         "On" => "在",
+        "Open" => "打开",
         "Options" => "选项",
         "Order" => "顺序",
         "Other" => "其他",
@@ -898,6 +953,7 @@ fn title_token_translation(token: &str) -> Option<&'static str> {
         "Parser" => "解析器",
         "Paste" => "粘贴",
         "Path" => "路径",
+        "Permission" => "权限",
         "Picker" => "选择器",
         "Plugins" => "插件",
         "Popover" => "弹出层",
@@ -907,6 +963,7 @@ fn title_token_translation(token: &str) -> Option<&'static str> {
         "Preview" => "预览",
         "Privacy" => "隐私",
         "Profiler" => "性能分析器",
+        "Provider" => "提供商",
         "Profiles" => "配置档案",
         "Project" => "项目",
         "Providers" => "提供商",
@@ -922,7 +979,10 @@ fn title_token_translation(token: &str) -> Option<&'static str> {
         "Results" => "结果",
         "Retention" => "保留",
         "Review" => "评审",
+        "Reject" => "拒绝",
+        "Rules" => "规则",
         "Rounded" => "圆角",
+        "Run" => "运行",
         "Runnables" => "可运行项",
         "Sandbox" => "沙箱",
         "Save" => "保存",
@@ -932,6 +992,7 @@ fn title_token_translation(token: &str) -> Option<&'static str> {
         "Scrolling" => "滚动",
         "Search" => "搜索",
         "Security" => "安全",
+        "Select" => "选择",
         "Selected" => "选中",
         "Selection" => "选择",
         "Selections" => "选择",
@@ -954,6 +1015,8 @@ fn title_token_translation(token: &str) -> Option<&'static str> {
         "Startup" => "启动",
         "Sticky" => "固定",
         "Strategy" => "策略",
+        "Subagent" => "子 Agent",
+        "Subagents" => "子 Agent",
         "Substitution" => "替换",
         "Support" => "支持",
         "Symbol" => "符号",
@@ -1009,6 +1072,8 @@ fn title_token_translation(token: &str) -> Option<&'static str> {
 fn exact_translation(text: &str) -> Option<&'static str> {
     Some(match text {
         "Open" => "打开",
+        "Open Project" => "打开项目",
+        "Open Repository" => "打开仓库",
         "Close" => "关闭",
         "Cancel" => "取消",
         "Save" => "保存",
@@ -1024,6 +1089,7 @@ fn exact_translation(text: &str) -> Option<&'static str> {
         "Redo" => "重做",
         "Create" => "创建",
         "New" => "新建",
+        "New Session" => "新建会话",
         "Add" => "添加",
         "Edit" => "编辑",
         "Apply" => "应用",
@@ -1042,6 +1108,28 @@ fn exact_translation(text: &str) -> Option<&'static str> {
         "Settings" => "设置",
         "Preferences" => "偏好设置",
         "Extensions" => "扩展",
+        "Incompatible" => "不兼容",
+        "View Documentation" => "查看文档",
+        "Install Dev Extension" => "安装开发扩展",
+        "Creating Dev Container" => "正在创建开发容器",
+        "Copy Server Address" => "复制服务器地址",
+        "Remove Server" => "移除服务器",
+        "Debugger Docs" => "调试器文档",
+        "Debugger Extensions" => "调试器扩展",
+        "Edit debug.json" => "编辑 debug.json",
+        "No Breakpoints Set" => "尚未设置断点",
+        "Clone Repository" => "克隆仓库",
+        "or" => "或",
+        "Choose one of the options below to use the Agent Panel" => {
+            "选择下面的一个选项来使用 Agent 面板"
+        }
+        "Restricted Mode prevents:" => "受限模式会阻止以下操作：",
+        "Project settings from being applied" => "应用项目设置",
+        "Language servers from running" => "运行语言服务器",
+        "MCP Server integrations from installing" => "安装 MCP Server 集成",
+        "Trust all projects in" => "信任该目录下的所有项目",
+        "Stay in Restricted Mode" => "保持受限模式",
+        "Trust and Continue" => "信任并继续",
         "Terminal" => "终端",
         "Project" => "项目",
         "Projects" => "项目",
@@ -1104,7 +1192,6 @@ fn exact_translation(text: &str) -> Option<&'static str> {
         "Open Local Folders" => "打开本地文件夹",
         "Open Remote Folder" => "打开远程文件夹",
         "Open File" => "打开文件",
-        "Open Project" => "打开项目",
         "Open Project in This Window" => "在当前窗口打开项目",
         "Open Project in New Window" => "在新窗口打开项目",
         "Open Recent" => "打开最近项目",
@@ -1160,6 +1247,10 @@ fn exact_translation(text: &str) -> Option<&'static str> {
         "Account" => "账户",
         "Manage" => "管理",
         "Manage Profiles" => "管理配置档案",
+        "Add New Profile" => "添加新配置档案",
+        "Custom Profiles" => "自定义配置档案",
+        "Delete Profile" => "删除配置档案",
+        "Fork Profile" => "派生配置档案",
         "Manage Skills" => "管理技能",
         "Profiles" => "配置档案",
         "Skills" => "技能",
@@ -1269,6 +1360,8 @@ fn exact_translation(text: &str) -> Option<&'static str> {
         "History" => "历史",
         "View History" => "查看历史",
         "Diagnostics" => "诊断",
+        "Call Diagnostics" => "通话诊断",
+        "Not in a call" => "未在通话中",
         "Problems" => "问题",
         "Debugger" => "调试器",
         "Debug" => "调试",
@@ -1637,7 +1730,6 @@ fn exact_translation(text: &str) -> Option<&'static str> {
         "Subagents Awaiting Permission:" => "等待授权的子 Agent：",
         // debugger_ui
         "Debugger:" => "调试器：",
-        "Edit debug.json" => "编辑 debug.json",
         "Edit in debug.json" => "在 debug.json 中编辑",
         // language_models
         "But first, to access models on AWS, you need to:" => "要访问 AWS 上的模型，你需要：",
@@ -1677,7 +1769,6 @@ fn exact_translation(text: &str) -> Option<&'static str> {
         // ui / workspace
         "Connection error: unable to connect to server" => "连接错误：无法连接到服务器",
         "Restricted mode prevents:" => "受限模式会阻止以下操作：",
-        "Restricted Mode prevents:" => "受限模式会阻止以下操作：",
         _ => return None,
     })
 }
@@ -1728,6 +1819,71 @@ mod tests {
             settings_sentence_translation("A mapping from languages to file extensions.")
                 .expect("sentence should be translated");
         assert!(translated.as_ref().starts_with("映射："));
+    }
+
+    #[test]
+    fn translates_high_frequency_settings_sentence_tokens() {
+        let translated =
+            settings_sentence_translation("Whether or not to automatically check for updates.")
+                .expect("sentence should be translated");
+        assert!(!translated.as_ref().contains("not"), "{translated}");
+        assert!(!translated.as_ref().contains("updates"), "{translated}");
+        assert!(translated.as_ref().contains("自动"), "{translated}");
+        assert!(translated.as_ref().contains("更新"), "{translated}");
+
+        let translated = settings_sentence_translation(
+            "How many lines to expand the multibuffer excerpts by default.",
+        )
+        .expect("sentence should be translated");
+        assert!(!translated.as_ref().contains("many"), "{translated}");
+        assert!(!translated.as_ref().contains("lines"), "{translated}");
+        assert!(!translated.as_ref().contains("default"), "{translated}");
+
+        let translated = settings_sentence_translation(
+            "Controls whether to use language servers to provide code intelligence.",
+        )
+        .expect("sentence should be translated");
+        assert!(!translated.as_ref().contains("provide"), "{translated}");
+        assert!(
+            !translated.as_ref().contains("language servers"),
+            "{translated}"
+        );
+        assert!(translated.as_ref().contains("语言服务器"), "{translated}");
+        assert!(translated.as_ref().contains("代码智能能力"), "{translated}");
+    }
+
+    #[test]
+    fn translates_common_title_tokens_from_l10n_audit() {
+        assert_eq!(title_translation("Never").unwrap().as_ref(), "从不");
+        assert_eq!(title_translation("Always").unwrap().as_ref(), "始终");
+        assert_eq!(title_translation("First Run").unwrap().as_ref(), "首次运行");
+        assert_eq!(title_translation("All Files").unwrap().as_ref(), "全部文件");
+        assert_eq!(
+            title_translation("Select Model").unwrap().as_ref(),
+            "选择模型"
+        );
+        assert_eq!(
+            title_translation("Configure Provider").unwrap().as_ref(),
+            "配置提供商"
+        );
+        assert_eq!(title_translation("Clear All").unwrap().as_ref(), "清除全部");
+        assert_eq!(
+            title_translation("Change Mode").unwrap().as_ref(),
+            "切换模式"
+        );
+        assert_eq!(
+            title_translation("Open Global Rules").unwrap().as_ref(),
+            "打开全局规则"
+        );
+        assert_eq!(title_translation("Git Panel").unwrap().as_ref(), "Git 面板");
+        assert_eq!(
+            title_translation("Subagent Output").unwrap().as_ref(),
+            "子 Agent 输出"
+        );
+        assert_eq!(
+            title_translation("Awaiting Confirmation").unwrap().as_ref(),
+            "等待确认"
+        );
     }
 
     #[test]
