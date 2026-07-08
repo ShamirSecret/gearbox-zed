@@ -13,9 +13,11 @@ use crate::tools::{
     CancellationToken, DiffSnapshot, ShellCommandResult, check_scope, git_snapshot,
     run_shell_command_with_env_and_cancellation,
 };
-use crate::workers::{WorkerConfig, WorkerRegistry, WorkerRunRequest, WorkerStatus};
+use crate::workers::{WorkerConfig, WorkerKind, WorkerRegistry, WorkerRunRequest, WorkerStatus};
 
 pub type EventSink = Arc<dyn Fn(&Event) + Send + Sync + 'static>;
+pub type CoordinatorReviewHook =
+    Arc<dyn Fn(CoordinatorReviewInput) -> Result<Option<CoordinatorReview>> + Send + Sync + 'static>;
 pub const DEFAULT_MAX_ITERATIONS: usize = 2;
 
 #[derive(Clone)]
@@ -33,6 +35,29 @@ pub struct RunOptions {
     pub max_iterations: usize,
     pub coordinator_model: Option<CoordinatorModel>,
     pub coordinator_brief: Option<String>,
+    pub coordinator_review_hook: Option<CoordinatorReviewHook>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CoordinatorReviewInput {
+    pub goal_id: String,
+    pub iteration: usize,
+    pub max_iterations: usize,
+    pub request: String,
+    pub worker_status: String,
+    pub worker_summary: String,
+    pub verification_passed: bool,
+    pub verification_summary: String,
+    pub scope_summary: String,
+    pub diff_summary: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct CoordinatorReview {
+    pub goal_satisfied: Option<bool>,
+    pub summary: String,
+    pub repair_request: Option<String>,
+    pub raw_response: String,
 }
 
 #[derive(Clone, Debug)]
@@ -132,7 +157,11 @@ impl Orchestrator {
             ),
         )?;
 
-        let mut tasks = initial_tasks(&goal_id, &scope);
+        let mut tasks = initial_tasks(
+            &goal_id,
+            &scope,
+            options.worker.selected_route(1).worker_kind,
+        );
         store.write_tasks(&goal_id, &tasks)?;
 
         let spec_path =
@@ -198,14 +227,21 @@ impl Orchestrator {
 
         for iteration in 1..=max_iterations {
             check_run_cancelled(options.cancellation_token.as_ref())?;
+            let selected_route = options.worker.selected_route(iteration);
             let worker_task_id = if iteration == 1 {
                 "task_003".to_string()
             } else {
                 let verification_path = last_verification_path
                     .as_deref()
                     .context("missing verification artifact for repair iteration")?;
-                let repair_task_id =
-                    add_repair_task(&mut tasks, &goal_id, &scope, iteration, verification_path);
+                let repair_task_id = add_repair_task(
+                    &mut tasks,
+                    &goal_id,
+                    &scope,
+                    iteration,
+                    verification_path,
+                    selected_route.worker_kind,
+                );
                 store.write_tasks(&goal_id, &tasks)?;
                 append_event(
                     &store,
@@ -407,7 +443,7 @@ impl Orchestrator {
                     .as_ref()
                     .context("missing worker result for goal evaluation")?
                     .status,
-                options.worker.require_worker,
+                selected_route.require_worker,
                 &scope_check,
                 iteration,
                 max_iterations,
@@ -557,7 +593,7 @@ fn success_criteria(detection: &LanguageDetection) -> Vec<String> {
     criteria
 }
 
-fn initial_tasks(goal_id: &str, scope: &Scope) -> Vec<Task> {
+fn initial_tasks(goal_id: &str, scope: &Scope, worker_kind: WorkerKind) -> Vec<Task> {
     [
         ("task_001", "Generate minimal spec", TaskKind::Spec, None),
         ("task_002", "Generate executable plan", TaskKind::Plan, None),
@@ -565,7 +601,7 @@ fn initial_tasks(goal_id: &str, scope: &Scope) -> Vec<Task> {
             "task_003",
             "Dispatch bounded implementation packet",
             TaskKind::Edit,
-            Some("opencode".to_string()),
+            Some(worker_kind.as_str().to_string()),
         ),
         (
             "task_004",
@@ -689,6 +725,7 @@ fn add_repair_task(
     scope: &Scope,
     iteration: usize,
     verification_path: &std::path::Path,
+    worker_kind: WorkerKind,
 ) -> String {
     let task_id = repair_task_id(iteration);
     tasks.push(Task {
@@ -697,7 +734,7 @@ fn add_repair_task(
         title: format!("Repair failed verification iteration {iteration}"),
         kind: TaskKind::Repair,
         status: TaskStatus::Pending,
-        assigned_worker: Some("opencode".to_string()),
+        assigned_worker: Some(worker_kind.as_str().to_string()),
         attempt: iteration,
         scope: scope.clone(),
         inputs: TaskInputs {
@@ -930,6 +967,7 @@ mod tests {
             worker: WorkerConfig {
                 worker_kind: WorkerKind::Opencode,
                 worker_command: None,
+                worker_routes: Vec::new(),
                 skip_worker: true,
                 require_worker: false,
             },
@@ -1018,6 +1056,7 @@ mod tests {
             worker: WorkerConfig {
                 worker_kind: WorkerKind::Opencode,
                 worker_command: None,
+                worker_routes: Vec::new(),
                 skip_worker: true,
                 require_worker: false,
             },
@@ -1061,6 +1100,7 @@ mod tests {
             worker: WorkerConfig {
                 worker_kind: WorkerKind::Opencode,
                 worker_command: None,
+                worker_routes: Vec::new(),
                 skip_worker: true,
                 require_worker: false,
             },
@@ -1104,6 +1144,7 @@ mod tests {
             worker: WorkerConfig {
                 worker_kind: WorkerKind::Opencode,
                 worker_command: None,
+                worker_routes: Vec::new(),
                 skip_worker: true,
                 require_worker: false,
             },

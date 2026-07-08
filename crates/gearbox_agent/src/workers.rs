@@ -11,11 +11,18 @@ use crate::tools::{CancellationToken, run_shell_command_with_env_and_cancellatio
 pub struct WorkerConfig {
     pub worker_kind: WorkerKind,
     pub worker_command: Option<String>,
+    pub worker_routes: Vec<WorkerRoute>,
     pub skip_worker: bool,
     pub require_worker: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkerRoute {
+    pub worker_kind: WorkerKind,
+    pub worker_command: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerKind {
     #[default]
@@ -47,6 +54,35 @@ impl WorkerKind {
             Self::Custom => "custom",
         }
     }
+}
+
+impl WorkerConfig {
+    pub fn selected_route(&self, attempt: usize) -> SelectedWorkerRoute<'_> {
+        if self.worker_routes.is_empty() {
+            return SelectedWorkerRoute {
+                worker_kind: self.worker_kind,
+                worker_command: self.worker_command.as_deref(),
+                require_worker: self.require_worker,
+            };
+        }
+
+        let index = attempt
+            .saturating_sub(1)
+            .min(self.worker_routes.len().saturating_sub(1));
+        let route = &self.worker_routes[index];
+        SelectedWorkerRoute {
+            worker_kind: route.worker_kind,
+            worker_command: route.worker_command.as_deref(),
+            require_worker: self.require_worker || route.worker_command.is_some(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SelectedWorkerRoute<'a> {
+    pub worker_kind: WorkerKind,
+    pub worker_command: Option<&'a str>,
+    pub require_worker: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -125,20 +161,16 @@ pub struct WorkerRegistry;
 
 impl WorkerRegistry {
     pub fn run(&self, request: WorkerRunRequest<'_>) -> Result<WorkerResult> {
-        CommandWorker {
-            kind: request.config.worker_kind,
-        }
-        .run(request)
+        CommandWorker.run(request)
     }
 }
 
 pub struct CommandWorker {
-    kind: WorkerKind,
 }
 
 impl WorkerAdapter for CommandWorker {
     fn name(&self) -> &'static str {
-        self.kind.as_str()
+        "command"
     }
 
     fn run(&self, request: WorkerRunRequest<'_>) -> Result<WorkerResult> {
@@ -153,9 +185,11 @@ impl WorkerAdapter for CommandWorker {
             coordinator_model,
             coordinator_brief,
         } = request;
+        let route = config.selected_route(task.attempt);
+        let worker_name = route.worker_kind.as_str();
         let packet = WorkerPacket {
             task_id: task.id.clone(),
-            worker: self.name().to_string(),
+            worker: worker_name.to_string(),
             goal: goal.to_string(),
             coordinator_model: coordinator_model.cloned(),
             coordinator_brief: coordinator_brief.map(ToString::to_string),
@@ -193,7 +227,7 @@ impl WorkerAdapter for CommandWorker {
         let prompt = worker_prompt(&packet)?;
         let prompt_path = store.write_worker_file(&task.id, "prompt.md", &prompt)?;
 
-        if config.skip_worker || config.worker_command.is_none() {
+        if config.skip_worker || route.worker_command.is_none() {
             let summary = if config.skip_worker {
                 "Worker execution was skipped by CLI option."
             } else {
@@ -214,10 +248,7 @@ impl WorkerAdapter for CommandWorker {
             return Ok(result);
         }
 
-        let command = config
-            .worker_command
-            .as_ref()
-            .context("worker command missing")?;
+        let command = route.worker_command.context("worker command missing")?;
         let mut env = HashMap::new();
         env.insert(
             "GEARBOX_WORKER_PACKET".to_string(),
@@ -243,12 +274,12 @@ impl WorkerAdapter for CommandWorker {
             } else {
                 WorkerStatus::Failed
             },
-            command: Some(command.clone()),
+            command: Some(command.to_string()),
             exit_code: output.exit_code,
             summary: if output.success {
-                format!("{} worker command completed.", self.name())
+                format!("{worker_name} worker command completed.")
             } else {
-                format!("{} worker command failed.", self.name())
+                format!("{worker_name} worker command failed.")
             },
             packet_path,
             prompt_path,
@@ -329,6 +360,7 @@ mod tests {
         let config = WorkerConfig {
             worker_kind: WorkerKind::Codex,
             worker_command: None,
+            worker_routes: Vec::new(),
             skip_worker: true,
             require_worker: false,
         };

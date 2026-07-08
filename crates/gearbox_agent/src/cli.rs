@@ -74,6 +74,7 @@ pub fn run() -> Result<()> {
                 worker: WorkerConfig {
                     worker_kind,
                     worker_command: command.worker_command.or(command.opencode_command),
+                    worker_routes: Vec::new(),
                     skip_worker: command.skip_worker,
                     require_worker: command.require_worker,
                 },

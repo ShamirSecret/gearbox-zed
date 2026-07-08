@@ -50,7 +50,7 @@ use futures::{FutureExt as _, StreamExt as _, future};
 use gearbox_agent::runtime::{DEFAULT_MAX_ITERATIONS, Orchestrator, RunOptions};
 use gearbox_agent::state::CoordinatorModel;
 use gearbox_agent::tools::CancellationToken;
-use gearbox_agent::workers::{WorkerConfig, WorkerKind};
+use gearbox_agent::workers::{WorkerConfig, WorkerKind, WorkerRoute};
 use gpui::{
     App, AppContext, AsyncApp, Context, Entity, EntityId, SharedString, Subscription, Task,
     TaskExt, WeakEntity,
@@ -2730,11 +2730,20 @@ fn gear_workspace_for_session(session: &Session, agent: &NativeAgent, cx: &App) 
 }
 
 fn gear_worker_config_from_env() -> WorkerConfig {
-    gear_worker_config_from_values(
+    let mut config = gear_worker_config_from_values(
         trimmed_env_value("GEARBOX_GEAR_WORKER").as_deref(),
         trimmed_env_value("GEARBOX_GEAR_WORKER_COMMAND").as_deref(),
         trimmed_env_value("GEARBOX_OPENCODE_COMMAND").as_deref(),
-    )
+    );
+    config.worker_routes =
+        gear_worker_routes_from_env(config.worker_kind, config.worker_command.as_deref());
+    if !config.worker_routes.is_empty() {
+        config.require_worker = config
+            .worker_routes
+            .iter()
+            .any(|route| route.worker_command.is_some());
+    }
+    config
 }
 
 fn gear_worker_config_from_values(
@@ -2758,9 +2767,54 @@ fn gear_worker_config_from_values(
     WorkerConfig {
         worker_kind,
         worker_command,
+        worker_routes: Vec::new(),
         skip_worker: false,
         require_worker,
     }
+}
+
+fn gear_worker_routes_from_env(
+    default_worker_kind: WorkerKind,
+    default_worker_command: Option<&str>,
+) -> Vec<WorkerRoute> {
+    let Some(sequence) = trimmed_env_value("GEARBOX_GEAR_WORKER_SEQUENCE") else {
+        return Vec::new();
+    };
+
+    sequence
+        .split(',')
+        .filter_map(|worker| {
+            let worker = worker.trim();
+            if worker.is_empty() {
+                return None;
+            }
+            let Some(worker_kind) = WorkerKind::parse(worker) else {
+                log::warn!("Ignoring unknown GEARBOX_GEAR_WORKER_SEQUENCE value `{worker}`");
+                return None;
+            };
+            let worker_command =
+                gear_worker_command_for_kind(worker_kind).or_else(|| {
+                    (worker_kind == default_worker_kind)
+                        .then(|| default_worker_command.map(ToString::to_string))
+                        .flatten()
+                });
+            Some(WorkerRoute {
+                worker_kind,
+                worker_command,
+            })
+        })
+        .collect()
+}
+
+fn gear_worker_command_for_kind(worker_kind: WorkerKind) -> Option<String> {
+    let env_name = match worker_kind {
+        WorkerKind::Opencode => "GEARBOX_GEAR_OPENCODE_COMMAND",
+        WorkerKind::Codex => "GEARBOX_GEAR_CODEX_COMMAND",
+        WorkerKind::Claude => "GEARBOX_GEAR_CLAUDE_COMMAND",
+        WorkerKind::ZedAgent => "GEARBOX_GEAR_ZED_AGENT_COMMAND",
+        WorkerKind::Custom => "GEARBOX_GEAR_CUSTOM_COMMAND",
+    };
+    trimmed_env_value(env_name)
 }
 
 fn trimmed_env_value(name: &str) -> Option<String> {
