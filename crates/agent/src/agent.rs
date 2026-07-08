@@ -4674,16 +4674,27 @@ mod internal_tests {
     }
 
     async fn wait_for_fake_completion(model: &FakeLanguageModel, cx: &mut TestAppContext) {
-        for _ in 0..100 {
+        if wait_for_optional_fake_completion(model, cx, 100).await {
+            return;
+        }
+        panic!("timed out waiting for fake model completion request");
+    }
+
+    async fn wait_for_optional_fake_completion(
+        model: &FakeLanguageModel,
+        cx: &mut TestAppContext,
+        attempts: usize,
+    ) -> bool {
+        for _ in 0..attempts {
             cx.run_until_parked();
             if model.completion_count() > 0 {
-                return;
+                return true;
             }
             cx.background_executor
                 .timer(Duration::from_millis(10))
                 .await;
         }
-        panic!("timed out waiting for fake model completion request");
+        false
     }
 
     #[gpui::test]
@@ -4820,6 +4831,11 @@ mod internal_tests {
         wait_for_fake_completion(fake_model, cx).await;
         fake_model.send_last_completion_stream_text_chunk(
             "GOAL_SATISFIED: yes\nSUMMARY: The generated artifacts satisfy the MVP goal.\nREPAIR_REQUEST: none",
+        );
+        fake_model.end_last_completion_stream();
+        wait_for_fake_completion(fake_model, cx).await;
+        fake_model.send_last_completion_stream_text_chunk(
+            "GOAL_SATISFIED: unknown\nSUMMARY: The run reached its verification limit.\nREPAIR_REQUEST: none",
         );
         fake_model.end_last_completion_stream();
         prompt_task.await.unwrap();
