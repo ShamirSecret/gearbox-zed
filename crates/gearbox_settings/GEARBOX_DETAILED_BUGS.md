@@ -266,6 +266,71 @@ eprintln!("zed build.rs: {lib} not found in pkg-config's path");
 
 ---
 
+### 13. `coordinator_brief` 单次生成导致每轮 goal review/repair 无动态重评估
+
+**文件：** `crates/agent/src/agent.rs:2441-2465`, `crates/gearbox_agent/src/runtime.rs:260-279`
+
+`coordinator_brief` 仅在进入 Gear 会话前生成一次，随后一次性传入 `Orchestrator::run(...)`：
+
+```rust
+let coordinator_brief =
+    generate_gear_coordinator_brief(coordinator_language_model, &request, cx).await;
+
+let outcome = Orchestrator::run(RunOptions {
+    ...
+    coordinator_brief,
+    ...
+});
+```
+
+在 runtime 主循环中，每一轮 worker/verify/review 都复用同一个 `goal.coordinator_brief`：
+
+```rust
+coordinator_brief: goal.coordinator_brief.as_deref(),
+```
+
+与计划目标（每轮 review/repair 前再次向模型确认下一步）不一致；`coordinator_brief` 不会反映上一轮失败证据，可能造成越跑越偏。
+
+---
+
+### 14. `NeedUser` 状态在事件层被折叠为 `GoalBlocked`
+
+**文件：** `crates/gearbox_agent/src/state.rs:76-99,209-227`, `crates/gearbox_agent/src/runtime.rs:488-492`
+
+`GoalStatus` 定义了 `NeedsUser`，且 `evaluate_goal` 会在 worker 需要人工介入时返回该状态，但最终事件类型映射只有 `Complete/ Limited` 两个明确分支：
+
+```rust
+let final_event_kind = match goal.status {
+    GoalStatus::Complete => EventKind::GoalCompleted,
+    GoalStatus::Limited => EventKind::GoalLimited,
+    _ => EventKind::GoalBlocked,
+};
+```
+
+下游只会看到 `GoalBlocked`，`NeedsUser` 的细分信号无法被持久化为事件，影响可观测性与前端提示准确性。
+
+---
+
+### 15. `ACP stdio External Agent server` 尚未实现
+
+**文件：** `crates/gearbox_agent/src/main.rs:1-3`, `crates/gearbox_agent/src/cli.rs:17-20,87-90`, `crates/gearbox_agent/src/product.rs:292-293`, `docs/gearbox-gear-agent-plan.md:48,52`
+
+`main.rs` 直接进入 CLI，`clap` 子命令仅包含 `run`，缺少 stdio server 协议入口；`product.rs` 的 `Known Limits` 也明确写 “ACP server integration is intentionally deferred”：
+
+```rust
+enum Command {
+    Run(RunCommand),
+}
+```
+
+```text
+ACP server integration is intentionally deferred until the local CLI runtime is stable.
+```
+
+这意味着 Milestone 2 的 ACP 外部接入（session map、std-io 服务器）仍未到位，当前仍是 GUI 原生接入与本地 CLI 模式。
+
+---
+
 ## 修复优先级
 
 ```
@@ -281,8 +346,11 @@ P1：
   7. worktree 排序不一致 → 行 2940-2955
   8. title_token_translation 缺失词
   9. exact_translation 缺失 UI 标签
+  10. coordinator_brief 未按每轮 review/repair 重新生成
+  11. NeedsUser 被映射为 GoalBlocked 导致用户介入信号丢失
+  12. ACP stdio External Agent server 未实现（里程碑2未完成）
 
 P2：
-  10. build.rs 残留 "zed" → 行 17
-  12. HighlightedLabel 不翻译（已知限制）
+  13. build.rs 残留 "zed" → 行 17
+  14. HighlightedLabel 不翻译（已知限制）
 ```
