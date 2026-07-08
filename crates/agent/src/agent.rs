@@ -2408,11 +2408,6 @@ impl NativeAgentConnection {
             }
         });
 
-        acp_thread.update(cx, |acp_thread, cx| {
-            for block in prompt_blocks.iter().cloned() {
-                acp_thread.push_user_content_block(Some(client_user_message_id.clone()), block, cx);
-            }
-        });
         thread.update(cx, |thread, cx| {
             thread.push_acp_user_block(
                 client_user_message_id,
@@ -2420,6 +2415,25 @@ impl NativeAgentConnection {
                 path_style,
                 cx,
             );
+        });
+
+        if !is_gear_executable_goal(&request) {
+            return cx.spawn(async move |cx| {
+                push_gear_assistant_markdown(
+                    &acp_thread,
+                    &thread,
+                    "你好，我是 Gear。请告诉我你想完成的目标，例如要生成、修改、修复或审查哪一项工作。"
+                        .to_string(),
+                    cx,
+                );
+                Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))
+            });
+        }
+
+        self.agent.update(cx, |agent, _cx| {
+            if let Some(session) = agent.sessions.get_mut(&session_id) {
+                session.gear_cancellation_token = Some(cancellation_token.clone());
+            }
         });
 
         let (event_tx, event_rx) = async_channel::unbounded::<String>();
@@ -2538,6 +2552,70 @@ fn gear_request_from_prompt(prompt: &[acp::ContentBlock]) -> String {
         .filter(|text| !text.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+fn is_gear_executable_goal(request: &str) -> bool {
+    let request = request.trim();
+    if request.is_empty() {
+        return false;
+    }
+
+    let normalized = request
+        .trim_matches(|character: char| {
+            character.is_whitespace() || character.is_ascii_punctuation()
+        })
+        .to_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+
+    const SMALL_TALK: &[&str] = &[
+        "hi",
+        "hello",
+        "hey",
+        "你好",
+        "您好",
+        "嗨",
+        "哈喽",
+        "在吗",
+        "谢谢",
+        "thanks",
+        "thank you",
+    ];
+    if SMALL_TALK.iter().any(|phrase| normalized == *phrase) {
+        return false;
+    }
+
+    const ACTION_WORDS: &[&str] = &[
+        "add",
+        "build",
+        "change",
+        "create",
+        "debug",
+        "fix",
+        "implement",
+        "refactor",
+        "review",
+        "test",
+        "update",
+        "生成",
+        "创建",
+        "实现",
+        "修改",
+        "修复",
+        "调试",
+        "重构",
+        "审查",
+        "检查",
+        "测试",
+        "更新",
+        "继续",
+    ];
+
+    request.chars().count() >= 12
+        || ACTION_WORDS
+            .iter()
+            .any(|action_word| normalized.contains(action_word))
 }
 
 fn gear_workspace_for_session(session: &Session, agent: &NativeAgent, cx: &App) -> Result<PathBuf> {
@@ -4321,13 +4399,10 @@ mod internal_tests {
             })
             .await
             .unwrap();
-        let session_id = cx.update(|cx| acp_thread.read(cx).session_id().clone());
-
         let prompt_task = cx.update(|cx| {
-            connection.prompt(
-                acp::PromptRequest::new(session_id, vec!["Build a tiny notes app MVP".into()]),
-                cx,
-            )
+            acp_thread.update(cx, |thread, cx| {
+                thread.send(vec!["Build a tiny notes app MVP".into()], cx)
+            })
         });
         prompt_task.await.unwrap();
         cx.run_until_parked();
@@ -4352,6 +4427,41 @@ mod internal_tests {
             .find(|content| content.contains("Build a tiny notes app MVP"))
             .expect("Gear should persist the original request in the goal ledger");
         assert!(goal.contains("\"request\""));
+    }
+
+    #[gpui::test]
+    async fn test_gear_prompt_greeting_does_not_start_orchestrator(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("README.md"), "# Gear greeting test\n").unwrap();
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/", json!({ "a": {} })).await;
+        let project = Project::test(fs.clone(), [Path::new("/a")], cx).await;
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        let agent = cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs, cx));
+        let connection = Rc::new(NativeAgentConnection::gear(agent));
+
+        let acp_thread = cx
+            .update(|cx| {
+                connection.clone().new_session(
+                    project.clone(),
+                    PathList::new(&[workspace.path()]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let prompt_task = cx
+            .update(|cx| acp_thread.update(cx, |thread, cx| thread.send(vec!["你好".into()], cx)));
+        prompt_task.await.unwrap();
+        cx.run_until_parked();
+
+        assert!(
+            !workspace.path().join(".gearbox-agent").exists(),
+            "Gear should not create runtime artifacts for a greeting"
+        );
     }
 
     #[gpui::test]

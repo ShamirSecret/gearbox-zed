@@ -428,6 +428,8 @@ When syncing with upstream Zed, check these files first. The intended rule is:
 
 - Warns when `GEARBOX_GEAR_WORKER` contains an unknown worker kind instead of silently treating the value as `opencode`.
 - Adds testable Gear worker env parsing coverage for explicit worker command, legacy `GEARBOX_OPENCODE_COMMAND` fallback, and invalid worker kind fallback.
+- Avoids re-entering `AcpThread` updates when Gear sends a prompt; the ACP thread already records the user message before calling the Gear connection, while Gear still mirrors the user block into its internal native `Thread` for persistence and runtime context.
+- Keeps short greetings and small-talk in the Gear GUI session instead of starting a Gear runtime goal and writing `.gearbox-agent` artifacts.
 
 ### `crates/gearbox/src/main.rs`
 ### `crates/gearbox/src/zed.rs`
