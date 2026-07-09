@@ -363,16 +363,16 @@ impl Render for Onboarding {
                                                             "Welcome to Zed",
                                                             "欢迎使用 Gearbox",
                                                         ))
-                                                            .size(HeadlineSize::Small),
+                                                        .size(HeadlineSize::Small),
                                                     )
                                                     .child(
                                                         Label::new(gearbox_text(
                                                             "The editor for what's next",
                                                             "面向下一代工作的中文编辑器",
                                                         ))
-                                                            .color(Color::Muted)
-                                                            .size(LabelSize::Small)
-                                                            .italic(),
+                                                        .color(Color::Muted)
+                                                        .size(LabelSize::Small)
+                                                        .italic(),
                                                     ),
                                             ),
                                     )
@@ -381,17 +381,19 @@ impl Render for Onboarding {
                                             "finish_setup",
                                             gearbox_text("Finish Setup", "完成设置"),
                                         )
-                                            .style(ButtonStyle::Filled)
-                                            .size(ButtonSize::Medium)
-                                            .width(rems_from_px(200.))
-                                            .key_binding(KeyBinding::for_action_in(
-                                                &Finish,
-                                                &self.focus_handle,
-                                                cx,
-                                            ))
-                                            .on_click(|_, window, cx| {
+                                        .style(ButtonStyle::Filled)
+                                        .size(ButtonSize::Medium)
+                                        .width(rems_from_px(200.))
+                                        .key_binding(KeyBinding::for_action_in(
+                                            &Finish,
+                                            &self.focus_handle,
+                                            cx,
+                                        ))
+                                        .on_click(
+                                            |_, window, cx| {
                                                 window.dispatch_action(Finish.boxed_clone(), cx);
-                                            })
+                                            },
+                                        )
                                     }),
                             )
                             .child(Divider::horizontal().color(ui::DividerColor::BorderVariant))

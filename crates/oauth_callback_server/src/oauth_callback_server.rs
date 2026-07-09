@@ -312,8 +312,16 @@ mod server {
                     Ok(_) => (
                         200,
                         oauth_callback_page(
-                            if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") { "授权成功" } else { "Authorization Successful" },
-                            if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") { "你可以关闭此标签页并返回 Gearbox。" } else { "You can close this tab and return to Zed." },
+                            if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") {
+                                "授权成功"
+                            } else {
+                                "Authorization Successful"
+                            },
+                            if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") {
+                                "你可以关闭此标签页并返回 Gearbox。"
+                            } else {
+                                "You can close this tab and return to Zed."
+                            },
                             false,
                         ),
                     ),
@@ -322,8 +330,16 @@ mod server {
                         (
                             400,
                             oauth_callback_page(
-                                if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") { "授权失败" } else { "Authorization Failed" },
-                                if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") { "出现问题。请从 Gearbox 中重试。" } else { "Something went wrong. Please try again from Zed." },
+                                if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") {
+                                    "授权失败"
+                                } else {
+                                    "Authorization Failed"
+                                },
+                                if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") {
+                                    "出现问题。请从 Gearbox 中重试。"
+                                } else {
+                                    "Something went wrong. Please try again from Zed."
+                                },
                                 true,
                             ),
                         )

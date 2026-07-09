@@ -703,7 +703,9 @@ fn initialize_file_watcher(window: &mut Window, cx: &mut Context<Workspace>) {
         cx.spawn(async move |_, cx| {
             if prompt.await == Ok(0) {
                 cx.update(|cx| {
-                    cx.open_url("https://github.com/ShamirSecret/gearbox-zed#windows-troubleshooting");
+                    cx.open_url(
+                        "https://github.com/ShamirSecret/gearbox-zed#windows-troubleshooting",
+                    );
                     cx.quit()
                 });
             }

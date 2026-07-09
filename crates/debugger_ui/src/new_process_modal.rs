@@ -837,9 +837,9 @@ impl ConfigureMode {
                     "ENV=Zed ~/bin/program --option"
                 },
             )
-                .label("Program")
-                .tab_stop(true)
-                .tab_index(1)
+            .label("Program")
+            .tab_stop(true)
+            .tab_index(1)
         });
 
         let cwd = cx.new(|cx| {

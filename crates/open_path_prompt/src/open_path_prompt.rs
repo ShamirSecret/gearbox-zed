@@ -885,9 +885,9 @@ impl PickerDelegate for OpenPathDelegate {
             DirectoryState::List {
                 error: Some(error), ..
             } => error.clone(),
-            DirectoryState::List { .. } | DirectoryState::None { .. } => {
-                SharedString::from(gearbox_label("No such file or directory", "没有这个文件或目录"))
-            }
+            DirectoryState::List { .. } | DirectoryState::None { .. } => SharedString::from(
+                gearbox_label("No such file or directory", "没有这个文件或目录"),
+            ),
         })
     }
 

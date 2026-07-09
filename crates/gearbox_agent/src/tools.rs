@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use smol::process::{Command, Stdio};
 
 use crate::state::{CommandRecord, Scope};
@@ -39,7 +40,7 @@ impl CancellationToken {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ShellCommandResult {
     pub command: String,
     pub exit_code: Option<i32>,
@@ -67,6 +68,7 @@ pub struct DiffSnapshot {
     pub is_git_repo: bool,
     pub status: String,
     pub changed_files: Vec<String>,
+    pub diff_hash: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -170,17 +172,50 @@ pub fn git_snapshot(workspace: &Path) -> Result<DiffSnapshot> {
             is_git_repo: false,
             status: rev_parse.stderr,
             changed_files: Vec::new(),
+            diff_hash: None,
         });
     }
 
     let status = run_raw_git(workspace, &["status", "--short"])?;
     let changed_files = parse_status_paths(&status.stdout);
 
+    let diff_hash = {
+        let diff_result = run_raw_git(workspace, &["diff"])?;
+        if diff_result.success && !diff_result.stdout.trim().is_empty() {
+            let normalized = normalize_diff_patch(&diff_result.stdout);
+            let mut hasher = Sha256::new();
+            hasher.update(normalized.as_bytes());
+            Some(format!("{:x}", hasher.finalize()))
+        } else {
+            None
+        }
+    };
+
     Ok(DiffSnapshot {
         is_git_repo: true,
         status: status.stdout,
         changed_files,
+        diff_hash,
     })
+}
+
+/// Strip timestamp noise from `---`/`+++` header lines so that semantically
+/// identical diffs produced at different times hash to the same value.
+pub fn normalize_diff_patch(patch: &str) -> String {
+    patch
+        .lines()
+        .map(|line| {
+            if line.starts_with("--- ") || line.starts_with("+++ ") {
+                // Drop everything after the first tab, which is where git puts
+                // the timestamp (e.g. "--- a/foo.rs\t2024-01-01 12:00:00.000000000 +0000").
+                if let Some(tab_idx) = line.find('\t') {
+                    return line[..tab_idx].to_string();
+                }
+            }
+            line.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 pub fn check_scope(snapshot: &DiffSnapshot, scope: &Scope) -> ScopeCheck {
@@ -326,6 +361,7 @@ mod tests {
             is_git_repo: true,
             status: String::new(),
             changed_files: vec!["src/main.rs".to_string(), "README.md".to_string()],
+            diff_hash: None,
         };
         let scope = Scope::new(vec!["src".to_string()], vec![".git".to_string()], 10);
 

@@ -415,16 +415,26 @@ impl PaneLeaderDecorator for PaneRenderContext<'_> {
                             )))
                         }
                     }
-                    ParticipantLocation::UnsharedProject => Some(Label::new(if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") {
-                        format!("{} 正在查看一个未共享的 Gearbox 项目", leader.user.username)
-                    } else {
-                        format!("{} is viewing an unshared Zed project", leader.user.username)
-                    })),
-                    ParticipantLocation::External => Some(Label::new(if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") {
-                        format!("{} 正在查看 Gearbox 外部的窗口", leader.user.username)
-                    } else {
-                        format!("{} is viewing a window outside of Zed", leader.user.username)
-                    })),
+                    ParticipantLocation::UnsharedProject => Some(Label::new(
+                        if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") {
+                            format!("{} 正在查看一个未共享的 Gearbox 项目", leader.user.username)
+                        } else {
+                            format!(
+                                "{} is viewing an unshared Zed project",
+                                leader.user.username
+                            )
+                        },
+                    )),
+                    ParticipantLocation::External => Some(Label::new(
+                        if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") {
+                            format!("{} 正在查看 Gearbox 外部的窗口", leader.user.username)
+                        } else {
+                            format!(
+                                "{} is viewing a window outside of Zed",
+                                leader.user.username
+                            )
+                        },
+                    )),
                 };
                 status_box = leader_status_box.map(|status| {
                     div()

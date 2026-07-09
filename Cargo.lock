@@ -7340,6 +7340,7 @@ dependencies = [
  "clap",
  "serde",
  "serde_json",
+ "sha2",
  "smol",
  "tempfile",
 ]

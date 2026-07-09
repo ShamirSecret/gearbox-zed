@@ -20,10 +20,7 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
             "重置缩放",
             zed_actions::ResetBufferFontSize { persist: false },
         ),
-        MenuItem::action(
-            "重置全部缩放",
-            zed_actions::ResetAllZoom { persist: false },
-        ),
+        MenuItem::action("重置全部缩放", zed_actions::ResetAllZoom { persist: false }),
         MenuItem::separator(),
         MenuItem::action("显示/隐藏左侧停靠栏", workspace::ToggleLeftDock),
         MenuItem::action("显示/隐藏右侧停靠栏", workspace::ToggleRightDock),
@@ -156,21 +153,14 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
                 MenuItem::action("查找", search::buffer_search::Deploy::find()),
                 MenuItem::action("在项目中查找", workspace::DeploySearch::default()),
                 MenuItem::separator(),
-                MenuItem::action(
-                    "切换行注释",
-                    editor::actions::ToggleComments::default(),
-                ),
+                MenuItem::action("切换行注释", editor::actions::ToggleComments::default()),
             ],
         },
         Menu {
             name: "选择".into(),
             disabled: false,
             items: vec![
-                MenuItem::os_action(
-                    "全选",
-                    editor::actions::SelectAll,
-                    OsAction::SelectAll,
-                ),
+                MenuItem::os_action("全选", editor::actions::SelectAll, OsAction::SelectAll),
                 MenuItem::action("扩大选择", editor::actions::SelectLargerSyntaxNode),
                 MenuItem::action("缩小选择", editor::actions::SelectSmallerSyntaxNode),
                 MenuItem::action("选择下一个同级节点", editor::actions::SelectNextSyntaxNode),
@@ -226,10 +216,7 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
                 MenuItem::separator(),
                 MenuItem::action("跳转到文件...", workspace::ToggleFileFinder::default()),
                 // MenuItem::action("Go to Symbol in Project", project_symbols::Toggle),
-                MenuItem::action(
-                    "跳转到编辑器符号...",
-                    zed_actions::outline::ToggleOutline,
-                ),
+                MenuItem::action("跳转到编辑器符号...", zed_actions::outline::ToggleOutline),
                 MenuItem::action("跳转到行/列...", editor::actions::ToggleGoToLine),
                 MenuItem::separator(),
                 MenuItem::action("跳转到定义", editor::actions::GoToDefinition),
@@ -285,10 +272,7 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
             name: "帮助".into(),
             disabled: false,
             items: vec![
-                MenuItem::action(
-                    "查看本地发行说明",
-                    auto_update_ui::ViewReleaseNotesLocally,
-                ),
+                MenuItem::action("查看本地发行说明", auto_update_ui::ViewReleaseNotesLocally),
                 MenuItem::action("查看遥测", zed_actions::OpenTelemetryLog),
                 MenuItem::action("查看依赖许可证", zed_actions::OpenLicenses),
                 MenuItem::action("显示欢迎页", onboarding::ShowWelcome),

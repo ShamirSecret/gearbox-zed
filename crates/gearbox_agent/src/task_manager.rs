@@ -178,6 +178,10 @@ pub struct TaskSnapshot {
     pub result_path: Option<PathBuf>,
     pub outcome_path: Option<PathBuf>,
     pub summary: String,
+    #[serde(default)]
+    pub summary_head: String,
+    #[serde(default)]
+    pub continuation_hint: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -502,6 +506,24 @@ fn messageability_for_record(record: &TaskRecord) -> Messageability {
         ManagedTaskStatus::Skipped => Messageability::NotContinuable {
             reason: "task was skipped".to_string(),
         },
+    }
+}
+
+fn continuation_hint_for_record(record: &TaskRecord) -> String {
+    match messageability_for_record(record) {
+        Messageability::Revive => {
+            "Follow up from the Gear panel or open the result/outcome artifacts to continue."
+                .to_string()
+        }
+        Messageability::Steer => {
+            "Steer the running task from the Gear panel or open the result/outcome artifacts."
+                .to_string()
+        }
+        Messageability::NotContinuable { reason } => {
+            format!(
+                "Open the result/outcome artifacts to inspect the full result ({reason})."
+            )
+        }
     }
 }
 
@@ -831,6 +853,7 @@ impl TaskManagerControl {
 pub struct TaskManager {
     registry: WorkerRegistry,
     records: HashMap<String, TaskRecord>,
+    task_record_paths: HashMap<String, PathBuf>,
     running_tasks: HashMap<String, RunningTask>,
     queued_tasks: VecDeque<QueuedTask>,
     completed_runs: HashMap<String, ManagedWorkerRun>,
@@ -924,6 +947,7 @@ impl Default for TaskManager {
         Self {
             registry: WorkerRegistry::default(),
             records: HashMap::new(),
+            task_record_paths: HashMap::new(),
             running_tasks: HashMap::new(),
             queued_tasks: VecDeque::new(),
             completed_runs: HashMap::new(),
@@ -944,6 +968,16 @@ impl Drop for TaskManager {
     fn drop(&mut self) {
         self.shutdown_resident_tasks("task_manager_drop");
     }
+}
+
+fn state_store_from_task_record_path(task_record_path: &std::path::Path) -> Option<StateStore> {
+    let workspace_root = task_record_path
+        .parent()?
+        .parent()?
+        .parent()?
+        .parent()?
+        .to_path_buf();
+    Some(StateStore::new(workspace_root))
 }
 
 impl TaskManager {
@@ -1053,9 +1087,11 @@ impl TaskManager {
                     );
                 }
             });
+            let task_id = record.task_id.clone();
             write_task_record(store, &record)?;
             append_task_lifecycle_event(store, &record, Some(&transition))?;
-            self.records.insert(record.task_id.clone(), record);
+            self.records.insert(task_id.clone(), record);
+            self.task_record_paths.insert(task_id, task_record_path);
             recovered += 1;
         }
 
@@ -1125,6 +1161,10 @@ impl TaskManager {
         write_task_record(&store, &record)?;
         append_task_lifecycle_event(&store, &record, None)?;
         self.records.insert(task_id.clone(), record.clone());
+        self.task_record_paths.insert(
+            task_id.clone(),
+            store.worker_dir(&task_id).join("task-record.json"),
+        );
         self.control
             .set_current(task_id.clone(), ManagedTaskStatus::Pending, None)?;
 
@@ -1263,6 +1303,11 @@ impl TaskManager {
                 self.completed_runs
                     .get(task_id)
                     .map(|run| run.store.clone())
+            })
+            .or_else(|| {
+                self.task_record_paths
+                    .get(task_id)
+                    .and_then(|task_record_path| state_store_from_task_record_path(task_record_path))
             });
 
         // Stop the resident handle best-effort before clearing records.
@@ -1315,6 +1360,7 @@ impl TaskManager {
         // Clean up completed runs, errors, records
         self.completed_runs.remove(task_id);
         self.completed_errors.remove(task_id);
+        self.task_record_paths.remove(task_id);
 
         // Remove from archive
         self.completed_archive
@@ -1435,35 +1481,65 @@ impl TaskManager {
         count
     }
 
-    fn trim_archive(&mut self) {
-        // Preserve Cancelled and Lost records in archive
-        // Remove oldest Completed/Failed/Interrupted/Skipped if over cap
-        let preserved_count = self
-            .completed_archive
-            .iter()
-            .filter(|record| {
-                matches!(
-                    record.status,
-                    ManagedTaskStatus::Cancelled | ManagedTaskStatus::Lost
-                )
-            })
-            .count();
-        let cap = ARCHIVE_CAP.saturating_sub(preserved_count);
-        while self.completed_archive.len() > cap && cap > 0 {
-            let front = &self.completed_archive[0];
-            if matches!(
-                front.status,
+fn trim_archive(&mut self) {
+    if self.completed_archive.len() <= ARCHIVE_CAP {
+        return;
+    }
+
+    let preserved_indices: Vec<usize> = self
+        .completed_archive
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, record)| {
+            matches!(record.status, ManagedTaskStatus::Cancelled | ManagedTaskStatus::Lost)
+                .then_some(idx)
+        })
+        .collect();
+    let non_preserved_indices: Vec<usize> = self
+        .completed_archive
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, record)| {
+            (!matches!(
+                record.status,
                 ManagedTaskStatus::Cancelled | ManagedTaskStatus::Lost
-            ) {
-                // Move to end to preserve it
-                if let Some(record) = self.completed_archive.pop_front() {
-                    self.completed_archive.push_back(record);
-                }
-            } else {
-                self.completed_archive.pop_front();
-            }
+            ))
+            .then_some(idx)
+        })
+        .collect();
+
+    let preserved_budget = preserved_indices.len().min(ARCHIVE_CAP);
+    let non_preserved_budget = ARCHIVE_CAP - preserved_budget;
+    let non_preserved_kept: Vec<usize> = non_preserved_indices
+        .iter()
+        .rev()
+        .take(non_preserved_budget)
+        .copied()
+        .collect();
+    let non_preserved_keep = non_preserved_kept
+        .iter()
+        .collect::<std::collections::HashSet<_>>();
+
+    let preserved_keep: Vec<usize> = if preserved_indices.len() <= preserved_budget {
+        preserved_indices.clone()
+    } else {
+        preserved_indices
+            .iter()
+            .rev()
+            .take(preserved_budget)
+            .copied()
+            .collect()
+    };
+    let preserved_keep = preserved_keep.iter().collect::<std::collections::HashSet<_>>();
+
+    let mut filtered = VecDeque::new();
+    for (index, task_record) in self.completed_archive.iter().enumerate() {
+        if non_preserved_keep.contains(&index) || preserved_keep.contains(&index) {
+            filtered.push_back(task_record.clone());
         }
     }
+    self.completed_archive = filtered;
+}
 
     fn sweep_stale_running_tasks(&mut self) -> Result<usize> {
         let stale_task_timeout = self.runtime_policy.stale_task_timeout;
@@ -2020,6 +2096,13 @@ impl TaskManager {
                 let status = record.status.clone();
                 let has_failure_kind = record.failure_kind.is_some();
                 let has_retry_reason = record.retry_reason.is_some();
+                let summary_head = record
+                    .summary
+                    .lines()
+                    .next()
+                    .unwrap_or(record.summary.as_str())
+                    .to_string();
+                let continuation_hint = continuation_hint_for_record(&record);
                 TaskSnapshot {
                     task_id: record.task_id,
                     status: record.status,
@@ -2065,6 +2148,8 @@ impl TaskManager {
                     result_path: record.result_path,
                     outcome_path: record.outcome_path,
                     summary: record.summary,
+                    summary_head,
+                    continuation_hint,
                 }
             })
             .collect();
@@ -2387,6 +2472,8 @@ pub struct CompletionNotification {
     pub status: ManagedTaskStatus,
     pub run_epoch: u64,
     pub summary: String,
+    pub summary_head: String,
+    pub continuation_hint: String,
     pub failure_kind: Option<TaskFailureKind>,
     pub duration_ms: u64,
     pub result_path: Option<PathBuf>,
@@ -2394,6 +2481,8 @@ pub struct CompletionNotification {
 }
 
 const NOTIFIER_DEBOUNCE_MS: u64 = 100;
+const NOTIFIER_RETRY_DELAY_MS: u64 = 100;
+const NOTIFIER_RETRY_ATTEMPTS: usize = 2;
 
 #[derive(Clone, Default)]
 pub struct CompletionNotifier {
@@ -2436,6 +2525,13 @@ impl CompletionNotifier {
             status: record.status.clone(),
             run_epoch: record.run_epoch,
             summary: record.summary.clone(),
+            summary_head: record
+                .summary
+                .lines()
+                .next()
+                .unwrap_or(record.summary.as_str())
+                .to_string(),
+            continuation_hint: continuation_hint_for_record(record),
             failure_kind: record.failure_kind.clone(),
             duration_ms,
             result_path: record.result_path.clone(),
@@ -2455,21 +2551,7 @@ impl CompletionNotifier {
         }
 
         if parent_state.can_wake() {
-            match write_notified(&notification.task_id, notification.run_epoch) {
-                Ok(()) => Ok(NotificationResult::Sent),
-                Err(e) => {
-                    let failure = format!("{e:#}");
-                    if let Err(record_error) =
-                        record_failed_epoch(&notification.task_id, notification.run_epoch)
-                    {
-                        eprintln!(
-                            "failed to record completion notification failure for {} epoch {}: {record_error:#}",
-                            notification.task_id, notification.run_epoch,
-                        );
-                    }
-                    Ok(NotificationResult::Failed(failure))
-                }
-            }
+            Self::deliver_with_retry(&notification, write_notified, record_failed_epoch)
         } else if parent_state.should_buffer() {
             self.buffer
                 .lock()
@@ -2480,6 +2562,36 @@ impl CompletionNotifier {
         } else {
             Ok(NotificationResult::Dropped)
         }
+    }
+
+    fn deliver_with_retry(
+        notification: &CompletionNotification,
+        write_notified: &dyn Fn(&str, u64) -> Result<()>,
+        record_failed_epoch: &dyn Fn(&str, u64) -> Result<()>,
+    ) -> Result<NotificationResult> {
+        let mut last_failure: Option<String> = None;
+        for attempt in 0..NOTIFIER_RETRY_ATTEMPTS {
+            match write_notified(&notification.task_id, notification.run_epoch) {
+                Ok(()) => return Ok(NotificationResult::Sent),
+                Err(error) => {
+                    last_failure = Some(format!("{error:#}"));
+                    if attempt + 1 < NOTIFIER_RETRY_ATTEMPTS {
+                        std::thread::sleep(Duration::from_millis(NOTIFIER_RETRY_DELAY_MS));
+                    }
+                }
+            }
+        }
+
+        if let Err(record_error) = record_failed_epoch(&notification.task_id, notification.run_epoch)
+        {
+            eprintln!(
+                "failed to record completion notification failure for {} epoch {}: {record_error:#}",
+                notification.task_id, notification.run_epoch,
+            );
+        }
+        Ok(NotificationResult::Failed(
+            last_failure.unwrap_or_else(|| "notification delivery failed".to_string()),
+        ))
     }
 
     pub fn flush_buffer(
@@ -2520,20 +2632,11 @@ impl CompletionNotifier {
         keys.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
         for key in keys {
             if let Some(notification) = buffer.remove(&key) {
-                match write_notified(&notification.task_id, notification.run_epoch) {
-                    Ok(()) => results.push(NotificationResult::Sent),
-                    Err(e) => {
-                        if let Err(record_error) =
-                            record_failed_epoch(&notification.task_id, notification.run_epoch)
-                        {
-                            eprintln!(
-                                "failed to record completion notification failure for {} epoch {}: {record_error:#}",
-                                notification.task_id, notification.run_epoch,
-                            );
-                        }
-                        results.push(NotificationResult::Failed(format!("{e:#}")));
-                    }
-                }
+                results.push(Self::deliver_with_retry(
+                    &notification,
+                    write_notified,
+                    record_failed_epoch,
+                )?);
             }
         }
         Ok(results)
@@ -4818,6 +4921,11 @@ mod tests {
         assert_eq!(snapshot.tasks.len(), 1);
         assert_eq!(snapshot.tasks[0].task_id, "task_snapshot");
         assert_eq!(snapshot.tasks[0].attempts.len(), 1);
+        assert_eq!(snapshot.tasks[0].messageability, Some(Messageability::Steer));
+        assert_eq!(snapshot.tasks[0].summary_head, "Worker task started.");
+        assert!(snapshot.tasks[0]
+            .continuation_hint
+            .contains("Steer the running task"));
         assert_eq!(
             snapshot.tasks[0].attempts[0].outcome_path.as_deref(),
             Some(std::path::Path::new("/tmp/attempt-outcome.json"))
@@ -6389,6 +6497,15 @@ mod tests {
                 .exists()
         );
 
+        manager.destroy_resident_task("task_pending", "test-orphan-dispose")?;
+        let pending_json =
+            fs::read_to_string(store.worker_dir("task_pending").join("task-record.json"))?;
+        let pending_after_destroy: TaskRecord = serde_json::from_str(&pending_json)?;
+        assert_eq!(pending_after_destroy.residency_state, ResidencyState::Disposed);
+        let pending_events =
+            fs::read_to_string(store.worker_dir("task_pending").join("task-events.jsonl"))?;
+        assert!(pending_events.contains("dispose"));
+
         Ok(())
     }
 
@@ -6480,6 +6597,58 @@ mod tests {
     }
 
     #[test]
+    fn completion_notification_includes_summary_head_and_continuation_hint() -> Result<()> {
+        let mut record = test_task_record(
+            "task_notification_content",
+            ManagedTaskStatus::Completed,
+            TaskAttemptStatus::Completed,
+        );
+        record.summary = "Head line\nTail line".to_string();
+        record.run_epoch = 2;
+        record.started_at = timestamp();
+        record.finished_at = Some(timestamp());
+
+        let notification = CompletionNotifier::build_notification(
+            &record,
+            &record.started_at,
+            record.finished_at.as_ref().unwrap(),
+        )
+        .context("should build notification for completed task")?;
+
+        assert_eq!(notification.summary_head, "Head line");
+        assert!(notification
+            .continuation_hint
+            .contains("Follow up from the Gear panel"));
+        Ok(())
+    }
+
+    #[test]
+    fn completion_notification_uses_artifact_hint_when_not_continuable() -> Result<()> {
+        let mut record = test_task_record(
+            "task_notification_nonresident",
+            ManagedTaskStatus::Lost,
+            TaskAttemptStatus::Failed,
+        );
+        record.residency_state = ResidencyState::Disposed;
+        record.summary = "Lost line".to_string();
+        record.started_at = timestamp();
+        record.finished_at = Some(timestamp());
+
+        let notification = CompletionNotifier::build_notification(
+            &record,
+            &record.started_at,
+            record.finished_at.as_ref().unwrap(),
+        )
+        .context("should build notification for lost task")?;
+
+        assert_eq!(notification.summary_head, "Lost line");
+        assert!(notification
+            .continuation_hint
+            .contains("Open the result/outcome artifacts"));
+        Ok(())
+    }
+
+    #[test]
     fn buffer_flush_deduplicates_task_epoch() -> Result<()> {
         let notifier = CompletionNotifier::new();
         let notification = CompletionNotification {
@@ -6488,6 +6657,10 @@ mod tests {
             status: ManagedTaskStatus::Completed,
             run_epoch: 1,
             summary: "first".to_string(),
+            summary_head: "first".to_string(),
+            continuation_hint:
+                "Follow up from the Gear panel or open the result/outcome artifacts to continue."
+                    .to_string(),
             failure_kind: None,
             duration_ms: 0,
             result_path: None,
@@ -6540,7 +6713,8 @@ mod tests {
     #[test]
     fn delivery_failure_records_notification_failed_epoch() -> Result<()> {
         let notifier = CompletionNotifier::new();
-        let notified = Arc::new(Mutex::new(Vec::new()));
+        let delivery_attempts = Arc::new(Mutex::new(0usize));
+        let failed_epochs = Arc::new(Mutex::new(Vec::new()));
         let mut record = test_task_record(
             "task_delivery_fail",
             ManagedTaskStatus::Completed,
@@ -6560,9 +6734,18 @@ mod tests {
         let result = notifier.try_notify(
             notification,
             ParentSessionState::Idle,
-            &|task_id, epoch| bail!("deliberate delivery failure for {task_id} epoch {epoch}"),
+            &{
+                let delivery_attempts = delivery_attempts.clone();
+                move |task_id, epoch| {
+                    let mut attempts = delivery_attempts
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("mutex"))?;
+                    *attempts += 1;
+                    bail!("deliberate delivery failure for {task_id} epoch {epoch}")
+                }
+            },
             &|task_id, epoch| {
-                notified
+                failed_epochs
                     .lock()
                     .map_err(|_| anyhow::anyhow!("mutex"))?
                     .push((task_id.to_string(), epoch));
@@ -6570,11 +6753,75 @@ mod tests {
             },
         )?;
         assert!(matches!(result, NotificationResult::Failed(_)));
-        let notified = notified.lock().map_err(|_| anyhow::anyhow!("mutex"))?;
-        assert_eq!(
-            notified.as_slice(),
-            &[("task_delivery_fail".to_string(), 1)]
+        let attempts = delivery_attempts
+            .lock()
+            .map_err(|_| anyhow::anyhow!("mutex"))?;
+        assert_eq!(*attempts, 2, "delivery should retry once before failing");
+        let failed_epochs = failed_epochs.lock().map_err(|_| anyhow::anyhow!("mutex"))?;
+        assert_eq!(failed_epochs.as_slice(), &[("task_delivery_fail".to_string(), 1)]);
+        Ok(())
+    }
+
+    #[test]
+    fn delivery_retry_succeeds_after_transient_failure() -> Result<()> {
+        let notifier = CompletionNotifier::new();
+        let delivery_attempts = Arc::new(Mutex::new(0usize));
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let failed_epochs = Arc::new(Mutex::new(Vec::new()));
+        let mut record = test_task_record(
+            "task_delivery_retry",
+            ManagedTaskStatus::Completed,
+            TaskAttemptStatus::Completed,
         );
+        record.run_epoch = 2;
+        record.started_at = timestamp();
+        record.finished_at = Some(timestamp());
+
+        let notification = CompletionNotifier::build_notification(
+            &record,
+            &record.started_at,
+            record.finished_at.as_ref().unwrap(),
+        )
+        .context("should build notification for completed task")?;
+
+        let result = notifier.try_notify(
+            notification,
+            ParentSessionState::Idle,
+            &{
+                let delivery_attempts = delivery_attempts.clone();
+                let delivered = delivered.clone();
+                move |task_id, epoch| {
+                    let mut attempts = delivery_attempts
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("mutex"))?;
+                    *attempts += 1;
+                    if *attempts == 1 {
+                        bail!("transient delivery failure for {task_id} epoch {epoch}");
+                    }
+                    delivered
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("mutex"))?
+                        .push((task_id.to_string(), epoch));
+                    Ok(())
+                }
+            },
+            &|task_id, epoch| {
+                failed_epochs
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("mutex"))?
+                    .push((task_id.to_string(), epoch));
+                Ok(())
+            },
+        )?;
+        assert_eq!(result, NotificationResult::Sent);
+        let attempts = delivery_attempts
+            .lock()
+            .map_err(|_| anyhow::anyhow!("mutex"))?;
+        assert_eq!(*attempts, 2, "delivery should retry once before succeeding");
+        let delivered = delivered.lock().map_err(|_| anyhow::anyhow!("mutex"))?;
+        assert_eq!(delivered.as_slice(), &[("task_delivery_retry".to_string(), 2)]);
+        let failed_epochs = failed_epochs.lock().map_err(|_| anyhow::anyhow!("mutex"))?;
+        assert!(failed_epochs.is_empty(), "transient failure should not write failed epoch");
         Ok(())
     }
 

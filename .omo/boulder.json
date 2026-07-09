@@ -1,0 +1,35 @@
+{
+  "schema_version": 2,
+  "active_work_id": "gear-omo-alignment-9a5a719b",
+  "works": {
+    "gear-omo-alignment-9a5a719b": {
+      "work_id": "gear-omo-alignment-9a5a719b",
+      "active_plan": "/home/donald/文档/github/zed/.omo/plans/gear-omo-alignment.md",
+      "plan_name": "gear-omo-alignment",
+      "status": "active",
+      "started_at": "2026-07-09T16:01:24.566Z",
+      "updated_at": "2026-07-09T16:01:24.566Z",
+      "session_ids": [
+        "opencode:ses_0b86339ceffeA1NNdS89kgib0H"
+      ],
+      "session_origins": {
+        "opencode:ses_0b86339ceffeA1NNdS89kgib0H": "direct"
+      },
+      "agent": "atlas",
+      "task_sessions": {}
+    }
+  },
+  "active_plan": "/home/donald/文档/github/zed/.omo/plans/gear-omo-alignment.md",
+  "started_at": "2026-07-09T16:01:24.566Z",
+  "status": "active",
+  "updated_at": "2026-07-09T16:01:24.566Z",
+  "session_ids": [
+    "opencode:ses_0b86339ceffeA1NNdS89kgib0H"
+  ],
+  "session_origins": {
+    "opencode:ses_0b86339ceffeA1NNdS89kgib0H": "direct"
+  },
+  "plan_name": "gear-omo-alignment",
+  "task_sessions": {},
+  "agent": "atlas"
+}

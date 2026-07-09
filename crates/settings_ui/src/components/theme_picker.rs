@@ -80,7 +80,12 @@ impl PickerDelegate for ThemePickerDelegate {
     }
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
-        (if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") { "搜索主题..." } else { "Search theme…" }).into()
+        (if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") {
+            "搜索主题..."
+        } else {
+            "Search theme…"
+        })
+        .into()
     }
 
     fn update_matches(

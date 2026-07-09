@@ -16,7 +16,8 @@ use context_server::ContextServerId;
 pub use db::*;
 pub use gearbox_agent::task_manager::ManagedTaskStatus as GearManagedTaskStatus;
 pub use gearbox_agent::task_manager::{
-    TaskAttemptSnapshot as GearTaskAttemptSnapshot, TaskManagerSnapshot as GearTaskManagerSnapshot,
+    Messageability as GearTaskMessageability, TaskAttemptSnapshot as GearTaskAttemptSnapshot,
+    TaskAttemptStatus as GearTaskAttemptStatus, TaskManagerSnapshot as GearTaskManagerSnapshot,
     TaskSnapshot as GearTaskSnapshot,
 };
 use itertools::Itertools;
@@ -54,19 +55,19 @@ use futures::future::Shared;
 use futures::{FutureExt as _, StreamExt as _, future};
 use gearbox_agent::runtime::{
     CoordinatorReview, CoordinatorReviewHook, CoordinatorReviewInput, DEFAULT_MAX_ITERATIONS,
-    Orchestrator, RunOptions,
+    DEFAULT_MAX_PROVIDER_UNKNOWN_STREAK, DEFAULT_MAX_RUNTIME_MINUTES, Orchestrator, RunOptions,
 };
-use gearbox_agent::state::CoordinatorModel;
+use gearbox_agent::state::{CoordinatorModel, StateStore};
 use gearbox_agent::task_manager::{
     ManagedTaskStatus, SharedTaskManager, TaskAttemptSnapshot, TaskManager, TaskManagerControl,
     TaskManagerSnapshot, TaskManagerTickLoop, TaskSnapshot,
 };
 use gearbox_agent::tools::CancellationToken;
 use gearbox_agent::workers::{
-    NativeWorkerBackend, VerificationContract, WorkerConfig, WorkerKind, WorkerOutcome,
-    WorkerPacket, WorkerRegistry, WorkerResult, WorkerRoute, WorkerSessionHandle,
-    WorkerStartRequest, WorkerStatus, worker_outcome_from_result, worker_prompt,
-    write_result_and_outcome,
+    NativeWorkerBackend, VerificationContract, WorkerCategory, WorkerConfig, WorkerKind,
+    WorkerOutcome, WorkerPacket, WorkerRegistry, WorkerResult, WorkerRoute, WorkerSessionHandle,
+    WorkerStartRequest, WorkerStatus, category_resolution_for_route, sanitize_model_fields,
+    worker_outcome_from_result, worker_prompt, write_result_and_outcome,
 };
 use gpui::{
     App, AppContext, AsyncApp, Context, Entity, EntityId, SharedString, Subscription, Task,
@@ -87,7 +88,7 @@ use settings::{LanguageModelSelection, Settings as _, update_settings_file};
 use std::any::Any;
 use std::collections::VecDeque;
 use std::fs as std_fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use util::ResultExt;
@@ -2218,6 +2219,22 @@ impl NativeAgentConnection {
         }
     }
 
+    fn gear_task_manager(
+        &self,
+        session_id: &acp::SessionId,
+        cx: &App,
+    ) -> Option<SharedTaskManager> {
+        if !self.is_gear() {
+            return None;
+        }
+
+        self.agent
+            .read(cx)
+            .sessions
+            .get(session_id)
+            .and_then(|session| session.gear_task_manager.clone())
+    }
+
     fn gear_task_manager_control(
         &self,
         session_id: &acp::SessionId,
@@ -2238,14 +2255,33 @@ impl NativeAgentConnection {
         let Some(control) = self.gear_task_manager_control(session_id, cx) else {
             return Ok(false);
         };
-        control.interrupt_current_task()
+        let Some(task_id) = control.current_task_id()? else {
+            return Ok(false);
+        };
+        let Some(task_manager) = self.gear_task_manager(session_id, cx) else {
+            return Ok(false);
+        };
+        task_manager
+            .lock()
+            .map_err(|_| anyhow::anyhow!("gear task manager mutex poisoned"))?
+            .interrupt_task(&task_id)
     }
 
     pub fn cancel_gear_task(&self, session_id: &acp::SessionId, cx: &App) -> Result<bool> {
         let Some(control) = self.gear_task_manager_control(session_id, cx) else {
             return Ok(false);
         };
-        control.cancel_current_task()
+        let Some(task_id) = control.current_task_id()? else {
+            return Ok(false);
+        };
+        let Some(task_manager) = self.gear_task_manager(session_id, cx) else {
+            return Ok(false);
+        };
+        task_manager
+            .lock()
+            .map_err(|_| anyhow::anyhow!("gear task manager mutex poisoned"))?
+            .cancel_task(&task_id)
+            .map(|_| true)
     }
 
     pub fn send_follow_up_gear_task(
@@ -2257,7 +2293,24 @@ impl NativeAgentConnection {
         let Some(control) = self.gear_task_manager_control(session_id, cx) else {
             return Ok(false);
         };
-        control.send_follow_up_current_task(prompt)
+        let Some(task_id) = control.current_task_id()? else {
+            return Ok(false);
+        };
+        match control.current_task_status()? {
+            Some(ManagedTaskStatus::Pending) | Some(ManagedTaskStatus::Running) => {
+                control.send_follow_up_task(&task_id, prompt)
+            }
+            Some(_) => {
+                let Some(task_manager) = self.gear_task_manager(session_id, cx) else {
+                    return Ok(false);
+                };
+                task_manager
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("gear task manager mutex poisoned"))?
+                    .send_follow_up_task(&task_id, prompt)
+            }
+            None => Ok(false),
+        }
     }
 
     pub fn steer_gear_task(
@@ -2269,7 +2322,24 @@ impl NativeAgentConnection {
         let Some(control) = self.gear_task_manager_control(session_id, cx) else {
             return Ok(false);
         };
-        control.steer_current_task(prompt)
+        let Some(task_id) = control.current_task_id()? else {
+            return Ok(false);
+        };
+        match control.current_task_status()? {
+            Some(ManagedTaskStatus::Pending) | Some(ManagedTaskStatus::Running) => {
+                control.steer_task(&task_id, prompt)
+            }
+            Some(_) => {
+                let Some(task_manager) = self.gear_task_manager(session_id, cx) else {
+                    return Ok(false);
+                };
+                task_manager
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("gear task manager mutex poisoned"))?
+                    .steer_task(&task_id, prompt)
+            }
+            None => Ok(false),
+        }
     }
 
     /// Forwards to [`NativeAgent::ensure_skills_scan_started`]. The
@@ -2575,11 +2645,13 @@ impl NativeAgentConnection {
         let cancellation_session_id = session_id.clone();
         cx.spawn(async move |cx| {
             let review_language_model = coordinator_language_model.clone();
+            let review_workspace = workspace.clone();
             let review_task = cx.spawn(async move |cx| {
                 while let Ok(job) = review_rx.recv().await {
                     let review = generate_gear_coordinator_review(
                         review_language_model.clone(),
                         job.input,
+                        &job.workspace,
                         cx,
                     )
                     .await;
@@ -2595,7 +2667,11 @@ impl NativeAgentConnection {
                     Some(Arc::new(move |input: CoordinatorReviewInput| {
                         let (response_tx, response_rx) = async_channel::bounded(1);
                         review_tx
-                            .send_blocking(GearCoordinatorReviewJob { input, response_tx })
+                            .send_blocking(GearCoordinatorReviewJob {
+                                input,
+                                workspace: review_workspace.clone(),
+                                response_tx,
+                            })
                             .context("failed to send Gear coordinator review request")?;
                         response_rx
                             .recv_blocking()
@@ -2631,6 +2707,9 @@ impl NativeAgentConnection {
                     event_sink: Some(event_sink),
                     cancellation_token: Some(run_cancellation_token),
                     max_iterations: gear_max_iterations_from_env(),
+                    max_provider_unknown_streak: gear_max_provider_unknown_streak_from_env(),
+                    max_child_depth: gear_max_child_depth_from_env(),
+                    max_runtime_minutes: gear_max_runtime_minutes_from_env(),
                     coordinator_model,
                     coordinator_brief,
                     coordinator_review_hook,
@@ -2819,6 +2898,7 @@ fn gear_provider_review_enabled(model: Option<&Arc<dyn LanguageModel>>) -> bool 
 
 struct GearCoordinatorReviewJob {
     input: CoordinatorReviewInput,
+    workspace: PathBuf,
     response_tx: async_channel::Sender<Result<Option<CoordinatorReview>>>,
 }
 
@@ -2899,83 +2979,33 @@ fn format_list_or_none(values: &[String]) -> String {
 async fn generate_gear_coordinator_review(
     model: Option<Arc<dyn LanguageModel>>,
     input: CoordinatorReviewInput,
+    workspace: &Path,
     cx: &AsyncApp,
 ) -> Option<CoordinatorReview> {
     let Some(model) = model else {
         return None;
     };
 
-    let review_request = format!(
-        r#"Goal id: {goal_id}
-Task id: {task_id}
-Iteration: {iteration}/{max_iterations}
-Budget: {budget_summary}
+    let mut model_fields = std::collections::HashMap::new();
+    model_fields.insert("worker_kind".to_string(), input.worker_kind.clone());
+    model_fields.insert("worker_category".to_string(), input.worker_category.clone());
+    if let Some(worker_model) = input.worker_model.as_ref() {
+        model_fields.insert("worker_model".to_string(), worker_model.clone());
+    }
+    let sanitized_model_fields = sanitize_model_fields(&model_fields);
+    let model_metadata = if sanitized_model_fields.is_empty() {
+        "none".to_string()
+    } else {
+        let mut entries = sanitized_model_fields.into_iter().collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        entries
+            .into_iter()
+            .map(|(key, value)| format!("- {key}: {value}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
 
-Original request:
-{request}
-
-Worker:
-- kind: {worker_kind}
-- model: {worker_model}
-- category: {worker_category}
-- route_reason: {route_reason}
-- attempt: {worker_attempt} of {worker_attempt_count}
-- failure_kind: {worker_failure_kind}
-- retry_reason: {worker_retry_reason}
-- fallback_history:
-{worker_fallback_summary}
-- status: {worker_status}
-- summary: {worker_summary}
-- outcome: {worker_outcome_summary}
-- commands_run:
-{worker_commands_run}
-- known_failures:
-{worker_known_failures}
-- outcome_path: {worker_outcome_path}
-
-Verification passed: {verification_passed}
-Verification:
-{verification_summary}
-
-Scope:
-{scope_summary}
-
-Diff:
-{diff_summary}
-
-Return exactly these fields:
-GOAL_SATISFIED: yes|no|unknown
-SUMMARY: one concise sentence
-REPAIR_REQUEST: one concise instruction for the next worker, or none
-ROUTE_HINT: quick|repair|deep|review|explore|librarian|visual|zed-native|custom|needs_user|none
-STOP_REASON: complete|limited|blocked|needs_user|none
-"#,
-        goal_id = input.goal_id,
-        task_id = input.task_id,
-        iteration = input.iteration,
-        max_iterations = input.max_iterations,
-        budget_summary = input.budget_summary,
-        request = input.request,
-        worker_kind = input.worker_kind,
-        worker_model = input.worker_model.as_deref().unwrap_or("none"),
-        worker_category = input.worker_category,
-        route_reason = input.route_reason,
-        worker_attempt = input.worker_attempt,
-        worker_attempt_count = input.worker_attempt_count,
-        worker_failure_kind = input.worker_failure_kind.as_deref().unwrap_or("none"),
-        worker_retry_reason = input.worker_retry_reason.as_deref().unwrap_or("none"),
-        worker_fallback_summary = input.worker_fallback_summary,
-        worker_status = input.worker_status,
-        worker_summary = input.worker_summary,
-        worker_outcome_summary = input.worker_outcome_summary,
-        worker_commands_run = format_list_or_none(&input.worker_commands_run),
-        worker_known_failures = format_list_or_none(&input.worker_known_failures),
-        worker_outcome_path = input.worker_outcome_path.as_deref().unwrap_or("none"),
-        verification_passed = input.verification_passed,
-        verification_summary = input.verification_summary,
-        scope_summary = input.scope_summary,
-        diff_summary = input.diff_summary,
-    );
+    let review_request = coordinator_review_request_text(&input, &model_metadata);
 
     let request = LanguageModelRequest {
         intent: Some(CompletionIntent::UserPrompt),
@@ -3022,13 +3052,158 @@ STOP_REASON: complete|limited|blocked|needs_user|none
         }
     }
 
-    parse_gear_coordinator_review(&review)
+    let (parsed_review, warnings) = parse_gear_coordinator_review_with_warnings(&review);
+    if !warnings.is_empty() {
+        let store = StateStore::new(workspace);
+        if let Err(error) = store.write_artifact(
+            &input.goal_id,
+            &format!(
+                "coordinator-review-iteration-{}-warnings.md",
+                input.iteration
+            ),
+            &coordinator_review_warning_artifact(input.iteration, &warnings, &review),
+        ) {
+            log::warn!("Failed to write Gear coordinator review warning artifact: {error}");
+        }
+    }
+    parsed_review
 }
 
+fn coordinator_review_request_text(input: &CoordinatorReviewInput, model_metadata: &str) -> String {
+    format!(
+        r#"Goal id: {goal_id}
+Task id: {task_id}
+Iteration: {iteration}/{max_iterations}
+Budget: {budget_summary}
+
+Original request:
+{request}
+
+Model metadata:
+{model_metadata}
+
+Worker:
+- kind: {worker_kind}
+- model: {worker_model}
+- category: {worker_category}
+- route_reason: {route_reason}
+- route_resolution:
+{route_resolution}
+- attempt: {worker_attempt} of {worker_attempt_count}
+- failure_kind: {worker_failure_kind}
+- retry_reason: {worker_retry_reason}
+- fallback_history:
+{worker_fallback_summary}
+- status: {worker_status}
+- summary: {worker_summary}
+- outcome: {worker_outcome_summary}
+- commands_run:
+{worker_commands_run}
+- known_failures:
+{worker_known_failures}
+- outcome_path: {worker_outcome_path}
+
+Verification passed: {verification_passed}
+Verification:
+{verification_summary}
+
+Scope:
+{scope_summary}
+
+Diff:
+{diff_summary}
+
+No-progress signals:
+{no_progress_signals}
+
+Return exactly these fields:
+GOAL_SATISFIED: yes|no|unknown
+SUMMARY: one concise sentence
+REPAIR_REQUEST: one concise instruction for the next worker, or none
+ROUTE_HINT: quick|repair|deep|review|explore|librarian|visual|zed-native|custom|needs_user|none
+STOP_REASON: complete|limited|blocked|needs_user|none
+"#,
+        goal_id = input.goal_id,
+        task_id = input.task_id,
+        iteration = input.iteration,
+        max_iterations = input.max_iterations,
+        budget_summary = input.budget_summary,
+        request = input.request,
+        model_metadata = model_metadata,
+        worker_kind = input.worker_kind,
+        worker_model = input.worker_model.as_deref().unwrap_or("none"),
+        worker_category = input.worker_category,
+        route_reason = input.route_reason,
+        route_resolution = serde_json::to_string_pretty(&serde_json::json!({
+            "category_resolution": &input.category_resolution,
+            "category_resolution_result": &input.category_resolution_result,
+        }))
+        .unwrap_or_else(|_| "unavailable".to_string()),
+        worker_attempt = input.worker_attempt,
+        worker_attempt_count = input.worker_attempt_count,
+        worker_failure_kind = input.worker_failure_kind.as_deref().unwrap_or("none"),
+        worker_retry_reason = input.worker_retry_reason.as_deref().unwrap_or("none"),
+        worker_fallback_summary = input.worker_fallback_summary,
+        worker_status = input.worker_status,
+        worker_summary = input.worker_summary,
+        worker_outcome_summary = input.worker_outcome_summary,
+        worker_commands_run = format_list_or_none(&input.worker_commands_run),
+        worker_known_failures = format_list_or_none(&input.worker_known_failures),
+        worker_outcome_path = input.worker_outcome_path.as_deref().unwrap_or("none"),
+        verification_passed = input.verification_passed,
+        verification_summary = input.verification_summary,
+        scope_summary = input.scope_summary,
+        diff_summary = input.diff_summary,
+        no_progress_signals = format_list_or_none(&input.no_progress_signals),
+    )
+}
+
+fn coordinator_review_warning_artifact(
+    iteration: usize,
+    warnings: &[String],
+    raw_response: &str,
+) -> String {
+    let warnings = warnings
+        .iter()
+        .map(|warning| format!("- {warning}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        r#"# Coordinator Review Parser Warnings
+
+Iteration: `{iteration}`
+
+## Warnings
+
+{}
+
+## Raw Response
+
+```text
+{}
+```
+"#,
+        if warnings.is_empty() {
+            "- none".to_string()
+        } else {
+            warnings
+        },
+        raw_response.trim()
+    )
+}
+
+#[cfg(test)]
 fn parse_gear_coordinator_review(review: &str) -> Option<CoordinatorReview> {
+    parse_gear_coordinator_review_with_warnings(review).0
+}
+
+fn parse_gear_coordinator_review_with_warnings(
+    review: &str,
+) -> (Option<CoordinatorReview>, Vec<String>) {
     let raw_response = review.trim();
     if raw_response.is_empty() {
-        return None;
+        return (None, vec!["Empty coordinator review response.".to_string()]);
     }
 
     let mut goal_satisfied = None;
@@ -3036,9 +3211,15 @@ fn parse_gear_coordinator_review(review: &str) -> Option<CoordinatorReview> {
     let mut repair_request = None;
     let mut route_hint = None;
     let mut stop_reason = None;
+    let mut warnings = Vec::new();
 
     for line in raw_response.lines() {
-        let Some((key, value)) = line.split_once(':') else {
+        let trimmed_line = line.trim();
+        if trimmed_line.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = trimmed_line.split_once(':') else {
+            warnings.push(format!("Ignored malformed review line: {trimmed_line}"));
             continue;
         };
         let key = key.trim().to_ascii_lowercase();
@@ -3048,7 +3229,10 @@ fn parse_gear_coordinator_review(review: &str) -> Option<CoordinatorReview> {
                 goal_satisfied = match value.to_ascii_lowercase().as_str() {
                     "yes" | "true" | "complete" => Some(true),
                     "no" | "false" | "incomplete" => Some(false),
-                    _ => None,
+                    other => {
+                        warnings.push(format!("Unrecognized GOAL_SATISFIED value: {other}"));
+                        None
+                    }
                 };
             }
             "summary" if !value.is_empty() => summary = Some(value.to_string()),
@@ -3056,23 +3240,40 @@ fn parse_gear_coordinator_review(review: &str) -> Option<CoordinatorReview> {
                 repair_request = Some(value.to_string());
             }
             "route_hint" if !value.is_empty() && !value.eq_ignore_ascii_case("none") => {
+                if WorkerCategory::parse(value).is_none() {
+                    warnings.push(format!("Unrecognized ROUTE_HINT value: {value}"));
+                }
                 route_hint = Some(value.to_string());
             }
             "stop_reason" if !value.is_empty() && !value.eq_ignore_ascii_case("none") => {
+                if !matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "complete" | "limited" | "blocked" | "needs_user"
+                ) {
+                    warnings.push(format!("Unrecognized STOP_REASON value: {value}"));
+                }
                 stop_reason = Some(value.to_string());
             }
-            _ => {}
+            other => warnings.push(format!("Unrecognized coordinator review field: {other}")),
         }
     }
 
-    Some(CoordinatorReview {
-        goal_satisfied,
-        summary: summary.unwrap_or_else(|| raw_response.lines().next().unwrap_or("").to_string()),
-        repair_request,
-        route_hint,
-        stop_reason,
-        raw_response: raw_response.to_string(),
-    })
+    if summary.is_none() {
+        warnings.push("SUMMARY missing; using first line fallback.".to_string());
+    }
+
+    (
+        Some(CoordinatorReview {
+            goal_satisfied,
+            summary: summary
+                .unwrap_or_else(|| raw_response.lines().next().unwrap_or("").to_string()),
+            repair_request,
+            route_hint,
+            stop_reason,
+            raw_response: raw_response.to_string(),
+        }),
+        warnings,
+    )
 }
 
 fn is_gear_executable_goal(request: &str) -> bool {
@@ -3433,8 +3634,26 @@ fn gear_max_iterations_from_env() -> usize {
     gear_usize_from_env("GEARBOX_GEAR_MAX_ITERATIONS", DEFAULT_MAX_ITERATIONS)
 }
 
+fn gear_max_provider_unknown_streak_from_env() -> usize {
+    gear_usize_from_env(
+        "GEARBOX_GEAR_MAX_PROVIDER_UNKNOWN_STREAK",
+        DEFAULT_MAX_PROVIDER_UNKNOWN_STREAK,
+    )
+}
+
 fn gear_max_files_changed_from_env() -> usize {
     gear_usize_from_env("GEARBOX_GEAR_MAX_FILES_CHANGED", 40)
+}
+
+fn gear_max_child_depth_from_env() -> usize {
+    gear_usize_from_env("GEARBOX_GEAR_MAX_CHILD_DEPTH", usize::MAX)
+}
+
+fn gear_max_runtime_minutes_from_env() -> usize {
+    gear_usize_from_env(
+        "GEARBOX_GEAR_MAX_RUNTIME_MINUTES",
+        DEFAULT_MAX_RUNTIME_MINUTES,
+    )
 }
 
 fn gear_usize_from_env(name: &str, default_value: usize) -> usize {
@@ -3459,8 +3678,11 @@ fn gear_event_status_markdown(event: &gearbox_agent::state::Event) -> String {
     let path = event
         .data
         .get("path")
+        .or_else(|| event.data.get("result_path"))
+        .or_else(|| event.data.get("outcome_path"))
         .or_else(|| event.data.get("verification_path"))
         .or_else(|| event.data.get("final_report_path"))
+        .or_else(|| event.data.get("task_record_path"))
         .and_then(|value| value.as_str())
         .map(|path| format!(" (`{path}`)"))
         .unwrap_or_default();
@@ -3502,7 +3724,10 @@ fn gear_task_manager_snapshot_markdown(task_manager: &SharedTaskManager) -> Resu
 fn gear_task_manager_snapshot_to_markdown(
     snapshot: &TaskManagerSnapshot,
 ) -> Result<Option<String>> {
-    if snapshot.tasks.is_empty() {
+    if snapshot.tasks.is_empty()
+        && snapshot.artifacts_root.is_none()
+        && snapshot.current_output.is_none()
+    {
         return Ok(None);
     }
 
@@ -3517,18 +3742,30 @@ fn gear_task_manager_snapshot_to_markdown(
         snapshot.counts.lost,
         snapshot.counts.skipped,
     );
+    if let Some(artifacts_root) = snapshot.artifacts_root.as_deref() {
+        let artifacts = gear_goal_artifact_links(artifacts_root);
+        if !artifacts.is_empty() {
+            message.push_str(&format!("Goal artifacts:{}\n\n", artifacts));
+        }
+    }
     for record in snapshot.tasks.iter().take(6) {
         let artifacts = gear_task_artifact_links(record);
         let worker =
             gear_worker_snapshot_label(&record.worker_kind, record.worker_model.as_deref());
+        let parent_task = record
+            .parent_task_id
+            .as_deref()
+            .map(|parent_task_id| format!("; parent `{parent_task_id}`"))
+            .unwrap_or_default();
         message.push_str(&format!(
-            "- `{}` {} via `{}` / `{}`; attempts: {}; {}{}\n",
+            "- `{}` {} via `{}` / `{}`; attempts: {}; {}{}{}\n",
             record.task_id,
             gear_managed_task_status_label(&record.status),
             worker,
             record.worker_category,
             record.attempts.len(),
             record.summary,
+            parent_task,
             artifacts
         ));
         for attempt in record.attempts.iter().rev().take(2).rev() {
@@ -3559,6 +3796,42 @@ fn gear_task_manager_snapshot_to_markdown(
     }
     message.push('\n');
     Ok(Some(message))
+}
+
+fn gear_goal_artifact_links(artifacts_root: &Path) -> String {
+    let mut links = vec![format!("[Artifacts]({})", artifacts_root.display())];
+    if let Some(path) = gear_latest_goal_artifact(artifacts_root, "goal-review-iteration-") {
+        links.push(format!("[Goal Review]({})", path.display()));
+    }
+    if let Some(path) = gear_latest_goal_artifact(artifacts_root, "coordinator-review-iteration-") {
+        links.push(format!("[Coordinator Review]({})", path.display()));
+    }
+    let final_report = artifacts_root.join("final-report.md");
+    if final_report.is_file() {
+        links.push(format!("[Final Report]({})", final_report.display()));
+    }
+    format!(" ({})", links.join(", "))
+}
+
+fn gear_latest_goal_artifact(artifacts_root: &Path, prefix: &str) -> Option<PathBuf> {
+    let mut latest: Option<(usize, PathBuf)> = None;
+    for entry in std_fs::read_dir(artifacts_root).ok()? {
+        let entry = entry.ok()?;
+        let path = entry.path();
+        let name = path.file_name()?.to_str()?;
+        let iteration = name
+            .strip_prefix(prefix)?
+            .strip_suffix(".md")?
+            .parse::<usize>()
+            .ok()?;
+        match &mut latest {
+            Some((current_iteration, _)) if *current_iteration >= iteration => {}
+            _ => {
+                latest = Some((iteration, path));
+            }
+        }
+    }
+    latest.map(|(_, path)| path)
 }
 
 fn gear_worker_snapshot_label(worker_kind: &str, worker_model: Option<&str>) -> String {
@@ -3597,11 +3870,37 @@ fn gear_task_attempt_status_label(
 
 fn gear_task_artifact_links(record: &TaskSnapshot) -> String {
     let mut links = Vec::new();
+    let artifact_dir = record
+        .result_path
+        .as_ref()
+        .or(record.outcome_path.as_ref())
+        .and_then(|path| path.parent());
+    if let Some(artifact_dir) = artifact_dir {
+        links.push(format!(
+            "[packet]({})",
+            artifact_dir.join("packet.json").display()
+        ));
+        links.push(format!(
+            "[prompt]({})",
+            artifact_dir.join("prompt.md").display()
+        ));
+        links.push(format!(
+            "[transcript]({})",
+            artifact_dir.join("transcript.jsonl").display()
+        ));
+    }
     if let Some(path) = record.result_path.as_ref() {
         links.push(format!("[result]({})", path.display()));
     }
     if let Some(path) = record.outcome_path.as_ref() {
         links.push(format!("[outcome]({})", path.display()));
+    }
+    if let Some(path) = record
+        .attempts
+        .last()
+        .and_then(|attempt| attempt.route_transform_path.as_ref())
+    {
+        links.push(format!("[fallback]({})", path.display()));
     }
     if links.is_empty() {
         String::new()
@@ -3612,11 +3911,33 @@ fn gear_task_artifact_links(record: &TaskSnapshot) -> String {
 
 fn gear_task_attempt_artifact_links(attempt: &TaskAttemptSnapshot) -> String {
     let mut links = Vec::new();
+    let artifact_dir = attempt
+        .result_path
+        .as_ref()
+        .or(attempt.outcome_path.as_ref())
+        .and_then(|path| path.parent());
+    if let Some(artifact_dir) = artifact_dir {
+        links.push(format!(
+            "[packet]({})",
+            artifact_dir.join("packet.json").display()
+        ));
+        links.push(format!(
+            "[prompt]({})",
+            artifact_dir.join("prompt.md").display()
+        ));
+        links.push(format!(
+            "[transcript]({})",
+            artifact_dir.join("transcript.jsonl").display()
+        ));
+    }
     if let Some(path) = attempt.result_path.as_ref() {
         links.push(format!("[result]({})", path.display()));
     }
     if let Some(path) = attempt.outcome_path.as_ref() {
         links.push(format!("[outcome]({})", path.display()));
+    }
+    if let Some(path) = attempt.route_transform_path.as_ref() {
+        links.push(format!("[fallback]({})", path.display()));
     }
     if links.is_empty() {
         String::new()
@@ -4056,9 +4377,14 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
         self.agent.update(cx, |agent, cx| {
             if let Some(session) = agent.sessions.get(session_id) {
                 if let Some(task_manager_control) = session.gear_task_manager_control.as_ref()
-                    && let Err(error) = task_manager_control.cancel_current_task()
+                    && let Some(task_id) = task_manager_control.current_task_id().ok().flatten()
+                    && let Some(task_manager) = session.gear_task_manager.as_ref()
+                    && let Err(error) = task_manager
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("gear task manager mutex poisoned"))
+                        .and_then(|mut task_manager| task_manager.cancel_task(&task_id))
                 {
-                    log::warn!("failed to cancel current Gear task: {error:#}");
+                    log::warn!("failed to cancel current Gear task tree: {error:#}");
                 }
                 if let Some(cancellation_token) = session.gear_cancellation_token.as_ref() {
                     cancellation_token.cancel();
@@ -4507,10 +4833,20 @@ impl NativeWorkerBackend for GearZedWorkerBackend {
         let route = request
             .config
             .selected_route_for_hint(request.route_attempt, request.route_hint);
+        let (category_resolution, category_resolution_result) = category_resolution_for_route(
+            request.config,
+            request.route_attempt,
+            request.route_hint,
+            &route,
+        );
         let packet = WorkerPacket {
             task_id: request.task.id.clone(),
             worker: route.worker_kind.as_str().to_string(),
             worker_model: route.worker_model.map(ToString::to_string),
+            prompt_append: route.prompt_append.clone(),
+            tools: route.tools.clone(),
+            category_resolution,
+            category_resolution_result,
             goal: request.goal.to_string(),
             coordinator_model: request.coordinator_model.cloned(),
             coordinator_brief: request.coordinator_brief.map(ToString::to_string),
@@ -5673,6 +6009,7 @@ mod internal_tests {
     use acp_thread::{AgentConnection, AgentModelGroupName, AgentModelInfo, MentionUri};
     use agent_settings::COMPACTION_PROMPT;
     use fs::FakeFs;
+    use gearbox_agent::workers::{CategoryResolution, CategoryResolutionResult, FallbackRoute};
     use gpui::TestAppContext;
     use indoc::formatdoc;
     use language_model::fake_provider::{FakeLanguageModel, FakeLanguageModelProvider};
@@ -5694,6 +6031,50 @@ mod internal_tests {
             load_warnings: Vec::new(),
             disable_model_invocation: false,
             embedded_body: None,
+        }
+    }
+
+    fn coordinator_review_input(no_progress_signals: Vec<String>) -> CoordinatorReviewInput {
+        CoordinatorReviewInput {
+            goal_id: "goal_001".to_string(),
+            task_id: "task_001".to_string(),
+            iteration: 2,
+            max_iterations: 5,
+            request: "Build a tiny task tracker".to_string(),
+            worker_kind: "codex".to_string(),
+            worker_model: Some("gpt-5".to_string()),
+            worker_category: "review".to_string(),
+            route_reason: "category `review` selected attempt 2 configured `codex` route"
+                .to_string(),
+            worker_attempt: 2,
+            worker_attempt_count: 2,
+            worker_failure_kind: None,
+            worker_retry_reason: None,
+            worker_fallback_summary: "none".to_string(),
+            worker_status: "succeeded".to_string(),
+            worker_summary: "worker summary".to_string(),
+            worker_outcome_summary: "outcome summary".to_string(),
+            worker_commands_run: vec!["echo verify-ok".to_string()],
+            worker_known_failures: Vec::new(),
+            worker_outcome_path: Some("/tmp/outcome.json".to_string()),
+            worker_transcript_head: None,
+            worker_transcript_tail: None,
+            category_resolution: CategoryResolution::default(),
+            category_resolution_result: CategoryResolutionResult::Resolved {
+                requested_category: "review".to_string(),
+                available_categories: vec!["review".to_string()],
+                attempted_provider_model: Some("openai/gpt5".to_string()),
+                nearest_fallback: Some(FallbackRoute {
+                    worker_kind: WorkerKind::Codex,
+                    worker_model: Some("gpt-5".to_string()),
+                }),
+            },
+            no_progress_signals,
+            budget_summary: "iterations=2/5; changed_files=1/10".to_string(),
+            verification_passed: true,
+            verification_summary: "all verification commands passed.".to_string(),
+            scope_summary: "scope ok".to_string(),
+            diff_summary: "diff ok".to_string(),
         }
     }
 
@@ -5809,6 +6190,17 @@ mod internal_tests {
     }
 
     #[test]
+    fn coordinator_review_request_text_includes_no_progress_signals() {
+        let input = coordinator_review_input(vec![
+            "No file changes detected for 2 consecutive iterations.".to_string(),
+        ]);
+        let request = coordinator_review_request_text(&input, "- worker_kind: codex");
+
+        assert!(request.contains("No-progress signals:"));
+        assert!(request.contains("No file changes detected for 2 consecutive iterations."));
+    }
+
+    #[test]
     fn gear_apply_provider_model_availability_marks_missing_qualified_models() {
         let mut config = gear_worker_config_from_values(
             Some("codex"),
@@ -5881,6 +6273,37 @@ mod internal_tests {
         );
         assert_eq!(review.route_hint.as_deref(), Some("repair"));
         assert_eq!(review.stop_reason, None);
+    }
+
+    #[test]
+    fn parses_gear_coordinator_review_reports_warnings_for_malformed_fields() {
+        let (review, warnings) = parse_gear_coordinator_review_with_warnings(
+            "GOAL_SATISFIED: maybe\nSUMMARY: Needs another repair pass.\nROUTE_HINT: not-a-category\nSTOP_REASON: perhaps\nunexpected line",
+        );
+
+        let review = review.expect("review should still parse");
+        assert_eq!(review.summary, "Needs another repair pass.");
+        assert!(!warnings.is_empty());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("GOAL_SATISFIED"))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("ROUTE_HINT"))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("STOP_REASON"))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("malformed review line"))
+        );
     }
 
     async fn setup_native_agent_session(
@@ -6175,6 +6598,7 @@ mod internal_tests {
         let task = GearTask {
             id: "task_native_zed_follow_up".to_string(),
             goal_id: "goal_native_zed_follow_up".to_string(),
+            parent_task_id: None,
             title: "native zed follow up".to_string(),
             kind: TaskKind::Edit,
             status: TaskStatus::Pending,

@@ -3,7 +3,10 @@ use std::path::PathBuf;
 use anyhow::{Result, anyhow};
 use clap::{Args, Parser, Subcommand};
 
-use crate::runtime::{DEFAULT_MAX_ITERATIONS, Orchestrator, RunOptions};
+use crate::runtime::{
+    DEFAULT_MAX_ITERATIONS, DEFAULT_MAX_PROVIDER_UNKNOWN_STREAK, DEFAULT_MAX_RUNTIME_MINUTES,
+    Orchestrator, RunOptions,
+};
 use crate::workers::{WorkerConfig, WorkerKind, WorkerRoute};
 
 #[derive(Debug, Parser)]
@@ -91,6 +94,15 @@ struct RunCommand {
 
     #[arg(long, default_value_t = DEFAULT_MAX_ITERATIONS)]
     max_iterations: usize,
+
+    #[arg(long, default_value_t = DEFAULT_MAX_PROVIDER_UNKNOWN_STREAK)]
+    max_provider_unknown_streak: usize,
+
+    #[arg(long, default_value_t = usize::MAX)]
+    max_child_depth: usize,
+
+    #[arg(long, default_value_t = DEFAULT_MAX_RUNTIME_MINUTES)]
+    max_runtime_minutes: usize,
 }
 
 pub fn run() -> Result<()> {
@@ -111,6 +123,9 @@ pub fn run() -> Result<()> {
                 event_sink: None,
                 cancellation_token: None,
                 max_iterations: command.max_iterations,
+                max_provider_unknown_streak: command.max_provider_unknown_streak,
+                max_child_depth: command.max_child_depth,
+                max_runtime_minutes: command.max_runtime_minutes,
                 coordinator_model: None,
                 coordinator_brief: None,
                 coordinator_review_hook: None,
@@ -269,6 +284,9 @@ mod tests {
             allowed_paths: Vec::new(),
             forbidden_paths: Vec::new(),
             max_files_changed: 40,
+            max_provider_unknown_streak: DEFAULT_MAX_PROVIDER_UNKNOWN_STREAK,
+            max_child_depth: usize::MAX,
+            max_runtime_minutes: DEFAULT_MAX_RUNTIME_MINUTES,
             install_dependencies: false,
             max_iterations: DEFAULT_MAX_ITERATIONS,
         }

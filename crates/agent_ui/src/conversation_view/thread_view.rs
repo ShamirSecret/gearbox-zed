@@ -3230,7 +3230,10 @@ impl ThreadView {
         editor_bg_color.blend(active_color.opacity(0.3))
     }
 
-    fn gear_task_manager_snapshot(&self, cx: &App) -> Option<agent::GearTaskManagerSnapshot> {
+    pub(crate) fn gear_task_manager_snapshot(
+        &self,
+        cx: &App,
+    ) -> Option<agent::GearTaskManagerSnapshot> {
         self.as_native_connection(cx)?
             .gear_task_manager_snapshot(&self.session_id, cx)
     }
@@ -3246,7 +3249,6 @@ impl ThreadView {
         let changed_buffers = action_log.read(cx).changed_buffers(cx).collect::<Vec<_>>();
         let plan = thread.plan();
         let queue_is_empty = !self.has_queued_messages();
-        let gear_task_manager_snapshot = self.gear_task_manager_snapshot(cx);
 
         let awaiting_permission = self
             .render_main_agent_awaiting_permission(window, cx)
@@ -3257,7 +3259,6 @@ impl ThreadView {
             && plan.is_empty()
             && queue_is_empty
             && !has_awaiting_permission
-            && gear_task_manager_snapshot.is_none()
         {
             return None;
         }
@@ -3272,7 +3273,6 @@ impl ThreadView {
         let plan_expanded = self.plan_expanded;
         let edits_expanded = self.edits_expanded;
         let queue_expanded = self.queue_expanded;
-        let gear_task_manager_expanded = self.gear_task_manager_expanded;
 
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
         // Drop shadows have no opaque surface to blend into on a transparent
@@ -3303,27 +3303,6 @@ impl ThreadView {
                         ])
                     })
                     .when_some(awaiting_permission, |this, element| this.child(element))
-                    .when(
-                        has_awaiting_permission
-                            && (!plan.is_empty()
-                                || !changed_buffers.is_empty()
-                                || !queue_is_empty
-                                || gear_task_manager_snapshot.is_some()),
-                        |this| this.child(Divider::horizontal().color(DividerColor::Border)),
-                    )
-                    .when_some(gear_task_manager_snapshot.as_ref(), |this, snapshot| {
-                        this.child(self.render_gear_task_manager_summary(snapshot, window, cx))
-                            .when(gear_task_manager_expanded, |parent| {
-                                parent.child(
-                                    self.render_gear_task_manager_entries(snapshot, window, cx),
-                                )
-                            })
-                    })
-                    .when(
-                        gear_task_manager_snapshot.is_some()
-                            && (!plan.is_empty() || !changed_buffers.is_empty() || !queue_is_empty),
-                        |this| this.child(Divider::horizontal().color(DividerColor::Border)),
-                    )
                     .when(!plan.is_empty(), |this| {
                         this.child(self.render_plan_summary(plan, window, cx))
                             .when(plan_expanded, |parent| {
@@ -3365,6 +3344,38 @@ impl ThreadView {
             )
             .into_any()
             .into()
+    }
+
+    fn render_gear_task_panel(
+        &self,
+        window: &mut Window,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let snapshot = self.gear_task_manager_snapshot(cx)?;
+        if snapshot.tasks.is_empty() {
+            return None;
+        }
+
+        let expanded = self.gear_task_manager_expanded;
+        Some(
+            v_flex()
+                .w_full()
+                .px_2()
+                .pb_2()
+                .child(
+                    v_flex()
+                        .bg(cx.theme().colors().panel_background)
+                        .border_1()
+                        .border_color(cx.theme().colors().border)
+                        .rounded_md()
+                        .overflow_hidden()
+                        .child(self.render_gear_task_manager_summary(&snapshot, window, cx))
+                        .when(expanded, |this| {
+                            this.child(self.render_gear_task_manager_entries(&snapshot, window, cx))
+                        }),
+                )
+                .into_any(),
+        )
     }
 
     fn render_edited_files(
@@ -3851,7 +3862,7 @@ impl ThreadView {
             .into_any_element()
     }
 
-    fn render_gear_task_manager_summary(
+    pub(crate) fn render_gear_task_manager_summary(
         &self,
         snapshot: &agent::GearTaskManagerSnapshot,
         _window: &mut Window,
@@ -3868,6 +3879,8 @@ impl ThreadView {
             counts.running, counts.pending, counts.completed, counts.failed
         );
         let current_output = snapshot.current_output.clone();
+        let gear_thread_is_idle = self.thread.read(cx).status() == ThreadStatus::Idle;
+        let has_follow_up_draft = !self.message_editor.read(cx).is_empty(cx);
         let active_count = snapshot
             .tasks
             .iter()
@@ -3884,7 +3897,10 @@ impl ThreadView {
             .filter(|task| {
                 matches!(
                     task.status,
-                    agent::GearManagedTaskStatus::Failed | agent::GearManagedTaskStatus::Cancelled
+                    agent::GearManagedTaskStatus::Failed
+                        | agent::GearManagedTaskStatus::Cancelled
+                        | agent::GearManagedTaskStatus::Interrupted
+                        | agent::GearManagedTaskStatus::Lost
                 )
             })
             .count();
@@ -3924,6 +3940,32 @@ impl ThreadView {
             .child(
                 h_flex()
                     .gap_1()
+                    .child(
+                        Button::new("gear-task-manager-follow-up", "Follow Up")
+                            .label_size(LabelSize::XSmall)
+                            .disabled(gear_thread_is_idle || !has_follow_up_draft)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let _ = this.try_send_gear_follow_up(
+                                    this.message_editor.clone(),
+                                    false,
+                                    window,
+                                    cx,
+                                );
+                            })),
+                    )
+                    .child(
+                        Button::new("gear-task-manager-steer", "Steer")
+                            .label_size(LabelSize::XSmall)
+                            .disabled(gear_thread_is_idle || !has_follow_up_draft)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let _ = this.try_send_gear_follow_up(
+                                    this.message_editor.clone(),
+                                    true,
+                                    window,
+                                    cx,
+                                );
+                            })),
+                    )
                     .child(
                         Button::new("gear-task-manager-view-output", "View Output")
                             .label_size(LabelSize::XSmall)
@@ -4022,7 +4064,7 @@ impl ThreadView {
             .into_any_element()
     }
 
-    fn render_gear_task_manager_entries(
+    pub(crate) fn render_gear_task_manager_entries(
         &self,
         snapshot: &agent::GearTaskManagerSnapshot,
         _window: &mut Window,
@@ -4068,6 +4110,25 @@ impl ThreadView {
             .id("gear_task_manager_entries")
             .max_h_56()
             .overflow_y_scroll()
+            .when_some(snapshot.artifacts_root.as_ref(), |this, artifacts_root| {
+                this.child(
+                    v_flex()
+                        .p_2()
+                        .gap_1()
+                        .border_b_1()
+                        .border_color(cx.theme().colors().border)
+                        .child(
+                            Label::new("Goal Artifacts")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .child(self.render_gear_goal_artifact_buttons(
+                            "gear-goal-artifacts",
+                            artifacts_root,
+                            cx,
+                        )),
+                )
+            })
             .children(tasks.into_iter().enumerate().map(|(index, task)| {
                 v_flex()
                     .p_2()
@@ -4087,14 +4148,21 @@ impl ThreadView {
                                             .size(LabelSize::Small)
                                             .color(Color::Default),
                                     )
+                                    .when_some(
+                                        task.parent_task_id.as_deref(),
+                                        |this, parent_task_id| {
+                                            this.child(dot_divider()).child(
+                                                Label::new(format!("parent {}", parent_task_id))
+                                                    .size(LabelSize::Small)
+                                                    .color(Color::Muted),
+                                            )
+                                        },
+                                    )
                                     .child(dot_divider())
                                     .child(
                                         Label::new(format!(
                                             "{} / {}",
-                                            Self::gear_snapshot_status_label(&format!(
-                                                "{:?}",
-                                                task.status
-                                            )),
+                                            Self::gear_snapshot_status_label(&task.status),
                                             task.worker_category
                                         ))
                                         .size(LabelSize::Small)
@@ -4108,20 +4176,40 @@ impl ThreadView {
                                         ))
                                         .size(LabelSize::Small)
                                         .color(Color::Muted),
+                                    )
+                                    .child(dot_divider())
+                                    .child(
+                                        Label::new(Self::gear_messageability_label(
+                                            task.messageability.as_ref(),
+                                        ))
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
                                     ),
                             )
-                            .child(self.render_gear_artifact_buttons(
-                                &format!("gear-task-{}", task.task_id),
-                                task.result_path.as_ref(),
-                                task.outcome_path.as_ref(),
-                                cx,
-                            )),
+                            .child(
+                                self.render_gear_artifact_buttons(
+                                    &format!("gear-task-{}", task.task_id),
+                                    task.result_path.as_ref(),
+                                    task.outcome_path.as_ref(),
+                                    task.attempts
+                                        .last()
+                                        .and_then(|attempt| attempt.route_transform_path.as_ref()),
+                                    cx,
+                                ),
+                            ),
                     )
                     .child(
-                        Label::new(task.summary.clone())
+                        Label::new(task.summary_head.clone())
                             .size(LabelSize::Small)
                             .color(Color::Muted),
                     )
+                    .when(!task.continuation_hint.is_empty(), |this| {
+                        this.child(
+                            Label::new(task.continuation_hint.clone())
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                    })
                     .children(task.attempts.iter().rev().take(2).rev().map(|attempt| {
                         v_flex()
                             .pl_3()
@@ -4141,7 +4229,7 @@ impl ThreadView {
                                             .child(dot_divider())
                                             .child(
                                                 Label::new(Self::gear_snapshot_status_label(
-                                                    &format!("{:?}", attempt.status),
+                                                    &attempt.status,
                                                 ))
                                                 .size(LabelSize::XSmall)
                                                 .color(Color::Muted),
@@ -4163,6 +4251,7 @@ impl ThreadView {
                                         ),
                                         attempt.result_path.as_ref(),
                                         attempt.outcome_path.as_ref(),
+                                        attempt.route_transform_path.as_ref(),
                                         cx,
                                     )),
                             )
@@ -4257,12 +4346,87 @@ impl ThreadView {
         id_prefix: &str,
         result_path: Option<&std::path::PathBuf>,
         outcome_path: Option<&std::path::PathBuf>,
+        route_transform_path: Option<&std::path::PathBuf>,
         _cx: &Context<Self>,
     ) -> impl IntoElement {
         let workspace = self.workspace.clone();
+        let artifact_dir = result_path
+            .or(outcome_path)
+            .and_then(|path| path.parent().map(std::path::Path::to_path_buf));
 
         h_flex()
             .gap_1()
+            .when_some(artifact_dir.as_ref(), |this, artifact_dir| {
+                this.child(
+                    Button::new(format!("{id_prefix}-packet"), "Packet")
+                        .label_size(LabelSize::XSmall)
+                        .on_click({
+                            let workspace = workspace.clone();
+                            let path = artifact_dir.join("packet.json");
+                            move |_, window, cx| {
+                                let _ = workspace.update(cx, |workspace, cx| {
+                                    workspace
+                                        .open_abs_path(
+                                            path.clone(),
+                                            OpenOptions {
+                                                focus: Some(true),
+                                                ..Default::default()
+                                            },
+                                            window,
+                                            cx,
+                                        )
+                                        .detach_and_log_err(cx);
+                                });
+                            }
+                        }),
+                )
+                .child(
+                    Button::new(format!("{id_prefix}-prompt"), "Prompt")
+                        .label_size(LabelSize::XSmall)
+                        .on_click({
+                            let workspace = workspace.clone();
+                            let path = artifact_dir.join("prompt.md");
+                            move |_, window, cx| {
+                                let _ = workspace.update(cx, |workspace, cx| {
+                                    workspace
+                                        .open_abs_path(
+                                            path.clone(),
+                                            OpenOptions {
+                                                focus: Some(true),
+                                                ..Default::default()
+                                            },
+                                            window,
+                                            cx,
+                                        )
+                                        .detach_and_log_err(cx);
+                                });
+                            }
+                        }),
+                )
+                .child(
+                    Button::new(format!("{id_prefix}-transcript"), "Transcript")
+                        .label_size(LabelSize::XSmall)
+                        .on_click({
+                            let workspace = workspace.clone();
+                            let path = artifact_dir.join("transcript.jsonl");
+                            move |_, window, cx| {
+                                let _ = workspace.update(cx, |workspace, cx| {
+                                    workspace
+                                        .open_abs_path(
+                                            path.clone(),
+                                            OpenOptions {
+                                                focus: Some(true),
+                                                ..Default::default()
+                                            },
+                                            window,
+                                            cx,
+                                        )
+                                        .detach_and_log_err(cx);
+                                });
+                            }
+                        }),
+                )
+            })
             .children(result_path.into_iter().map({
                 let workspace = workspace.clone();
                 move |path| {
@@ -4287,6 +4451,29 @@ impl ThreadView {
                         })
                 }
             }))
+            .when_some(route_transform_path, |this, path| {
+                let workspace = workspace.clone();
+                let path = path.clone();
+                this.child(
+                    Button::new(format!("{id_prefix}-fallback"), "Fallback")
+                        .label_size(LabelSize::XSmall)
+                        .on_click(move |_, window, cx| {
+                            let _ = workspace.update(cx, |workspace, cx| {
+                                workspace
+                                    .open_abs_path(
+                                        path.clone(),
+                                        OpenOptions {
+                                            focus: Some(true),
+                                            ..Default::default()
+                                        },
+                                        window,
+                                        cx,
+                                    )
+                                    .detach_and_log_err(cx);
+                            });
+                        }),
+                )
+            })
             .children(outcome_path.into_iter().map(move |path| {
                 let workspace = workspace.clone();
                 let path = path.clone();
@@ -4310,10 +4497,161 @@ impl ThreadView {
             }))
     }
 
+    fn render_gear_goal_artifact_buttons(
+        &self,
+        id_prefix: &str,
+        artifacts_root: &std::path::PathBuf,
+        _cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let workspace = self.workspace.clone();
+        let goal_review_path =
+            Self::gear_latest_goal_artifact(artifacts_root, "goal-review-iteration-");
+        let coordinator_review_path =
+            Self::gear_latest_goal_artifact(artifacts_root, "coordinator-review-iteration-");
+        let final_report_path = artifacts_root.join("final-report.md");
+
+        h_flex()
+            .gap_1()
+            .child(
+                Button::new(format!("{id_prefix}-artifacts-root"), "Artifacts")
+                    .label_size(LabelSize::XSmall)
+                    .on_click({
+                        let workspace = workspace.clone();
+                        let path = artifacts_root.clone();
+                        move |_, window, cx| {
+                            let _ = workspace.update(cx, |workspace, cx| {
+                                workspace
+                                    .open_abs_path(
+                                        path.clone(),
+                                        OpenOptions {
+                                            focus: Some(true),
+                                            ..Default::default()
+                                        },
+                                        window,
+                                        cx,
+                                    )
+                                    .detach_and_log_err(cx);
+                            });
+                        }
+                    }),
+            )
+            .when_some(goal_review_path.as_ref(), |this, path| {
+                this.child(
+                    Button::new(format!("{id_prefix}-goal-review"), "Goal Review")
+                        .label_size(LabelSize::XSmall)
+                        .on_click({
+                            let workspace = workspace.clone();
+                            let path = path.clone();
+                            move |_, window, cx| {
+                                let _ = workspace.update(cx, |workspace, cx| {
+                                    workspace
+                                        .open_abs_path(
+                                            path.clone(),
+                                            OpenOptions {
+                                                focus: Some(true),
+                                                ..Default::default()
+                                            },
+                                            window,
+                                            cx,
+                                        )
+                                        .detach_and_log_err(cx);
+                                });
+                            }
+                        }),
+                )
+            })
+            .when_some(coordinator_review_path.as_ref(), |this, path| {
+                this.child(
+                    Button::new(
+                        format!("{id_prefix}-coordinator-review"),
+                        "Coordinator Review",
+                    )
+                    .label_size(LabelSize::XSmall)
+                    .on_click({
+                        let workspace = workspace.clone();
+                        let path = path.clone();
+                        move |_, window, cx| {
+                            let _ = workspace.update(cx, |workspace, cx| {
+                                workspace
+                                    .open_abs_path(
+                                        path.clone(),
+                                        OpenOptions {
+                                            focus: Some(true),
+                                            ..Default::default()
+                                        },
+                                        window,
+                                        cx,
+                                    )
+                                    .detach_and_log_err(cx);
+                            });
+                        }
+                    }),
+                )
+            })
+            .when(final_report_path.is_file(), |this| {
+                this.child(
+                    Button::new(format!("{id_prefix}-final-report"), "Final Report")
+                        .label_size(LabelSize::XSmall)
+                        .on_click({
+                            let workspace = workspace.clone();
+                            let path = final_report_path.clone();
+                            move |_, window, cx| {
+                                let _ = workspace.update(cx, |workspace, cx| {
+                                    workspace
+                                        .open_abs_path(
+                                            path.clone(),
+                                            OpenOptions {
+                                                focus: Some(true),
+                                                ..Default::default()
+                                            },
+                                            window,
+                                            cx,
+                                        )
+                                        .detach_and_log_err(cx);
+                                });
+                            }
+                        }),
+                )
+            })
+    }
+
+    fn gear_latest_goal_artifact(
+        artifacts_root: &std::path::PathBuf,
+        prefix: &str,
+    ) -> Option<std::path::PathBuf> {
+        let mut latest: Option<(usize, std::path::PathBuf)> = None;
+        let entries = std::fs::read_dir(artifacts_root).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let file_name = path.file_name()?.to_str()?;
+            let iteration = file_name
+                .strip_prefix(prefix)?
+                .strip_suffix(".md")?
+                .parse::<usize>()
+                .ok()?;
+            match &latest {
+                Some((current_iteration, _)) if *current_iteration >= iteration => {}
+                _ => latest = Some((iteration, path)),
+            }
+        }
+        latest.map(|(_, path)| path)
+    }
+
     fn gear_worker_label(worker_kind: &str, worker_model: Option<&str>) -> String {
         worker_model
             .map(|worker_model| format!("{worker_kind}:{worker_model}"))
             .unwrap_or_else(|| worker_kind.to_string())
+    }
+
+    fn gear_messageability_label(
+        messageability: Option<&agent::GearTaskMessageability>,
+    ) -> String {
+        match messageability {
+            Some(agent::GearTaskMessageability::Steer) => "Steerable".to_string(),
+            Some(agent::GearTaskMessageability::Revive) => "Revivable".to_string(),
+            Some(agent::GearTaskMessageability::NotContinuable { .. }) => "Locked".to_string(),
+            None => "unknown".to_string(),
+        }
     }
 
     fn gear_task_sort_rank(status: &agent::GearManagedTaskStatus) -> usize {
@@ -4321,9 +4659,11 @@ impl ThreadView {
             agent::GearManagedTaskStatus::Running => 0,
             agent::GearManagedTaskStatus::Pending => 1,
             agent::GearManagedTaskStatus::Failed => 2,
-            agent::GearManagedTaskStatus::Cancelled => 3,
-            agent::GearManagedTaskStatus::Skipped => 4,
-            agent::GearManagedTaskStatus::Completed => 5,
+            agent::GearManagedTaskStatus::Interrupted => 3,
+            agent::GearManagedTaskStatus::Lost => 4,
+            agent::GearManagedTaskStatus::Cancelled => 5,
+            agent::GearManagedTaskStatus::Skipped => 6,
+            agent::GearManagedTaskStatus::Completed => 7,
         }
     }
 
@@ -4339,13 +4679,16 @@ impl ThreadView {
             ),
             GearTaskManagerFilter::Attention => matches!(
                 task.status,
-                agent::GearManagedTaskStatus::Failed | agent::GearManagedTaskStatus::Cancelled
+                agent::GearManagedTaskStatus::Failed
+                    | agent::GearManagedTaskStatus::Cancelled
+                    | agent::GearManagedTaskStatus::Interrupted
+                    | agent::GearManagedTaskStatus::Lost
             ),
         }
     }
 
-    fn gear_snapshot_status_label(status: &str) -> String {
-        status.to_ascii_lowercase().replace('_', " ")
+    fn gear_snapshot_status_label(status: &impl GearStatusLabel) -> String {
+        status.gear_status_label().to_string()
     }
 
     fn clear_queue(&mut self, cx: &mut Context<Self>) {
@@ -6724,6 +7067,40 @@ fn sandbox_network_rows(network: &SandboxNetPolicy) -> Vec<SandboxRow> {
             .iter()
             .map(|domain| SandboxRow::domain(domain.clone()))
             .collect(),
+    }
+}
+
+trait GearStatusLabel {
+    fn gear_status_label(&self) -> &'static str;
+}
+
+impl GearStatusLabel for agent::GearManagedTaskStatus {
+    fn gear_status_label(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
+            Self::Lost => "lost",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
+impl GearStatusLabel for agent::GearTaskAttemptStatus {
+    fn gear_status_label(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
+            Self::Lost => "lost",
+            Self::Skipped => "skipped",
+        }
     }
 }
 
@@ -12728,6 +13105,9 @@ impl Render for ThreadView {
             .child(conversation)
             .children(self.render_multi_root_callout(cx))
             .children(self.render_activity_bar(window, cx))
+            .when_some(self.render_gear_task_panel(window, cx), |this, panel| {
+                this.child(panel)
+            })
             .when(self.show_external_source_prompt_warning, |this| {
                 this.child(self.render_external_source_prompt_warning(cx))
             })

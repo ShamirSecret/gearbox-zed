@@ -118,6 +118,17 @@ TaskManager completion event
   -> GUI streams summarized state
 ```
 
+### 7. 计划里必须显式保留的 OMO 守卫
+
+这些点已经拆到独立 phase 工单里，主计划只保留映射关系，避免后续实现时把关键语义丢掉：
+
+- Phase 01 / Phase 05：`run_epoch` / `notified_epoch` 去重，completion 只在 epoch 前进时再次投递。
+- Phase 03：`messageability` 矩阵，决定 `steer`、`revive` 还是 `not-continuable`。
+- Phase 05：parent wake 的 busy 检测、缓冲和重试，避免 completion 打断用户正在看的 streaming 回复。
+- Phase 06：LRU residency eviction 和 archive cap 的语义分离，`Cancelled` / `Lost` 不能被普通 FIFO 挤掉。
+- Phase 07：`question: false` / tool restriction、secret-like model field scan、fallback 链长度和 no-op skip。
+- Phase 09：`get_descendant_tasks()` / 级联取消，`skip_notification` 防止通知风暴。
+
 ## Gear runtime 总架构
 
 ```text
@@ -204,17 +215,17 @@ GearNativeSession
 
 仍不足：
 
-- `TaskManager` 已有 GUI queue/control-plane structured snapshot API：`TaskManager::snapshot()` 输出 pending/running/completed/skipped/failed/cancelled 计数、task/attempt 摘要、result/outcome artifact path 和当前 worker output；Gear event stream 现在用这份 snapshot 去重输出 markdown。
-- Gear `thread_view` 已新增第一版原生 TaskManager 区块：直接读取 snapshot，在 activity bar 内展示 task counts、最近 task/attempt、当前 worker output，并可直接打开 task/attempt `result` / `outcome` artifact。
+- `TaskManager` 已有 GUI queue/control-plane structured snapshot API：`TaskManager::snapshot()` 输出 pending/running/completed/skipped/failed/cancelled 计数、task/attempt 摘要、goal artifacts root、result/outcome/fallback route-transform artifact path、summary head / continuation hint 和当前 worker output；Gear event stream 现在用这份 snapshot 去重输出 markdown。
+- Gear `thread_view` 已把第一版原生 TaskManager 区块升级为独立 Gear panel：直接读取 snapshot，在独立面板内展示 task counts、最近 task/attempt、当前 worker output，并可直接打开 task/attempt `result` / `outcome` / `fallback` artifact，以及 goal 级 `Goal Review` / `Coordinator Review` / `Final Report` / `Artifacts` 入口。
 - 该区块已具备第一版面板能力：`All` / `Active` / `Attention` 过滤、running/pending 优先排序，以及超过 6 条时的 `Show More` / `Show Less`。
-- `TaskManagerControl` 现已支持第一版 worker interaction control plane：`current_last_output`、`cancel_current_task`、`interrupt_current_task`、`send_follow_up_current_task`、`steer_current_task`。Gear GUI 已接上 stop/send-now 的原生分支，并在 TaskManager 区块里提供 `Interrupt` / `Cancel Task` / `View Output` 按钮；后续还缺更完整的 output 浏览器和更细粒度的 worker 控件。
+- `TaskManagerControl` 现已支持第一版 worker interaction control plane：`current_last_output`、`cancel_current_task`、`interrupt_current_task`、`send_follow_up_current_task`、`steer_current_task`。Gear GUI 已接上 stop/send-now 的原生分支，并在独立 TaskManager panel 里提供 `Follow Up` / `Steer` / `Interrupt` / `Cancel Task` / `View Output` 按钮；goal review / coordinator review / final report 入口也已接通，后续继续收口更细粒度的 worker 控件。
 - `ConcurrencyManager` 已有 provider/model keyed concurrency MVP，并且已经有 CLI/env policy 覆盖；但还没有动态预算或 team-mode 配置。
-- GUI session 已持有当前 `SharedTaskManager` / `TaskManagerTickLoop` / control handle；cancel、interrupt、send-now follow-up/steer 已能打到当前 worker。Gear 消息流仍保留 markdown snapshot，同时 `thread_view` 已有第一版原生 TaskManager queue/control-plane 区块；后续还缺更完整的独立面板、筛选和专门的 artifact/output 浏览器。
+- GUI session 已持有当前 `SharedTaskManager` / `TaskManagerTickLoop` / control handle；cancel、interrupt、send-now follow-up/steer 已能打到当前 worker，pending follow-up/steer 也会在 task start 后按序 drain。Gear 消息流仍保留 markdown snapshot，同时 `thread_view` 已有独立原生 TaskManager panel；后续还缺更完整的筛选、worker 路由和专门的 artifact/output 浏览器。
 - `OpencodeSessionWorker` 已支持同一 managed handle 的 follow-up/steer 兼容路径，但还不是绑定 opencode 原生长驻 session API 的 backend；普通 command worker 仍明确返回 unsupported。
 - Codex/Claude/Zed Agent 目前只有 command-backed adapter 身份，还没有原生 session 协议。
-- model availability 已有 MVP policy 输入：worker route 可记录 `worker_model`，CLI/env 可声明 unavailable worker models；TaskManager 会在启动 worker 前把 unavailable model 记为 `ModelUnavailable` attempt，并且 command-backed worker 也会把缺失 PATH binary 预检测为 `WorkerUnavailable`。Gear GUI 路径现在还会把 provider registry 的当前可用模型快照投影到 `provider/model` 级别的 unavailable entry。仍未完成的是更主动的 provider-aware routing、premium/depth 联合预算、以及把 Codex/Claude/Zed Agent 从 command worker 升级为真正 session worker。
+- model availability 已有 MVP policy 输入：worker route 可记录 `worker_model`，CLI/env 可声明 unavailable worker models；TaskManager 会在启动 worker 前把 unavailable model 记为 `ModelUnavailable` attempt，并且 command-backed worker 也会把缺失 PATH binary 预检测为 `WorkerUnavailable`。Gear GUI 路径现在还会把 provider registry 的当前可用模型快照投影到 `provider/model` 级别的 unavailable entry，`CategoryRouter` 也已经会在 route selection 阶段跳过不可用的 provider/model route。仍未完成的是更完整的 premium/depth 联合预算，以及把 Codex/Claude/Zed Agent 从 command worker 升级为真正 session worker。
 - fallback chain 已有 MVP：同一 managed task 内 failed/unavailable worker result 可追加下一 attempt 并切换到下一 category/sequence route；同类失败达到上限时会停止。
-- `CategoryRouter` 仍是内置 MVP policy，还没有 CLI/env policy 覆盖。
+- `CategoryRouter` 仍是内置 MVP policy，还没有 CLI/env policy 覆盖；provider/model availability 只是第一版内置 skip 规则。
 - worker outcome 还没有形成可订阅 event stream。
 - 已有 OMO 式 model-level fallback 的 MVP policy/attempt 记录；还没有接 GUI provider registry 的实时 availability、stale session detection、loop detector、crash cleanup。
 
@@ -328,6 +339,8 @@ impl TaskManager {
     pub fn list(&self, scope: TaskListScope) -> Vec<TaskRecord>;
 }
 ```
+
+> MVP 现状：GUI 交互控制面先通过 `TaskManagerControl` 绑定当前 `current_task`，所以 cancel / interrupt / send_follow_up / steer 都是 current-task scoped。`TaskManager` 保留的是 task_id 级别的管理语义；等 Phase 09 的 parallel worker pool 真正放开后，再把这些控制路径扩展成多 task routing。
 
 ### MVP 约束
 
@@ -694,7 +707,7 @@ Gear task -> ZedAgentWorker -> native sibling/subagent thread -> outcome -> Gear
 
 ### Phase 1：TaskManager 升级为后台 control plane
 
-状态：MVP control plane 已完成。已完成 shared `TaskManagerControl`、running handle 共享、wait 期间 control cancel、GUI Gear cancel 绑定当前 worker、pending queue、pending cancel、`ConcurrencyManager` 全局槽位 + provider/model keyed per-key 槽位、completed archive、task lifecycle event、后台 worker completion dispatcher、非阻塞 `tick()` 收割、`TaskManagerTickLoop` 后台 tick loop primitive、runtime / GUI session 生命周期接入，以及 GUI 可消费的 `TaskManager::snapshot()` 结构化 queue/control-plane observer API。`TaskManagerControl` 的 `send_follow_up` / `steer` / `interrupt` 已接入原生 GUI 交互：Gear `Stop Generation` 走 interrupt，运行中的 `Send Immediately` / queue `Send Now` 会优先复用当前 worker handle。`thread_view` 也已新增第一版原生 Gear TaskManager 区块、task/attempt artifact opener、当前 worker output 独立查看入口、`Interrupt` / `Cancel Task` 控制按钮，以及第一版 filter/sort/show-more 面板能力。并发上限也已经进入 CLI/env policy，可通过 `WorkerConfig` 注入到共享 `TaskManager`。后续剩更完整的独立面板、专门的 artifact/output 浏览器和动态预算/team-mode 调度策略。
+状态：MVP control plane 已完成。已完成 shared `TaskManagerControl`、running handle 共享、wait 期间 control cancel、GUI Gear cancel 绑定当前 worker、pending queue、pending cancel、`ConcurrencyManager` 全局槽位 + provider/model keyed per-key 槽位、completed archive、task lifecycle event、后台 worker completion dispatcher、非阻塞 `tick()` 收割、`TaskManagerTickLoop` 后台 tick loop primitive、runtime / GUI session 生命周期接入，以及 GUI 可消费的 `TaskManager::snapshot()` 结构化 queue/control-plane observer API。`TaskManagerControl` 的 `send_follow_up` / `steer` / `interrupt` 已接入原生 GUI 交互：Gear `Stop Generation` 走 interrupt，运行中的 `Send Immediately` / queue `Send Now` 会优先复用当前 worker handle。`thread_view` 也已把第一版原生 Gear TaskManager 区块升级为独立 Gear panel、task/attempt artifact opener、当前 worker output 独立查看入口、`Interrupt` / `Cancel Task` 控制按钮，以及第一版 filter/sort/show-more 面板能力。并发上限也已经进入 CLI/env policy，可通过 `WorkerConfig` 注入到共享 `TaskManager`。后续剩更完整的 worker 路由、专门的 artifact/output 浏览器和动态预算/team-mode 调度策略。
 
 任务：
 
@@ -754,7 +767,7 @@ Gear task -> ZedAgentWorker -> native sibling/subagent thread -> outcome -> Gear
 
 ### Phase 4：真正 session worker
 
-状态：MVP 已完成，并补上了 resident-command 版本的 revive / stale detection / interrupt 控制路径。`WorkerSessionHandle` 已是 `Send + Sync`，command-backed worker 已支持 cancellation token 和 `last_output` cache；`TaskManagerControl.current_last_output()` 已能读取当前 worker handle 的最近输出；unsupported `send_follow_up` / `steer` 会明确返回错误。`OpencodeSessionWorker` 已作为 resident-command MVP 接入：它复用 `--opencode-command`，在同一个 managed handle 内执行 follow-up/steer turn，并把每轮 prompt、stdout/stderr、result/outcome 写入 artifacts。交互式 resident handle 在取消或 interrupt 后会进入 stale 状态，下一次 follow-up/steer 前自动 revive，并写 `interrupt-*.md` / `revive-*.md` artifact。
+状态：MVP 已完成，并补上了 resident-command 版本的 revive / stale detection / interrupt 控制路径。`WorkerSessionHandle` 已是 `Send + Sync`，并新增了 `abort` / `dispose` / `subscribe` / `wait_for_idle` 入口；command-backed worker 已支持 cancellation token 和 `last_output` cache；`TaskManagerControl.current_last_output()` 已能读取当前 worker handle 的最近输出；unsupported `send_follow_up` / `steer` 会明确返回错误。`OpencodeSessionWorker` 已作为 resident-command MVP 接入：它复用 `--opencode-command`，在同一个 managed handle 内执行 follow-up/steer turn，并把每轮 prompt、stdout/stderr、result/outcome 写入 artifacts。现在还会写 `transcript.jsonl`、`tool-events.jsonl`、`partial-output.md`，并由 `TaskManager` 持有 subscription token。交互式 resident handle 在取消或 interrupt 后会进入 stale 状态，下一次 follow-up/steer 前自动 revive，并写 `interrupt-*.md` / `revive-*.md` artifact。
 
 任务：
 
@@ -764,8 +777,8 @@ Gear task -> ZedAgentWorker -> native sibling/subagent thread -> outcome -> Gear
 3. `OpencodeSessionWorker` 支持 resident-command session MVP。（已完成）
 4. `send_follow_up` / `steer` API 在 session worker 中可用。（已完成）
 5. 后续把 resident-command backend 替换为 opencode 原生长驻 session API，并补齐真正的 opencode-native `interrupt`；当前只有 resident-command 版本的 interrupt/revive/stale detection。
-6. Phase 4 follow-up：补齐 OMO `ManagedChildHandle.subscribe()` 等价的 worker event/transcript stream，让 `TaskManager` 能订阅 worker 中间事件、tool call、partial assistant text，并把它们写成可审计 artifact / GUI snapshot，而不是只等 `last_output` 或最终 `outcome.json`。
-7. Phase 4 follow-up：把 pending task 的 `send_follow_up` / `steer` 做成 OMO 式 queued delivery，任务真正 start 后按顺序 drain；当前 GUI queue 只打到 running handle，pending delivery 还没有和 worker lifecycle 合并。
+6. Phase 4 follow-up：补齐 OMO `ManagedChildHandle.subscribe()` 等价的 worker event/transcript stream，让 `TaskManager` 能订阅 worker 中间事件、tool call、partial assistant text，并把它们写成可审计 artifact / GUI snapshot，而不是只等 `last_output` 或最终 `outcome.json`。（第一版已落地：resident handle 现在会发 coarse `transcript.jsonl` / `tool-events.jsonl` / `partial-output.md`，TaskManager 也持有 subscription token；真正的 tool call / assistant delta 级 streaming 仍待补齐）
+7. Phase 4 follow-up：把 pending task 的 `send_follow_up` / `steer` 做成 OMO 式 queued delivery，任务真正 start 后按顺序 drain。（已完成）
 8. Phase 4 follow-up：把 terminal resident task revive 做成正式语义。OMO 允许 terminal resident task 在同一 session 上 `followUp` 并递增 run epoch；Gear 当前只保证 running 期间复用 session，settled 后继续开新轮仍未定义。
 
 验收：
@@ -776,7 +789,7 @@ Gear task -> ZedAgentWorker -> native sibling/subagent thread -> outcome -> Gear
 - interrupt 控制链路已存在，resident handle 会写 interrupt artifact，并在下一次 follow-up/steer 前 revive。（已完成 resident-command MVP）
 - unsupported 能清楚回报，不静默吞掉。（command-backed worker 已覆盖）
 - worker event/transcript stream 能还原 worker 中间行为，review 不只能依赖最终 stdout/outcome。（待 Phase 4 follow-up）
-- pending follow-up/steer 能在 task start 后按序投递；terminal resident task 能 revive 同一 session，并在 attempt/run epoch 中可追踪。（待 Phase 4 follow-up）
+- pending follow-up/steer 能在 task start 后按序投递；terminal resident task 能 revive 同一 session，并在 attempt/run epoch 中可追踪。（terminal revive 已完成，queued delivery 已完成）
 
 ### Phase 5：ZedAgentWorker
 
@@ -832,7 +845,8 @@ Gear task -> ZedAgentWorker -> native sibling/subagent thread -> outcome -> Gear
 4. final report 必须引用 verification/review/artifact 证据。
 5. Phase 7 follow-up：引入 OMO `ultrawork` / Oracle 风格的 independent reviewer gate。高风险、用户要求审查、或 provider review 要求 `ROUTE_HINT=review` 时，worker/coordination 的 completion claim 不能直接 complete，必须由独立 reviewer worker 产出可引用 evidence。
 6. Phase 7 follow-up：把 fallback policy 从 route sequence MVP 升级为 provider/model policy：跳过 unreachable provider、跳过 no-op fallback、记录 provider/model transform、previous session、failed model、next model，并把这些事实输入 review。
-7. Phase 7 follow-up：把 provider-backed review、independent reviewer、fallback retry、premium/depth budget 合成一个统一 policy，而不是分别散落在 evaluation、TaskManager 和 worker router 中。
+7. Phase 7 follow-up：把 provider-backed review、independent reviewer、fallback retry、premium/depth budget 合成一个统一 policy，而不是分别散落在 evaluation、TaskManager 和 worker router 中；当前已把 `max_provider_unknown_streak` 显式并入 budget 控制器，后续继续把 provider/model fallback 细节和 route upgrade policy 收口到同一层。
+8. Phase 7 follow-up：修正 `nearest_fallback` 语义。`nearest_fallback` 只能表示“下一条可尝试的不同 route”，不能在没有可用 fallback 时回填当前 selected route；attempted route / unavailable route 必须单独记录，避免 review 和 GUI 误以为还有 fallback 可走。
 
 验收：
 
@@ -841,14 +855,22 @@ Gear task -> ZedAgentWorker -> native sibling/subagent thread -> outcome -> Gear
 - provider route hint 改变下一轮 category。
 - independent reviewer gate 能阻止“自称完成但未经审查”的高风险 complete。（待 Phase 7 follow-up）
 - fallback artifacts 能显示 skipped unreachable provider、skipped no-op fallback、failed model、next model 和 previous session。（待 Phase 7 follow-up）
+- 没有不同 fallback route 时，resolution/result/artifact 明确写 `nearest_fallback: none`，而不是把当前 route 当成 fallback。（待 Phase 7 follow-up）
 
 状态：
 
 - 已完成第一轮：provider-backed review 输入现在已经带上 `worker_attempt`、attempt 总数、`failure_kind`、`retry_reason`、fallback history 摘要；这让 review hook 不再只看到单轮 worker 成败，而能看到 route/fallback 上下文。
+- `CategoryRouter` 现在也会下发 category-scoped `prompt_append` 和 `WorkerToolPolicy`，并把 `GEARBOX_GEAR_WORKER_PROMPT_APPEND` 作为用户附加说明合并到 worker packet；review/explore/write 的工具策略边界因此开始显式化。
+- worker prompt 和 coordinator review prompt 都接了 sanitized model metadata block，`sanitize_model_fields()` 现在真正用于写入前清洗，而不是只停留在单测里。
+- fallback retry 现在会写 `workers/<task_id>/route-transform-*.md` artifact，并在 `goal-review-iteration-*.md` 里引用 fallback history，包含前后 attempt / provider / model / session / decision。
+- `queue_next_attempt` 的 no-op fallback 现在会通过共享 route identity canonicalization 比较 `worker_kind` / `worker_model` / `worker_command`，避免重复回到同一 route，并且 provider/model 不可用判断也会把 provider id case-insensitive、model punctuation canonicalize 之后再比较。
 - `ROUTE_HINT=review` 现在已经有 runtime 语义：当 verification 已通过但 coordinator review 仍要求独立审查时，GoalLoop 不会直接 complete，而会继续进入下一轮，并按 `review` category 选择 worker；下一轮 prompt 也会改成独立审查请求，而不是沿用 repair prompt。
-- final report 的第一版强制证据引用约束也已接上：`final-report.md` 现在会显式输出 `Evidence Chain`，列出 worker packet/prompt/result/outcome 以及 spec/plan/verification/review 等 task evidence 路径，不再只给结论性摘要。
+- `ROUTE_HINT=review` 现在即使伴随 `goal_satisfied: yes` 也会触发至少一轮独立 review worker，避免 provider 抢先给出 completion claim。
+- final report 的第一版强制证据引用约束也已接上：`final-report.md` 现在会显式输出 `Evidence Chain`，列出 worker packet/prompt/transcript/result/outcome 以及 spec/plan/verification/review 等 task evidence 路径，同时新增 `Decision` 区块把停止原因和下一步建议写出来，不再只给结论性摘要。
+- `CoordinatorReviewInput` 现在会携带 worker transcript head/tail 和 category resolution result，`collect_context_risk_texts` 也会读取 `transcript.jsonl` / `tool-events.jsonl` / `partial-output.md`，review / budget 不再只看最终摘要；transcript/tool-event 流的截断检测已经能识别未正常 finish 的 turn、未 finish 的 tool call、以及 partial output 落盘。
+- `max_provider_unknown_streak` 现在已经从 Gear CLI / GUI env 接到 `Goal.budget`，不再只靠内部默认值。
 - 连续 unknown / 同类失败的第一版升级策略也已接上：verification passed + provider `unknown` 不再直接 complete；第一次 `unknown` 会继续一轮，第二次 `unknown` 会升级到 `review`，否则进入 `needs_user`。连续相同 `failure_kind` 也会按 `repair/explore -> deep -> review` 方向升级 route，而不是原地空转。
-- 仍未完成：真正独立于 command worker 的 review session protocol、OMO Oracle/ultrawork 风格的 reviewer gate、provider/model 级 fallback 细节（unreachable/no-op/model transform/previous session）、以及把这套 route upgrade 进一步和 premium/depth budget、provider-aware availability 串成统一 policy。
+- 仍未完成：真正独立于 command worker 的 review session protocol、OMO Oracle/ultrawork 风格的 reviewer gate，以及把这套 route upgrade 进一步和 premium/depth budget、provider-aware availability 串成统一 policy；`max_provider_unknown_streak` 现在已先收进 budget 控制器，作为 provider-aware review 的第一版显式阈值。
 
 ### Phase 8：Resilience
 
@@ -859,27 +881,27 @@ Gear task -> ZedAgentWorker -> native sibling/subagent thread -> outcome -> Gear
 3. process/crash cleanup。
 4. completed archive size limit。
 5. orphaned worker cleanup。
-6. Phase 8 follow-up：补 OMO 式 no-progress / stagnation detector。Gear 应跟踪连续无有效 diff、无 tool/output 进展、相同失败重复、verification 无变化等信号，避免在“看似还在循环但没有实质进展”的状态里消耗预算。
-7. Phase 8 follow-up：补 token-limit / context-compaction guard。发生 token limit、上下文压缩、会话 agent 信息不可靠、或 worker/session 状态不可判定时，Gear 应保守进入 repair/replan/needs_user，而不是继续注入下一轮。
-8. Phase 8 follow-up：如果 GUI 后续要把 worker completion 主动注入同一聊天线程，需要吸收 OMO parent-wake 的竞态保护：按 parent session 串行化通知、检测用户消息/assistant/tool 活动、去重、失败重排，避免和用户新 prompt 或已有 assistant turn 竞争。
+6. Phase 8 follow-up：补 OMO 式 no-progress / stagnation detector。Gear 应跟踪连续无有效 diff、无 tool/output 进展、相同失败重复、verification 无变化等信号，避免在“看似还在循环但没有实质进展”的状态里消耗预算。第一版已落地：`detect_stagnation()` 产出的 `no_progress_signals` 现在会进入 coordinator review prompt 和 goal review artifact，后续继续把这些信号收口进 token-limit / context-compaction guard。
+7. Phase 8 follow-up：补 token-limit / context-compaction guard。发生 token limit、上下文压缩、会话 agent 信息不可靠、或 worker/session 状态不可判定时，Gear 应保守进入 repair/replan/needs_user，而不是继续注入下一轮。第一版已落地：`detect_context_risk_signals()` 的信号会阻止 repair/review/completion 的继续决策，completion 分支也会在 context 风险存在时暂停并要求 user 介入。
+8. Phase 8 follow-up：如果 GUI 后续要把 worker completion 主动注入同一聊天线程，需要吸收 OMO parent-wake 的竞态保护：按 parent session 串行化通知、检测用户消息/assistant/tool 活动、去重、失败重排，避免和用户新 prompt 或已有 assistant turn 竞争。第一版已落地：`ConversationView::notify_with_sound()` 现在会在 root thread 仍在生成、compacting、等待确认、存在 in-progress tool call 或 queued message 时将 completion notification 入缓冲；`flush_pending_notifications()` 在真正 drain 前会重新检查 root thread busy state，只有 idle 才 flush，避免 buffered completion 因状态变化被提前弹出。
 
 验收：
 
 - worker crash 不导致 goal loop 无限等待。
 - stale running task 可转为 error/limited。
 - archive 不无限增长。
-- no-progress/stagnation 会消耗预算并触发 route upgrade、needs_user 或 limited，而不是无限 repair。（待 Phase 8 follow-up）
-- token limit / compaction / session state 不可靠时不会盲目继续下一轮。（待 Phase 8 follow-up）
-- GUI completion notification 不会和用户输入或现有 assistant turn 竞争。（待 Phase 8 follow-up）
+- no-progress/stagnation 第一版已进入 coordinator review prompt 和 goal review artifact；后续继续把它收口成预算消耗、route upgrade、needs_user 或 limited，而不是无限 repair。（待 Phase 8 follow-up）
+- token limit / compaction / session state 不可靠时不会盲目继续下一轮；completion claim 也会被 context guard 拦住。（待 Phase 8 follow-up）
+- GUI completion notification 不会和用户输入或现有 assistant turn 竞争；flush 时必须重新检查 root busy state。（待 Phase 8 follow-up）
 
 状态：
 
 - 已完成第一轮：`TaskManager.wait_for()` 不再无限阻塞 channel，而是按短轮询间隔持续 `tick()`；`tick()` 现在会主动 sweep stale running task。超过当前 MVP 超时阈值的 running worker 会被标记为失败并写回 `task-record.json`，而不是让 Gear 永久卡死在 `wait_for()`。
 - stale / timeout 类失败也不再只会把整个 run 硬崩掉：它们会复用现有 fallback 机制，能继续下一条 route 就继续，不能继续时再通过 `NoFallbackRoute` / `limited` 或 error 收口。
 - stale timeout 现在已经从硬编码常量提升到第一版 runtime policy：`WorkerConfig.stale_task_timeout_secs` 会从 CLI / Gear GUI env 进入 `TaskManager`。同时，`tick()` 也会做第一版 orphaned in-memory state cleanup，清掉“有 running/queued 状态但没有 record”的孤儿任务状态，避免 control plane 越跑越脏。
-- runtime 启动时现在也会扫描 `.gearbox-agent/workers/*/task-record.json`，把上次异常退出遗留的 `pending/running` record 收口成失败态并追加 lifecycle event，避免跨进程重启后残留假运行态。
+- runtime 启动时现在也会扫描 `.gearbox-agent/workers/*/task-record.json`，把上次异常退出遗留的 `pending/running` record 收口成 `Lost`，同时保留 `WorkerStartFailed` 这类 failure kind 并追加 lifecycle event，避免跨进程重启后残留假运行态。
 - 已有 completed archive cap 仍保留 `100` 条上限。
-- 仍未完成：更细的 stale session detector、真正的 worker process cleanup、带真实 session/handle 探测的跨进程 orphaned worker cleanup、no-progress/stagnation detector、token-limit/context-compaction guard，以及 OMO parent-wake 级别的 GUI notification 竞态保护。
+- 仍未完成：更细的 stale session detector、真正的 worker process cleanup、带真实 session/handle 探测的跨进程 orphaned worker cleanup、完整 parent-session 串行通知队列、failure reorder，以及 dedicated completion panel；no-progress/stagnation 和 token/context guard 已有第一版，后续继续把它们收口到预算和 route policy。`delivery retry` 已有第一版短退避。
 
 ### Phase 9：小规模 team/parallel mode
 
@@ -899,17 +921,14 @@ Gear task -> ZedAgentWorker -> native sibling/subagent thread -> outcome -> Gear
 
 ## 立刻执行的下一步
 
-按优先级：
+当前顺序不是重新跑 Phase 01-03，而是收口仍未完全闭合的 follow-up，优先级如下：
 
-1. 执行 [Phase 01：TaskRecord 状态机与驻留语义](gearbox-gear-workorders/phase-01-state-machine.md)：补 `Interrupted` / `Lost`、`ResidencyState`、`run_epoch` / `notified_epoch`，并把所有状态写入集中到 `transition_task_record()`。
-2. 执行 [Phase 02：TaskManager control plane 与并发释放守卫](gearbox-gear-workorders/phase-02-task-manager-control-plane.md)：补 `(task_id, run_epoch)` release guard、waiter 队列、`forget_task()` 和非阻塞 control path。
-3. 执行 [Phase 03：Steering、messageability、queued delivery 与 revive](gearbox-gear-workorders/phase-03-steering-messageability-revive.md)：改 cancel/interrupt 为“先转换再 abort”，补 `messageability()`、pending message queue 和 terminal resident revive。
-4. 执行 [Phase 04：WorkerSessionHandle 与 runner 生命周期](gearbox-gear-workorders/phase-04-worker-session-runners.md)：补 worker event/transcript stream、显式 `dispose()` / `abort()`、`wait_for_idle()` 和真正 session runner 语义。
-5. 执行 [Phase 05：Completion notification 与 GUI parent wake](gearbox-gear-workorders/phase-05-completion-parent-wake.md)：补 completion epoch 去重、取消/中断不异步通知、GUI parent busy/buffer/retry。
-6. 执行 [Phase 06：Lifecycle、residency、reconciliation 与 TTL](gearbox-gear-workorders/phase-06-lifecycle-residency-cleanup.md)：补统一 destroy port、LRU residency、启动 reconciliation、TTL cleanup。
-7. 执行 [Phase 07：Category、fallback、provider/model policy](gearbox-gear-workorders/phase-07-category-fallback-model-policy.md)：补 secret-like model field scan、category `prompt_append`、provider/model fallback chain、no-op/unreachable skip。
-8. 执行 [Phase 08：GoalLoop、ReviewEngine、budget 与 stagnation guard](gearbox-gear-workorders/phase-08-goal-loop-review-budget.md)：补 robust review parser、independent reviewer gate、统一 policy、no-progress/token/context guard。
-9. 执行 [Phase 09：GUI 原生 worker 池、小规模并行与级联取消](gearbox-gear-workorders/phase-09-gui-parallel-worker-pool.md)：在前面状态机和 lifecycle 稳定后，再开放并行、descendant cancel、完整 worker pool 和独立 GUI panel。
+1. [Phase 04：WorkerSessionHandle 与 runner 生命周期](gearbox-gear-workorders/phase-04-worker-session-runners.md)：补 worker event/transcript stream、显式 `dispose()` / `abort()`、`wait_for_idle()` 和真正 session runner 语义。
+2. [Phase 05：Completion notification 与 GUI parent wake](gearbox-gear-workorders/phase-05-completion-parent-wake.md)：补 completion epoch 去重、取消/中断不异步通知、GUI parent busy/buffer/retry；runtime MVP 已接上 turn-end flush，notification delivery failure 也会写回 `notification_failed_epoch`，completion 内容已带 final response head / continuation hint / artifact links，GUI completion popup 现在会在 root thread 忙碌时缓冲，并在 idle flush 前再次检查 busy state；短退避 retry 已接入主链路，后续再补更精确的 parent session 串行化、failure reorder 与 dedicated panel。
+3. [Phase 06：Lifecycle、residency、reconciliation 与 TTL](gearbox-gear-workorders/phase-06-lifecycle-residency-cleanup.md)：补统一 destroy port、LRU residency、启动 reconciliation、TTL cleanup；当前已补上 `TaskManager` session shutdown drop cleanup、running handle 优先的 best-effort stop/cancel/abort/dispose、`task_record_paths` runtime 索引、dispose lifecycle event，以及 shutdown 时把 pending/running current 降级为 `Lost`。后续不要把普通 cancel/interrupt 强行改成 destroy，因为 Phase 03 仍要求 `Interrupted + Resident -> Revive`；destroy 只负责最终释放 residency。
+4. [Phase 07：Category、fallback、provider/model policy](gearbox-gear-workorders/phase-07-category-fallback-model-policy.md)：补 secret-like model field scan、category `prompt_append`、provider/model fallback chain、no-op/unreachable skip，并修正 `nearest_fallback` 只能指向下一条不同 fallback route；当前实现已对齐这一语义。
+5. [Phase 08：GoalLoop、ReviewEngine、budget 与 stagnation guard](gearbox-gear-workorders/phase-08-goal-loop-review-budget.md)：补 robust review parser、independent reviewer gate、统一 policy、no-progress/token/context guard；当前已补上 parser warning artifact、fallback history、GoalDecisionPolicy、budget snapshot、child-depth/runtime budget、artifact-backed context guard、worker-output stagnation signal、coordinator review no-progress evidence 和 final report 的 Decision 区块，后续继续收口更强的 token 信号来源。
+6. [Phase 09：GUI 原生 worker 池、小规模并行与级联取消](gearbox-gear-workorders/phase-09-gui-parallel-worker-pool.md)：在前面状态机和 lifecycle 稳定后，再开放并行、descendant cancel、完整 worker pool 和独立 GUI panel；当前已完成 read-only review task 的同 key 并行放宽、`parent_task_id` 任务树级联取消，以及显式写作用域 guard；独立 Gear panel 已从 activity bar 拆出并落到 ThreadView 的专用面板里，provider/model 不可用 route 也会在选择阶段提前跳过，goal review / coordinator review / final report 浏览入口也已接通，后续主要继续收更完整的 provider/depth 统一策略和 provider-aware review 阈值收口。
 
 ## 不做什么
 

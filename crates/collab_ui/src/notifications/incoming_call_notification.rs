@@ -125,11 +125,19 @@ impl Render for IncomingCallNotification {
                     move |_, _, cx| state.respond(false, cx)
                 }),
             )
-            .child(Label::new(if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") {
-                format!("{} 正在 Gearbox 中共享一个项目", self.state.call.calling_user.username)
-            } else {
-                format!("{} is sharing a project in Zed", self.state.call.calling_user.username)
-            })),
+            .child(Label::new(
+                if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") {
+                    format!(
+                        "{} 正在 Gearbox 中共享一个项目",
+                        self.state.call.calling_user.username
+                    )
+                } else {
+                    format!(
+                        "{} is sharing a project in Zed",
+                        self.state.call.calling_user.username
+                    )
+                },
+            )),
         )
     }
 }

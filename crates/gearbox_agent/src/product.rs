@@ -1,7 +1,8 @@
 use crate::languages::{LanguageDetection, LanguageProfile};
-use crate::state::{Goal, Task};
+use crate::state::{Goal, GoalStatus, Task};
 use crate::tools::{DiffSnapshot, ScopeCheck, ShellCommandResult};
 use crate::workers::WorkerResult;
+use std::path::PathBuf;
 
 pub fn spec(goal: &Goal, detection: &LanguageDetection) -> String {
     let generation_guidance = generation_guidance(detection);
@@ -210,6 +211,8 @@ pub fn final_report(
     scope_check: &ScopeCheck,
     verification_results: &[ShellCommandResult],
 ) -> String {
+    let goal_summary = goal_summary_text(&goal.summary);
+    let next_step = goal_next_step(&goal.status);
     let verification_summary = if verification_results.is_empty() {
         "No verification commands were available.".to_string()
     } else if verification_results.iter().all(|result| result.success) {
@@ -257,6 +260,11 @@ Goal: `{}`
 
 Status: `{}`
 
+## Decision
+
+- summary: {}
+- next step: {}
+
 ## Worker
 
 - status: `{}`
@@ -299,6 +307,8 @@ Status: `{}`
 "#,
         goal.id,
         goal.status.as_str(),
+        goal_summary,
+        next_step,
         worker_result.status.as_str(),
         worker_result.summary,
         worker_result.packet_path.display(),
@@ -314,7 +324,7 @@ Status: `{}`
 }
 
 fn final_report_evidence(tasks: &[Task], worker_result: &WorkerResult) -> String {
-    let worker_evidence = [
+    let mut worker_evidence = vec![
         (
             "packet",
             worker_result.packet_path.to_string_lossy().to_string(),
@@ -331,10 +341,24 @@ fn final_report_evidence(tasks: &[Task], worker_result: &WorkerResult) -> String
             "outcome",
             worker_result.outcome_path.to_string_lossy().to_string(),
         ),
-    ]
-    .into_iter()
-    .map(|(label, path)| format!("- worker_{label}: `{path}`"))
-    .collect::<Vec<_>>();
+    ];
+
+    for (label, file_name) in [
+        ("transcript", "transcript.jsonl"),
+        ("tool_events", "tool-events.jsonl"),
+        ("partial_output", "partial-output.md"),
+    ] {
+        if let Some(path) = worker_artifact_path(worker_result, file_name)
+            && path.exists()
+        {
+            worker_evidence.push((label, path.to_string_lossy().to_string()));
+        }
+    }
+
+    let worker_evidence = worker_evidence
+        .into_iter()
+        .map(|(label, path)| format!("- worker_{label}: `{path}`"))
+        .collect::<Vec<_>>();
 
     let task_evidence = tasks
         .iter()
@@ -352,4 +376,171 @@ fn final_report_evidence(tasks: &[Task], worker_result: &WorkerResult) -> String
         .chain(task_evidence)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn worker_artifact_path(worker_result: &WorkerResult, file_name: &str) -> Option<PathBuf> {
+    worker_result
+        .result_path
+        .parent()
+        .or_else(|| worker_result.outcome_path.parent())
+        .map(|artifact_dir| artifact_dir.join(file_name))
+}
+
+fn goal_summary_text(summary: &str) -> String {
+    if summary.trim().is_empty() {
+        "No final decision summary was recorded.".to_string()
+    } else {
+        summary.to_string()
+    }
+}
+
+fn goal_next_step(goal_status: &GoalStatus) -> &'static str {
+    match goal_status {
+        GoalStatus::Complete => "No further action is required.",
+        GoalStatus::Limited => {
+            "Split the goal, raise the budget, or narrow the scope before retrying."
+        }
+        GoalStatus::Blocked => "Resolve the scope or forbidden-path issue, then rerun the goal.",
+        GoalStatus::NeedsUser => "Provide the missing user input or required worker configuration.",
+        GoalStatus::Failed => {
+            "Inspect the failure artifact, repair the root cause, and rerun the goal."
+        }
+        GoalStatus::Draft | GoalStatus::Planning | GoalStatus::Running | GoalStatus::Verifying => {
+            "Continue the goal loop or re-evaluate the current plan before retrying."
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{goal_next_step, goal_summary_text};
+    use crate::state::{
+        Budget, Goal, GoalStatus, Scope, Task, TaskInputs, TaskKind, TaskOutputs, TaskStatus,
+    };
+    use crate::tools::{DiffSnapshot, ScopeCheck, ShellCommandResult};
+    use crate::workers::WorkerResult;
+
+    #[test]
+    fn goal_summary_text_uses_fallback_for_empty_summary() {
+        assert_eq!(
+            goal_summary_text(""),
+            "No final decision summary was recorded."
+        );
+    }
+
+    #[test]
+    fn goal_summary_text_preserves_summary_text() {
+        assert_eq!(goal_summary_text("done"), "done");
+    }
+
+    #[test]
+    fn goal_next_step_matches_goal_status() {
+        assert_eq!(
+            goal_next_step(&GoalStatus::Limited),
+            "Split the goal, raise the budget, or narrow the scope before retrying."
+        );
+        assert_eq!(
+            goal_next_step(&GoalStatus::Blocked),
+            "Resolve the scope or forbidden-path issue, then rerun the goal."
+        );
+        assert_eq!(
+            goal_next_step(&GoalStatus::NeedsUser),
+            "Provide the missing user input or required worker configuration."
+        );
+    }
+
+    #[test]
+    fn final_report_includes_decision_guidance() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp_dir.path().join("packet.md"), "packet").expect("packet");
+        std::fs::write(temp_dir.path().join("prompt.md"), "prompt").expect("prompt");
+        std::fs::write(temp_dir.path().join("result.json"), "{}").expect("result");
+        std::fs::write(temp_dir.path().join("outcome.json"), "{}").expect("outcome");
+        std::fs::write(
+            temp_dir.path().join("transcript.jsonl"),
+            "{\"event\":\"turn_started\"}\n{\"event\":\"turn_finished\"}\n",
+        )
+        .expect("transcript");
+        std::fs::write(
+            temp_dir.path().join("tool-events.jsonl"),
+            "{\"event\":\"tool_call_started\"}\n",
+        )
+        .expect("tool events");
+        std::fs::write(temp_dir.path().join("partial-output.md"), "partial output")
+            .expect("partial output");
+        let goal = Goal {
+            id: "goal_test".to_string(),
+            title: "test".to_string(),
+            status: GoalStatus::Limited,
+            workspace: "/workspace".to_string(),
+            created_at: "2026-07-09T00:00:00Z".to_string(),
+            updated_at: "2026-07-09T00:00:00Z".to_string(),
+            request: "make it work".to_string(),
+            product_type: "app".to_string(),
+            language_profile: "rust".to_string(),
+            success_criteria: vec!["works".to_string()],
+            budget: Budget::default(),
+            current_task_id: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            summary: "Goal reached the iteration limit.".to_string(),
+        };
+        let task = Task {
+            id: "task_1".to_string(),
+            goal_id: goal.id.clone(),
+            parent_task_id: None,
+            title: "Document results".to_string(),
+            kind: TaskKind::Document,
+            status: TaskStatus::Complete,
+            assigned_worker: None,
+            attempt: 1,
+            scope: Scope::new(vec![], vec![], usize::MAX),
+            inputs: TaskInputs::default(),
+            outputs: TaskOutputs::default(),
+        };
+        let worker_result = WorkerResult {
+            status: crate::workers::WorkerStatus::Succeeded,
+            command: Some("worker".to_string()),
+            exit_code: Some(0),
+            summary: "worker finished".to_string(),
+            packet_path: temp_dir.path().join("packet.md"),
+            prompt_path: temp_dir.path().join("prompt.md"),
+            stdout_path: None,
+            stderr_path: None,
+            last_message_path: None,
+            result_path: temp_dir.path().join("result.json"),
+            outcome_path: temp_dir.path().join("outcome.json"),
+        };
+        let report = super::final_report(
+            &goal,
+            &[task],
+            &worker_result,
+            &DiffSnapshot {
+                is_git_repo: true,
+                status: "M crates/gearbox_agent/src/product.rs".to_string(),
+                changed_files: vec!["crates/gearbox_agent/src/product.rs".to_string()],
+                diff_hash: None,
+            },
+            &ScopeCheck::default(),
+            &[ShellCommandResult {
+                command: "cargo test -p gearbox_agent".to_string(),
+                exit_code: Some(0),
+                success: true,
+                stdout: "ok".to_string(),
+                stderr: String::new(),
+                duration_ms: 12,
+            }],
+        );
+
+        assert!(report.contains("## Decision"));
+        assert!(report.contains("Goal reached the iteration limit."));
+        assert!(
+            report
+                .contains("Split the goal, raise the budget, or narrow the scope before retrying.")
+        );
+        assert!(report.contains("worker_transcript"));
+        assert!(report.contains("transcript.jsonl"));
+        assert!(report.contains("tool-events.jsonl"));
+        assert!(report.contains("partial-output.md"));
+    }
 }

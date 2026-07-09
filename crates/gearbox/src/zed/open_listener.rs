@@ -2027,7 +2027,8 @@ mod tests {
             OpenRequest::parse(
                 RawOpenRequest {
                     urls: vec![
-                        "zed://git/clone/?repo=https://github.com/ShamirSecret/gearbox-zed.git".into(),
+                        "zed://git/clone/?repo=https://github.com/ShamirSecret/gearbox-zed.git"
+                            .into(),
                     ],
                     ..Default::default()
                 },
@@ -2052,7 +2053,8 @@ mod tests {
             OpenRequest::parse(
                 RawOpenRequest {
                     urls: vec![
-                        "zed://git/clone?repo=https://github.com/ShamirSecret/gearbox-zed.git".into(),
+                        "zed://git/clone?repo=https://github.com/ShamirSecret/gearbox-zed.git"
+                            .into(),
                     ],
                     ..Default::default()
                 },

@@ -393,18 +393,21 @@ impl WelcomePage {
                     .mb_2(),
             )
             .child(
-                Button::new("open-agent", gearbox_text("Open Agent Panel", "打开 Agent 面板"))
-                    .full_width()
-                    .tab_index(tab_index as isize)
-                    .style(ButtonStyle::Outlined)
-                    .key_binding(
-                        KeyBinding::for_action_in(&ToggleFocus, &self.focus_handle, cx)
-                            .size(rems_from_px(12.)),
-                    )
-                    .on_click(move |_, window, cx| {
-                        focus.dispatch_action(&ToggleWorkspaceSidebar, window, cx);
-                        focus.dispatch_action(&ToggleFocus, window, cx);
-                    }),
+                Button::new(
+                    "open-agent",
+                    gearbox_text("Open Agent Panel", "打开 Agent 面板"),
+                )
+                .full_width()
+                .tab_index(tab_index as isize)
+                .style(ButtonStyle::Outlined)
+                .key_binding(
+                    KeyBinding::for_action_in(&ToggleFocus, &self.focus_handle, cx)
+                        .size(rems_from_px(12.)),
+                )
+                .on_click(move |_, window, cx| {
+                    focus.dispatch_action(&ToggleWorkspaceSidebar, window, cx);
+                    focus.dispatch_action(&ToggleFocus, window, cx);
+                }),
             )
     }
 
@@ -520,9 +523,9 @@ impl Render for WelcomePage {
                                         "The editor for what's next",
                                         "面向下一代工作的中文编辑器",
                                     ))
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted)
-                                        .italic(),
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .italic(),
                                 ),
                             ),
                     )
@@ -540,12 +543,12 @@ impl Render for WelcomePage {
                                     "welcome-exit",
                                     gearbox_text("Return to Onboarding", "返回初始化设置"),
                                 )
-                                    .tab_index(next_tab_index as isize)
-                                    .full_width()
-                                    .label_size(LabelSize::XSmall)
-                                    .on_click(|_, window, cx| {
-                                        window.dispatch_action(OpenOnboarding.boxed_clone(), cx);
-                                    }),
+                                .tab_index(next_tab_index as isize)
+                                .full_width()
+                                .label_size(LabelSize::XSmall)
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(OpenOnboarding.boxed_clone(), cx);
+                                }),
                             ),
                         )
                     }),

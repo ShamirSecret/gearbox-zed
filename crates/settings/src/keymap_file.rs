@@ -223,8 +223,8 @@ impl KeymapFile {
     #[cfg(any(test, feature = "test-support"))]
     pub fn load_asset_cached(asset_path: &str, cx: &App) -> anyhow::Result<Vec<KeyBinding>> {
         static CACHED: std::sync::OnceLock<KeymapFile> = std::sync::OnceLock::new();
-        let keymap = CACHED
-            .get_or_init(|| Self::parse(settings_asset_str(asset_path).as_ref()).unwrap());
+        let keymap =
+            CACHED.get_or_init(|| Self::parse(settings_asset_str(asset_path).as_ref()).unwrap());
         match keymap.load_keymap(cx) {
             KeymapFileLoadResult::SomeFailedToLoad {
                 key_bindings,

@@ -33,7 +33,7 @@
    - 两个 write tasks 如果 scope overlap，后者必须等待或被拒绝。
    - worker packet 里写 scope assumption。
 5. GUI panel：
-   - 从 `thread_view` 内嵌 markdown 区块升级为独立 Gear task panel。
+   - 已从 `thread_view` 内嵌 markdown 区块升级为独立 Gear task panel。
    - 支持筛选：pending/running/terminal/category/worker。
    - 支持排序：updated time、status、category。
    - 支持打开 artifact：packet、transcript、result、outcome、review。
@@ -71,3 +71,16 @@
 - 小规模并行只开放给安全的 read-only 类任务。
 - 用户 cancel Gear session 时不会留下后台子 task。
 - GUI 能清楚显示多个 task 的状态、artifact 和控制入口。
+
+## 当前状态
+
+- 已完成第一轮：`TaskManager::can_start()` 对 read-only review task 放宽了同 worker key 的并发限制；`max_parallel_workers > 1` 时，两个同 key 的 review task 可以并行起跑。
+- 已完成第一轮：`read_only_review_tasks_can_run_in_parallel_with_same_key` 回归通过。
+- 已完成第二轮：`parent_task_id` 任务树和 descendant cancel 已接通；`session_cancel_cascades_to_descendant_tasks` 回归通过，Gear session cancel 不再只停留在当前 worker handle。
+- 已完成第三轮：写任务的显式 scope guard 已接通；重叠写 scope 会串行，`task_manager_serializes_overlapping_write_scopes` 和 `task_manager_allows_disjoint_write_scopes_with_room_in_key_budget` 回归通过。
+- 已完成第四轮：独立 Gear task panel 已从 activity bar 拆出并落到 ThreadView 内，task/attempt artifact opener、packet/prompt/transcript/result/outcome、current worker output、interrupt/cancel/view output 和 filter/sort/show-more 也都接通。
+- 已完成第五轮：task rows 现在会显示 summary head 和 continuation hint，completion 结果不再只停留在 event/record 层。
+- 已完成第五轮：TaskManager panel 头部现在也提供 Follow Up / Steer 按钮，直接复用当前 draft 的 Gear follow-up/steer 控制路径。
+- 已完成第五轮：task rows 现在还会显示 messageability 标签，便于区分 Steer / Revive / Locked。
+- 已完成第五轮：provider/model 不可用 route 会在 route selection 阶段提前跳过，避免启动前的可避免 `ModelUnavailable` attempt。
+- 仍未完成：更完整的 provider-aware/depth 统一 budget 仍然需要继续推进；当前已有第一版 child-depth cap 和 `max_provider_unknown_streak` 接通运行时预算，而 task panel 已能直接打开 packet/prompt/transcript/result/outcome/fallback、goal review/coordinator review/final report 和 current output，summary head / continuation hint / messageability 会直接显示在条目里，任务面板也能直接走 follow-up / steer draft 控制路径，final report 也会把 transcript/tool-events/partial-output 纳入证据链。

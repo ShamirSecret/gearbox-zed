@@ -1,7 +1,11 @@
 use std::collections::HashMap;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex, Weak,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -28,6 +32,12 @@ pub struct WorkerConfig {
 pub struct WorkerRoute {
     pub worker_kind: WorkerKind,
     pub worker_command: Option<String>,
+    pub worker_model: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FallbackRoute {
+    pub worker_kind: WorkerKind,
     pub worker_model: Option<String>,
 }
 
@@ -98,6 +108,31 @@ impl WorkerKind {
 
     pub fn is_premium(&self) -> bool {
         matches!(self, Self::Codex | Self::Claude | Self::ZedAgent)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerToolPolicy {
+    pub question: bool,
+    pub allow_recursive_gear_tasks: bool,
+    pub can_write: bool,
+    pub can_review: bool,
+    pub can_explore: bool,
+}
+
+impl WorkerToolPolicy {
+    pub(crate) fn to_markdown(&self) -> String {
+        [
+            format!("- question: {}", self.question),
+            format!(
+                "- allow_recursive_gear_tasks: {}",
+                self.allow_recursive_gear_tasks
+            ),
+            format!("- can_write: {}", self.can_write),
+            format!("- can_review: {}", self.can_review),
+            format!("- can_explore: {}", self.can_explore),
+        ]
+        .join("\n")
     }
 }
 
@@ -183,6 +218,58 @@ impl WorkerCategory {
             Self::Custom => &[WorkerKind::Custom],
         }
     }
+
+    fn prompt_append(self) -> Option<&'static str> {
+        match self {
+            Self::Quick | Self::Repair | Self::Deep | Self::Visual | Self::Custom => Some(
+                "Focus on implementation, keep changes minimal, and do not ask the user questions.",
+            ),
+            Self::Review => Some(
+                "This is an independent review turn. Do not edit files; inspect the evidence and return concrete findings.",
+            ),
+            Self::Explore | Self::Librarian => Some(
+                "This is a read-only exploration turn. Do not edit files; trace the code and summarize the evidence.",
+            ),
+            Self::ZedNative => Some(
+                "This is a native Zed worker turn. Stay bounded and do not create a Gear goal loop recursively.",
+            ),
+        }
+    }
+
+    fn tool_policy(self) -> WorkerToolPolicy {
+        match self {
+            Self::Review => WorkerToolPolicy {
+                question: false,
+                allow_recursive_gear_tasks: false,
+                can_write: false,
+                can_review: true,
+                can_explore: true,
+            },
+            Self::Explore | Self::Librarian => WorkerToolPolicy {
+                question: false,
+                allow_recursive_gear_tasks: false,
+                can_write: false,
+                can_review: false,
+                can_explore: true,
+            },
+            Self::ZedNative => WorkerToolPolicy {
+                question: false,
+                allow_recursive_gear_tasks: false,
+                can_write: true,
+                can_review: true,
+                can_explore: true,
+            },
+            Self::Quick | Self::Deep | Self::Repair | Self::Visual | Self::Custom => {
+                WorkerToolPolicy {
+                    question: false,
+                    allow_recursive_gear_tasks: false,
+                    can_write: true,
+                    can_review: false,
+                    can_explore: true,
+                }
+            }
+        }
+    }
 }
 
 impl WorkerConfig {
@@ -221,6 +308,25 @@ impl CategoryRouter {
                     .saturating_sub(1)
                     .min(matching_routes.len().saturating_sub(1));
                 let route = matching_routes[index];
+                let selected_preferred_index = category
+                    .preferred_worker_kinds()
+                    .iter()
+                    .position(|worker_kind| *worker_kind == route.worker_kind)
+                    .unwrap_or(index);
+                let skipped_unavailable_route = category
+                    .preferred_worker_kinds()
+                    .iter()
+                    .take(selected_preferred_index)
+                    .any(|worker_kind| {
+                        config.worker_routes.iter().any(|configured_route| {
+                            configured_route.worker_kind == *worker_kind
+                                && Self::route_model_is_unavailable(
+                                    config,
+                                    configured_route.worker_kind,
+                                    configured_route.worker_model.as_deref(),
+                                )
+                        })
+                    });
                 return SelectedWorkerRoute {
                     worker_kind: route.worker_kind,
                     worker_command: route.worker_command.as_deref(),
@@ -228,10 +334,20 @@ impl CategoryRouter {
                     require_worker: config.require_worker || route.worker_command.is_some(),
                     category,
                     route_reason: format!(
-                        "category `{}` selected attempt {attempt} configured `{}` route",
+                        "category `{}` selected attempt {attempt} configured `{}` route{}",
                         category.as_str(),
-                        route.worker_kind.as_str()
+                        route.worker_kind.as_str(),
+                        if skipped_unavailable_route {
+                            " after skipping an unavailable provider/model route"
+                        } else {
+                            ""
+                        }
                     ),
+                    prompt_append: combined_prompt_append(
+                        category.prompt_append(),
+                        worker_prompt_append_from_env(),
+                    ),
+                    tools: category.tool_policy(),
                 };
             }
 
@@ -258,6 +374,11 @@ impl CategoryRouter {
                             require_worker: config.require_worker,
                             category,
                             route_reason,
+                            prompt_append: combined_prompt_append(
+                                category.prompt_append(),
+                                worker_prompt_append_from_env(),
+                            ),
+                            tools: category.tool_policy(),
                         };
                     }
                 }
@@ -272,10 +393,14 @@ impl CategoryRouter {
         config: &'a WorkerConfig,
         worker_kind: WorkerKind,
     ) -> Option<&'a WorkerRoute> {
-        config
-            .worker_routes
-            .iter()
-            .find(|route| route.worker_kind == worker_kind)
+        config.worker_routes.iter().find(|route| {
+            route.worker_kind == worker_kind
+                && !Self::route_model_is_unavailable(
+                    config,
+                    route.worker_kind,
+                    route.worker_model.as_deref(),
+                )
+        })
     }
 
     fn sequence_route<'a>(
@@ -311,13 +436,33 @@ impl CategoryRouter {
                         config.worker_kind.as_str()
                     )
                 },
+                prompt_append: combined_prompt_append(
+                    category.prompt_append(),
+                    worker_prompt_append_from_env(),
+                ),
+                tools: category.tool_policy(),
             };
         }
 
         let index = attempt
             .saturating_sub(1)
             .min(config.worker_routes.len().saturating_sub(1));
-        let route = &config.worker_routes[index];
+        let selected_route = config
+            .worker_routes
+            .iter()
+            .enumerate()
+            .skip(index)
+            .chain(config.worker_routes.iter().enumerate().take(index))
+            .find(|(_, route)| {
+                !Self::route_model_is_unavailable(
+                    config,
+                    route.worker_kind,
+                    route.worker_model.as_deref(),
+                )
+            })
+            .or_else(|| config.worker_routes.get(index).map(|route| (index, route)));
+        let (selected_route_index, route) = selected_route.expect("worker routes are non-empty");
+        let skipped_unavailable_route = selected_route_index != index;
         SelectedWorkerRoute {
             worker_kind: route.worker_kind,
             worker_command: route.worker_command.as_deref(),
@@ -326,22 +471,339 @@ impl CategoryRouter {
             category,
             route_reason: if hinted_category.is_some() {
                 format!(
-                    "category `{}` fell back to attempt {attempt} route `{}`",
+                    "category `{}` fell back to attempt {attempt} route `{}`{}",
                     category.as_str(),
-                    route.worker_kind.as_str()
+                    route.worker_kind.as_str(),
+                    if skipped_unavailable_route {
+                        " after skipping an unavailable provider/model route"
+                    } else {
+                        ""
+                    }
                 )
             } else {
                 format!(
-                    "attempt {attempt} selected sequence route `{}`",
-                    route.worker_kind.as_str()
+                    "attempt {attempt} selected sequence route `{}`{}",
+                    route.worker_kind.as_str(),
+                    if skipped_unavailable_route {
+                        " after skipping an unavailable provider/model route"
+                    } else {
+                        ""
+                    }
                 )
             },
+            prompt_append: combined_prompt_append(
+                category.prompt_append(),
+                worker_prompt_append_from_env(),
+            ),
+            tools: category.tool_policy(),
         }
     }
+
+    fn route_model_is_unavailable(
+        config: &WorkerConfig,
+        worker_kind: WorkerKind,
+        worker_model: Option<&str>,
+    ) -> bool {
+        worker_model_is_unavailable(worker_kind, worker_model, &config.unavailable_worker_models)
+    }
+}
+
+pub(crate) fn worker_model_is_unavailable(
+    worker_kind: WorkerKind,
+    worker_model: Option<&str>,
+    unavailable_worker_models: &[String],
+) -> bool {
+    let Some(worker_model) = worker_model
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    else {
+        return false;
+    };
+
+    let normalized_worker_model = canonicalize_model_id(worker_model);
+    let qualified_model = worker_kind.provider_id_hint().map(|provider_id| {
+        format!(
+            "{}/{}",
+            canonicalize_provider_id(provider_id),
+            normalized_worker_model
+        )
+    });
+
+    unavailable_worker_models.iter().any(|entry| {
+        let normalized_entry = canonicalize_provider_model_entry(entry);
+        normalized_entry == normalized_worker_model
+            || qualified_model
+                .as_ref()
+                .is_some_and(|qualified| normalized_entry == *qualified)
+    })
+}
+
+pub fn category_resolution_for_route(
+    config: &WorkerConfig,
+    route_attempt: usize,
+    route_hint: Option<&str>,
+    route: &SelectedWorkerRoute<'_>,
+) -> (CategoryResolution, CategoryResolutionResult) {
+    let hinted_category = route_hint.and_then(normalized_route_hint);
+    let available_categories = available_categories(config);
+    let selected_route = FallbackRoute {
+        worker_kind: route.worker_kind,
+        worker_model: route.worker_model.map(ToString::to_string),
+    };
+    let fallback_chain = if let Some(category) = hinted_category {
+        category_available_routes(config, category)
+    } else {
+        sequence_available_routes(config, route_attempt)
+    };
+    let nearest_fallback = fallback_chain
+        .iter()
+        .position(|candidate| *candidate == selected_route)
+        .and_then(|index| fallback_chain.get(index + 1).cloned());
+    let category_resolution = CategoryResolution {
+        prompt_append: route.prompt_append.clone(),
+        available_categories: available_categories.clone(),
+        nearest_fallback: nearest_fallback.clone(),
+        fallback_chain: fallback_chain.clone(),
+        tools: route.tools.clone(),
+    };
+    let resolution_result = if config.skip_worker {
+        CategoryResolutionResult::Disabled {
+            requested_category: route_hint
+                .map(|hint| hint.trim().to_string())
+                .filter(|hint| !hint.is_empty())
+                .unwrap_or_else(|| route.category.as_str().to_string()),
+            available_categories,
+            attempted_provider_model: worker_provider_model(route.worker_kind, route.worker_model),
+            nearest_fallback,
+        }
+    } else if let Some(hinted_category) = hinted_category {
+        let requested_category = hinted_category.as_str().to_string();
+        let configured_routes = category_configured_routes(config, hinted_category);
+        let available_routes = category_available_routes(config, hinted_category);
+        if configured_routes.is_empty() {
+            CategoryResolutionResult::NotFound {
+                requested_category,
+                available_categories,
+                attempted_provider_model: worker_provider_model(
+                    route.worker_kind,
+                    route.worker_model,
+                ),
+                nearest_fallback,
+            }
+        } else if available_routes.is_empty() {
+            CategoryResolutionResult::ModelUnavailable {
+                requested_category,
+                available_categories,
+                attempted_provider_model: worker_provider_model(
+                    route.worker_kind,
+                    route.worker_model,
+                ),
+                nearest_fallback,
+            }
+        } else {
+            CategoryResolutionResult::Resolved {
+                requested_category,
+                available_categories,
+                attempted_provider_model: worker_provider_model(
+                    route.worker_kind,
+                    route.worker_model,
+                ),
+                nearest_fallback,
+            }
+        }
+    } else {
+        CategoryResolutionResult::NotFound {
+            requested_category: route_hint
+                .map(|hint| hint.trim().to_string())
+                .filter(|hint| !hint.is_empty())
+                .unwrap_or_else(|| route.category.as_str().to_string()),
+            available_categories,
+            attempted_provider_model: worker_provider_model(route.worker_kind, route.worker_model),
+            nearest_fallback,
+        }
+    };
+
+    (category_resolution, resolution_result)
 }
 
 fn normalized_route_hint(value: &str) -> Option<WorkerCategory> {
     WorkerCategory::parse(value)
+}
+
+pub(crate) fn route_identity_key(worker_kind: WorkerKind, worker_model: Option<&str>) -> String {
+    let worker_model = worker_model
+        .map(str::trim)
+        .filter(|model| !model.is_empty());
+    match worker_model {
+        Some(worker_model) => provider_model_key(worker_kind, worker_model),
+        None => worker_kind.as_str().to_ascii_lowercase(),
+    }
+}
+
+pub(crate) fn provider_model_key(worker_kind: WorkerKind, worker_model: &str) -> String {
+    let normalized_model = canonicalize_model_id(worker_model);
+    if let Some(provider_id) = worker_kind.provider_id_hint() {
+        format!(
+            "{}/{}",
+            canonicalize_provider_id(provider_id),
+            normalized_model
+        )
+    } else {
+        normalized_model
+    }
+}
+
+fn canonicalize_provider_id(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn canonicalize_model_id(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(|character| character.to_lowercase())
+        .collect()
+}
+
+fn canonicalize_provider_model_entry(value: &str) -> String {
+    let value = value.trim();
+    if let Some((provider_id, worker_model)) = value.split_once('/') {
+        format!(
+            "{}/{}",
+            canonicalize_provider_id(provider_id),
+            canonicalize_model_id(worker_model)
+        )
+    } else {
+        canonicalize_model_id(value)
+    }
+}
+
+fn available_categories(config: &WorkerConfig) -> Vec<String> {
+    all_categories()
+        .iter()
+        .copied()
+        .filter(|category| !category_available_routes(config, *category).is_empty())
+        .map(|category| category.as_str().to_string())
+        .collect()
+}
+
+fn category_available_routes(
+    config: &WorkerConfig,
+    category: WorkerCategory,
+) -> Vec<FallbackRoute> {
+    category_configured_routes(config, category)
+        .into_iter()
+        .filter(|route| {
+            !CategoryRouter::route_model_is_unavailable(
+                config,
+                route.worker_kind,
+                route.worker_model.as_deref(),
+            )
+        })
+        .collect()
+}
+
+fn category_configured_routes(
+    config: &WorkerConfig,
+    category: WorkerCategory,
+) -> Vec<FallbackRoute> {
+    if config.worker_routes.is_empty() {
+        return if category
+            .preferred_worker_kinds()
+            .contains(&config.worker_kind)
+        {
+            vec![FallbackRoute {
+                worker_kind: config.worker_kind,
+                worker_model: config.worker_model.clone(),
+            }]
+        } else {
+            Vec::new()
+        };
+    }
+
+    category
+        .preferred_worker_kinds()
+        .iter()
+        .copied()
+        .filter_map(|worker_kind| {
+            config
+                .worker_routes
+                .iter()
+                .find(|route| route.worker_kind == worker_kind)
+                .map(|route| FallbackRoute {
+                    worker_kind: route.worker_kind,
+                    worker_model: route.worker_model.clone(),
+                })
+        })
+        .collect()
+}
+
+fn sequence_available_routes(config: &WorkerConfig, route_attempt: usize) -> Vec<FallbackRoute> {
+    if config.worker_routes.is_empty() {
+        return vec![FallbackRoute {
+            worker_kind: config.worker_kind,
+            worker_model: config.worker_model.clone(),
+        }];
+    }
+
+    let index = route_attempt
+        .saturating_sub(1)
+        .min(config.worker_routes.len().saturating_sub(1));
+    let routes = config
+        .worker_routes
+        .iter()
+        .enumerate()
+        .skip(index)
+        .chain(config.worker_routes.iter().enumerate().take(index))
+        .filter_map(|(_, route)| {
+            if CategoryRouter::route_model_is_unavailable(
+                config,
+                route.worker_kind,
+                route.worker_model.as_deref(),
+            ) {
+                None
+            } else {
+                Some(FallbackRoute {
+                    worker_kind: route.worker_kind,
+                    worker_model: route.worker_model.clone(),
+                })
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if routes.is_empty() {
+        vec![FallbackRoute {
+            worker_kind: config.worker_routes[index].worker_kind,
+            worker_model: config.worker_routes[index].worker_model.clone(),
+        }]
+    } else {
+        routes
+    }
+}
+
+fn all_categories() -> &'static [WorkerCategory] {
+    &[
+        WorkerCategory::Quick,
+        WorkerCategory::Deep,
+        WorkerCategory::Repair,
+        WorkerCategory::Review,
+        WorkerCategory::Explore,
+        WorkerCategory::Librarian,
+        WorkerCategory::Visual,
+        WorkerCategory::ZedNative,
+        WorkerCategory::Custom,
+    ]
+}
+
+fn worker_provider_model(worker_kind: WorkerKind, worker_model: Option<&str>) -> Option<String> {
+    let worker_model = worker_model
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    if let Some(provider_id) = worker_kind.provider_id_hint() {
+        Some(format!("{provider_id}/{worker_model}"))
+    } else {
+        Some(worker_model.to_string())
+    }
 }
 
 fn shell_single_quote(value: &str) -> String {
@@ -356,6 +818,49 @@ pub struct SelectedWorkerRoute<'a> {
     pub require_worker: bool,
     pub category: WorkerCategory,
     pub route_reason: String,
+    pub prompt_append: Option<String>,
+    pub tools: WorkerToolPolicy,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CategoryResolution {
+    pub prompt_append: Option<String>,
+    #[serde(default)]
+    pub available_categories: Vec<String>,
+    pub nearest_fallback: Option<FallbackRoute>,
+    #[serde(default)]
+    pub fallback_chain: Vec<FallbackRoute>,
+    #[serde(default)]
+    pub tools: WorkerToolPolicy,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CategoryResolutionResult {
+    Resolved {
+        requested_category: String,
+        available_categories: Vec<String>,
+        attempted_provider_model: Option<String>,
+        nearest_fallback: Option<FallbackRoute>,
+    },
+    Disabled {
+        requested_category: String,
+        available_categories: Vec<String>,
+        attempted_provider_model: Option<String>,
+        nearest_fallback: Option<FallbackRoute>,
+    },
+    NotFound {
+        requested_category: String,
+        available_categories: Vec<String>,
+        attempted_provider_model: Option<String>,
+        nearest_fallback: Option<FallbackRoute>,
+    },
+    ModelUnavailable {
+        requested_category: String,
+        available_categories: Vec<String>,
+        attempted_provider_model: Option<String>,
+        nearest_fallback: Option<FallbackRoute>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -370,6 +875,11 @@ pub struct WorkerPacket {
     pub worker: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_append: Option<String>,
+    pub tools: WorkerToolPolicy,
+    pub category_resolution: CategoryResolution,
+    pub category_resolution_result: CategoryResolutionResult,
     pub goal: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coordinator_model: Option<CoordinatorModel>,
@@ -420,6 +930,8 @@ pub struct WorkerResult {
 pub struct WorkerOutcome {
     pub status: WorkerStatus,
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub session_capability: Option<String>,
     pub summary: String,
     pub changed_files: Vec<String>,
     pub commands_run: Vec<String>,
@@ -427,6 +939,114 @@ pub struct WorkerOutcome {
     pub raw_output_path: Option<PathBuf>,
     pub command: Option<String>,
     pub exit_code: Option<i32>,
+}
+
+pub type WorkerTurnOutcome = WorkerResult;
+
+pub type WorkerEventListener = Arc<dyn Fn(WorkerEvent) + Send + Sync>;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerEvent {
+    TurnStarted {
+        kind: String,
+        prompt_path: PathBuf,
+    },
+    AssistantTextDelta {
+        kind: String,
+        delta: String,
+    },
+    ToolCallStarted {
+        kind: String,
+        tool_name: String,
+        #[serde(default)]
+        arguments: String,
+    },
+    ToolCallFinished {
+        kind: String,
+        tool_name: String,
+        #[serde(default)]
+        result: String,
+    },
+    WorkerStdout {
+        kind: String,
+        output: String,
+    },
+    WorkerStderr {
+        kind: String,
+        output: String,
+    },
+    TurnFinished {
+        kind: String,
+        result_path: PathBuf,
+        outcome_path: PathBuf,
+        summary: String,
+    },
+    Error {
+        kind: String,
+        message: String,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct WorkerSubscription {
+    subscriptions: Weak<WorkerSessionSubscriptions>,
+    subscription_id: usize,
+}
+
+impl WorkerSubscription {
+    pub fn noop() -> Self {
+        Self {
+            subscriptions: Weak::new(),
+            subscription_id: 0,
+        }
+    }
+}
+
+#[derive(Default)]
+struct WorkerSessionSubscriptions {
+    listeners: Mutex<HashMap<usize, WorkerEventListener>>,
+    next_listener_id: AtomicUsize,
+}
+
+impl WorkerSessionSubscriptions {
+    fn subscribe(self: &Arc<Self>, listener: WorkerEventListener) -> Result<WorkerSubscription> {
+        let subscription_id = self.next_listener_id.fetch_add(1, Ordering::Relaxed);
+        self.listeners
+            .lock()
+            .map_err(|_| anyhow::anyhow!("worker session subscription mutex poisoned"))?
+            .insert(subscription_id, listener);
+        Ok(WorkerSubscription {
+            subscriptions: Arc::downgrade(self),
+            subscription_id,
+        })
+    }
+
+    fn emit(&self, event: WorkerEvent) {
+        let listeners = self
+            .listeners
+            .lock()
+            .map(|listeners| listeners.values().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for listener in listeners {
+            listener(event.clone());
+        }
+    }
+
+    fn unsubscribe(&self, subscription_id: usize) {
+        let _ = self
+            .listeners
+            .lock()
+            .map(|mut listeners| listeners.remove(&subscription_id));
+    }
+}
+
+impl Drop for WorkerSubscription {
+    fn drop(&mut self) {
+        if let Some(subscriptions) = self.subscriptions.upgrade() {
+            subscriptions.unsubscribe(self.subscription_id);
+        }
+    }
 }
 
 pub struct WorkerStartRequest<'a> {
@@ -492,6 +1112,18 @@ pub trait WorkerSessionHandle: Send + Sync {
     fn steer(&self, prompt: String) -> Result<()>;
     fn interrupt(&self) -> Result<()>;
     fn cancel(&self) -> Result<()>;
+    fn abort(&self) -> Result<()> {
+        self.cancel()
+    }
+    fn dispose(&self) -> Result<()> {
+        Ok(())
+    }
+    fn subscribe(&self, _listener: WorkerEventListener) -> Result<WorkerSubscription> {
+        bail!("worker session does not support event subscriptions")
+    }
+    fn wait_for_idle(&self) -> Result<WorkerTurnOutcome> {
+        self.wait_for_result()
+    }
     fn wait_for_outcome(&self) -> Result<WorkerOutcome>;
     fn wait_for_result(&self) -> Result<WorkerResult>;
     fn last_output(&self) -> Option<String>;
@@ -652,11 +1284,17 @@ fn start_command_backed_worker(
         route_hint,
     } = request;
     let route = config.selected_route_for_hint(route_attempt, route_hint);
+    let (category_resolution, category_resolution_result) =
+        category_resolution_for_route(config, route_attempt, route_hint, &route);
     let worker_name = route.worker_kind.as_str();
     let packet = WorkerPacket {
         task_id: task.id.clone(),
         worker: worker_name.to_string(),
         worker_model: route.worker_model.map(ToString::to_string),
+        prompt_append: route.prompt_append.clone(),
+        tools: route.tools.clone(),
+        category_resolution,
+        category_resolution_result,
         goal: goal.to_string(),
         coordinator_model: coordinator_model.cloned(),
         coordinator_brief: coordinator_brief.map(ToString::to_string),
@@ -693,6 +1331,10 @@ fn start_command_backed_worker(
 
     let prompt = worker_prompt(&packet)?;
     let prompt_path = store.write_worker_file(&task.id, "prompt.md", &prompt)?;
+    if supports_interaction {
+        store.write_worker_file(&task.id, "transcript.jsonl", "")?;
+        store.write_worker_file(&task.id, "tool-events.jsonl", "")?;
+    }
 
     Ok(Arc::new(CommandWorkerSessionHandle {
         store: store.clone(),
@@ -703,11 +1345,13 @@ fn start_command_backed_worker(
         command: route.worker_command.map(ToString::to_string),
         packet_path,
         prompt_path,
+        subscriptions: Arc::new(WorkerSessionSubscriptions::default()),
         session_state: Mutex::new(ResidentSessionState {
             cancellation_token: cancellation_token.unwrap_or_else(CancellationToken::new),
             active_command: false,
             revive_count: 0,
             interrupt_count: 0,
+            turn_epoch: 0,
             stale_reason: None,
         }),
         result: Mutex::new(None),
@@ -726,6 +1370,7 @@ struct CommandWorkerSessionHandle {
     command: Option<String>,
     packet_path: PathBuf,
     prompt_path: PathBuf,
+    subscriptions: Arc<WorkerSessionSubscriptions>,
     session_state: Mutex<ResidentSessionState>,
     result: Mutex<Option<WorkerResult>>,
     last_output: Mutex<Option<String>>,
@@ -739,10 +1384,49 @@ struct ResidentSessionState {
     active_command: bool,
     revive_count: usize,
     interrupt_count: usize,
+    turn_epoch: usize,
     stale_reason: Option<String>,
 }
 
 impl CommandWorkerSessionHandle {
+    fn emit_event(&self, event: WorkerEvent) -> Result<()> {
+        if !self.supports_interaction {
+            return Ok(());
+        }
+
+        let event_json =
+            serde_json::to_string(&event).context("failed to serialize worker event")?;
+        let line = format!("{event_json}\n");
+        self.store
+            .append_worker_file(&self.task_id, "transcript.jsonl", &line)?;
+        match &event {
+            WorkerEvent::TurnStarted { .. }
+            | WorkerEvent::TurnFinished { .. }
+            | WorkerEvent::ToolCallStarted { .. }
+            | WorkerEvent::ToolCallFinished { .. }
+            | WorkerEvent::Error { .. } => {
+                self.store
+                    .append_worker_file(&self.task_id, "tool-events.jsonl", &line)?;
+            }
+            WorkerEvent::AssistantTextDelta { .. }
+            | WorkerEvent::WorkerStdout { .. }
+            | WorkerEvent::WorkerStderr { .. } => {}
+        }
+        self.subscriptions.emit(event);
+        Ok(())
+    }
+
+    fn turn_kind_from_files(stdout_file: &str, stderr_file: &str) -> String {
+        if stdout_file == "stdout.log" && stderr_file == "stderr.log" {
+            return "run".to_string();
+        }
+        stdout_file
+            .strip_suffix("-stdout.log")
+            .or_else(|| stderr_file.strip_suffix("-stderr.log"))
+            .unwrap_or(stdout_file)
+            .to_string()
+    }
+
     fn execute(&self) -> Result<WorkerResult> {
         if let Some(result) = self
             .result
@@ -814,6 +1498,14 @@ impl CommandWorkerSessionHandle {
         stderr_file: &str,
     ) -> Result<WorkerResult> {
         let command = self.command.as_deref().context("worker command missing")?;
+        let turn_kind = Self::turn_kind_from_files(stdout_file, stderr_file);
+        self.with_session_state(|state| {
+            state.turn_epoch += 1;
+        })?;
+        self.emit_event(WorkerEvent::TurnStarted {
+            kind: turn_kind.clone(),
+            prompt_path: prompt_path.to_path_buf(),
+        })?;
         let cancellation_token = self.with_session_state(|state| {
             state.active_command = true;
             state.cancellation_token.clone()
@@ -850,16 +1542,40 @@ impl CommandWorkerSessionHandle {
                 state.stale_reason = None;
             }
         })?;
-        let output = output?;
+        let output = match output {
+            Ok(output) => output,
+            Err(error) => {
+                self.emit_event(WorkerEvent::Error {
+                    kind: turn_kind,
+                    message: format!("{error:#}"),
+                })?;
+                return Err(error);
+            }
+        };
         let stdout_path =
             self.store
                 .write_worker_file(&self.task_id, stdout_file, &output.stdout)?;
         let stderr_path =
             self.store
                 .write_worker_file(&self.task_id, stderr_file, &output.stderr)?;
+        self.store.write_worker_file(
+            &self.task_id,
+            "partial-output.md",
+            &format!(
+                "# Gear worker partial output\n\n## stdout\n\n{}\n\n## stderr\n\n{}\n",
+                output.stdout, output.stderr
+            ),
+        )?;
+        self.emit_event(WorkerEvent::WorkerStdout {
+            kind: turn_kind.clone(),
+            output: output.stdout.clone(),
+        })?;
+        self.emit_event(WorkerEvent::WorkerStderr {
+            kind: turn_kind.clone(),
+            output: output.stderr.clone(),
+        })?;
         let last_message_path = last_message_path.exists().then_some(last_message_path);
-
-        Ok(WorkerResult {
+        let result = WorkerResult {
             status: if output.success {
                 WorkerStatus::Succeeded
             } else {
@@ -879,7 +1595,20 @@ impl CommandWorkerSessionHandle {
             last_message_path,
             result_path: self.store.worker_dir(&self.task_id).join("result.json"),
             outcome_path: self.store.worker_dir(&self.task_id).join("outcome.json"),
-        })
+        };
+        self.emit_event(WorkerEvent::TurnFinished {
+            kind: turn_kind.clone(),
+            result_path: result.result_path.clone(),
+            outcome_path: result.outcome_path.clone(),
+            summary: result.summary.clone(),
+        })?;
+        let turn_epoch = self.with_session_state(|state| state.turn_epoch)?;
+        self.store.write_worker_file(
+            &self.task_id,
+            &format!("turn-{turn_epoch}-result.json"),
+            &format!("{}\n", serde_json::to_string_pretty(&result)?),
+        )?;
+        Ok(result)
     }
 
     fn run_interaction(&self, prompt: String, kind: &str) -> Result<()> {
@@ -1027,6 +1756,32 @@ impl WorkerSessionHandle for CommandWorkerSessionHandle {
         Ok(())
     }
 
+    fn abort(&self) -> Result<()> {
+        self.cancel()
+    }
+
+    fn dispose(&self) -> Result<()> {
+        if self.supports_interaction {
+            self.store.write_worker_file(
+                &self.task_id,
+                "dispose.md",
+                "# Gear worker dispose\n\nGear disposed the resident worker session.\n",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn subscribe(&self, listener: WorkerEventListener) -> Result<WorkerSubscription> {
+        if !self.supports_interaction {
+            bail!("command-backed worker sessions do not support event subscriptions");
+        }
+        self.subscriptions.subscribe(listener)
+    }
+
+    fn wait_for_idle(&self) -> Result<WorkerTurnOutcome> {
+        self.wait_for_result()
+    }
+
     fn wait_for_outcome(&self) -> Result<WorkerOutcome> {
         Ok(worker_outcome_from_result(&self.execute()?))
     }
@@ -1046,6 +1801,14 @@ impl WorkerSessionHandle for CommandWorkerSessionHandle {
 pub fn worker_prompt(packet: &WorkerPacket) -> Result<String> {
     let packet_json =
         serde_json::to_string_pretty(packet).context("failed to serialize worker prompt packet")?;
+    let prompt_append = packet
+        .prompt_append
+        .as_deref()
+        .map(str::trim)
+        .filter(|append| !append.is_empty())
+        .map(|append| format!("\n## Route instructions\n\n{}\n", append))
+        .unwrap_or_default();
+    let model_metadata = worker_model_metadata(packet);
 
     Ok(format!(
         r#"# Gear worker packet
@@ -1056,6 +1819,15 @@ You are a `{}` worker controlled by Gearbox Gear. Treat this packet as the contr
 {}
 ```
 
+## Model metadata
+
+{}
+
+## Tool policy
+
+{}
+
+{}
 Return a concise report with:
 
 - summary
@@ -1064,8 +1836,79 @@ Return a concise report with:
 - known_failures
 - next_steps
 "#,
-        packet.worker, packet_json
+        packet.worker,
+        packet_json,
+        model_metadata,
+        packet.tools.to_markdown(),
+        prompt_append
     ))
+}
+
+fn worker_prompt_append_from_env() -> Option<String> {
+    env::var("GEARBOX_GEAR_WORKER_PROMPT_APPEND")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn combined_prompt_append(
+    builtin_append: Option<&'static str>,
+    user_append: Option<String>,
+) -> Option<String> {
+    let mut pieces = Vec::new();
+    if let Some(builtin_append) = builtin_append
+        .map(str::trim)
+        .filter(|append| !append.is_empty())
+    {
+        pieces.push(builtin_append.to_string());
+    }
+    if let Some(user_append) = user_append
+        .map(|append| append.trim().to_string())
+        .filter(|append| !append.is_empty())
+    {
+        pieces.push(user_append);
+    }
+
+    if pieces.is_empty() {
+        None
+    } else {
+        Some(pieces.join("\n\n"))
+    }
+}
+
+fn worker_model_metadata(packet: &WorkerPacket) -> String {
+    let mut fields = HashMap::new();
+    fields.insert("worker_kind".to_string(), packet.worker.clone());
+    if let Some(worker_model) = packet.worker_model.as_ref() {
+        fields.insert("worker_model".to_string(), worker_model.clone());
+    }
+    if let Some(coordinator_model) = packet.coordinator_model.as_ref() {
+        fields.insert(
+            "coordinator_provider_id".to_string(),
+            coordinator_model.provider_id.clone(),
+        );
+        fields.insert(
+            "coordinator_model_id".to_string(),
+            coordinator_model.model_id.clone(),
+        );
+        fields.insert(
+            "coordinator_name".to_string(),
+            coordinator_model.name.clone(),
+        );
+    }
+
+    let sanitized = sanitize_model_fields(&fields);
+    if sanitized.is_empty() {
+        return "none".to_string();
+    }
+
+    let mut entries = sanitized.into_iter().collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    entries
+        .into_iter()
+        .map(|(key, value)| format!("- {key}: {value}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 pub fn worker_outcome_from_result(result: &WorkerResult) -> WorkerOutcome {
@@ -1073,6 +1916,7 @@ pub fn worker_outcome_from_result(result: &WorkerResult) -> WorkerOutcome {
     WorkerOutcome {
         status: result.status.clone(),
         session_id: None,
+        session_capability: None,
         summary: parsed_report
             .summary
             .unwrap_or_else(|| result.summary.clone()),
@@ -1298,6 +2142,36 @@ pub fn write_result_and_outcome(
     Ok(())
 }
 
+pub fn sanitize_model_fields(fields: &HashMap<String, String>) -> HashMap<String, String> {
+    let secret_keys: &[&str] = &[
+        "apikey",
+        "authorization",
+        "bearertoken",
+        "clientsecret",
+        "password",
+        "privatekey",
+        "secret",
+        "secretkey",
+        "token",
+    ];
+
+    fields
+        .iter()
+        .map(|(key, value)| {
+            let normalized = key
+                .to_ascii_lowercase()
+                .chars()
+                .filter(|character| character.is_alphanumeric())
+                .collect::<String>();
+            if secret_keys.iter().any(|secret| normalized == *secret) {
+                (key.clone(), "***REDACTED***".to_string())
+            } else {
+                (key.clone(), value.clone())
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1352,6 +2226,15 @@ mod tests {
         assert_eq!(first.worker_kind, WorkerKind::Opencode);
         assert_eq!(first.worker_command, Some("opencode run"));
         assert!(first.require_worker);
+        assert!(
+            first
+                .prompt_append
+                .as_ref()
+                .expect("prompt append")
+                .contains("Focus on implementation")
+        );
+        assert!(first.tools.can_write);
+        assert!(!first.tools.question);
 
         let second = config.selected_route(2);
         assert_eq!(second.worker_kind, WorkerKind::Codex);
@@ -1360,6 +2243,34 @@ mod tests {
 
         let later = config.selected_route(8);
         assert_eq!(later.worker_kind, WorkerKind::Codex);
+    }
+
+    #[test]
+    fn prompt_append_combines_builtin_and_user_append() {
+        let combined =
+            combined_prompt_append(Some("builtin append"), Some("user append".to_string()));
+        let combined = combined.expect("combined append");
+        assert!(combined.contains("builtin append"));
+        assert!(combined.contains("user append"));
+        assert!(combined.contains("\n\n"));
+    }
+
+    #[test]
+    fn worker_tool_policy_disables_question_by_default() {
+        let policy = WorkerToolPolicy::default();
+        assert!(!policy.question);
+        assert!(!policy.allow_recursive_gear_tasks);
+        assert!(!policy.can_write);
+        assert!(!policy.can_review);
+        assert!(!policy.can_explore);
+
+        let review_policy = WorkerCategory::Review.tool_policy();
+        assert!(review_policy.can_review);
+        assert!(!review_policy.can_write);
+
+        let explore_policy = WorkerCategory::Explore.tool_policy();
+        assert!(explore_policy.can_explore);
+        assert!(!explore_policy.can_write);
     }
 
     #[test]
@@ -1493,6 +2404,143 @@ mod tests {
     }
 
     #[test]
+    fn category_router_skips_unavailable_provider_model_routes() {
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::Opencode,
+            worker_command: Some("opencode run".to_string()),
+            worker_model: None,
+            worker_routes: vec![
+                WorkerRoute {
+                    worker_kind: WorkerKind::Opencode,
+                    worker_command: Some("opencode run".to_string()),
+                    worker_model: None,
+                },
+                WorkerRoute {
+                    worker_kind: WorkerKind::Codex,
+                    worker_command: Some("codex exec".to_string()),
+                    worker_model: Some("gpt.5-1".to_string()),
+                },
+                WorkerRoute {
+                    worker_kind: WorkerKind::Claude,
+                    worker_command: Some("claude -p".to_string()),
+                    worker_model: Some("claude-3-7-sonnet".to_string()),
+                },
+                WorkerRoute {
+                    worker_kind: WorkerKind::ZedAgent,
+                    worker_command: Some("zed agent".to_string()),
+                    worker_model: None,
+                },
+            ],
+            unavailable_worker_models: vec!["OpenAI/GPT-5.1".to_string()],
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: false,
+        };
+
+        let deep = CategoryRouter::default().resolve(&config, 1, Some("deep"));
+        assert_eq!(deep.worker_kind, WorkerKind::Claude);
+        assert!(
+            deep.route_reason
+                .contains("skipping an unavailable provider/model route")
+        );
+
+        let sequence = CategoryRouter::default().resolve(&config, 2, None);
+        assert_eq!(sequence.worker_kind, WorkerKind::Claude);
+        assert!(
+            sequence
+                .route_reason
+                .contains("skipping an unavailable provider/model route")
+        );
+    }
+
+    #[test]
+    fn category_resolution_for_route_reports_model_unavailability() {
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::Opencode,
+            worker_command: Some("opencode run".to_string()),
+            worker_model: None,
+            worker_routes: vec![WorkerRoute {
+                worker_kind: WorkerKind::Codex,
+                worker_command: Some("codex exec".to_string()),
+                worker_model: Some("gpt.5-1".to_string()),
+            }],
+            unavailable_worker_models: vec!["OpenAI/GPT-5.1".to_string()],
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: false,
+        };
+
+        let route = config.selected_route_for_hint(1, Some("deep"));
+        let (resolution, result) = category_resolution_for_route(&config, 1, Some("deep"), &route);
+
+        assert!(resolution.available_categories.is_empty());
+        assert_eq!(resolution.nearest_fallback, None);
+        assert!(matches!(
+            result,
+            CategoryResolutionResult::ModelUnavailable {
+                requested_category,
+                attempted_provider_model,
+                ..
+            } if requested_category == "deep"
+                && attempted_provider_model.as_deref() == Some("openai/gpt.5-1")
+        ));
+    }
+
+    #[test]
+    fn category_resolution_for_route_reports_distinct_nearest_fallback() {
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::Opencode,
+            worker_command: Some("opencode run".to_string()),
+            worker_model: None,
+            worker_routes: vec![
+                WorkerRoute {
+                    worker_kind: WorkerKind::Codex,
+                    worker_command: Some("codex exec".to_string()),
+                    worker_model: Some("gpt.5-1".to_string()),
+                },
+                WorkerRoute {
+                    worker_kind: WorkerKind::Claude,
+                    worker_command: Some("claude code".to_string()),
+                    worker_model: Some("claude-3.5".to_string()),
+                },
+            ],
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: false,
+        };
+
+        let route = config.selected_route_for_hint(1, Some("deep"));
+        let (resolution, result) = category_resolution_for_route(&config, 1, Some("deep"), &route);
+
+        assert_eq!(
+            resolution.nearest_fallback,
+            Some(FallbackRoute {
+                worker_kind: WorkerKind::Claude,
+                worker_model: Some("claude-3.5".to_string()),
+            })
+        );
+        assert!(matches!(
+            result,
+            CategoryResolutionResult::Resolved {
+                requested_category,
+                attempted_provider_model,
+                ..
+            } if requested_category == "deep"
+                && attempted_provider_model.as_deref() == Some("openai/gpt.5-1")
+        ));
+    }
+
+    #[test]
     fn command_backed_worker_adapters_report_worker_identity() {
         assert_eq!(OpencodeCommandWorker {}.kind(), WorkerKind::Opencode);
         assert_eq!(OpencodeCommandWorker {}.name(), "opencode_command");
@@ -1526,6 +2574,7 @@ mod tests {
             status: crate::state::TaskStatus::Pending,
             assigned_worker: Some("codex".to_string()),
             attempt: 1,
+            parent_task_id: None,
             scope: Scope::new(Vec::new(), Vec::new(), 10),
             inputs: crate::state::TaskInputs::default(),
             outputs: crate::state::TaskOutputs::default(),
@@ -1626,6 +2675,22 @@ mod tests {
             Ok(())
         }
 
+        fn abort(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn dispose(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn subscribe(&self, _listener: WorkerEventListener) -> Result<WorkerSubscription> {
+            Ok(WorkerSubscription::noop())
+        }
+
+        fn wait_for_idle(&self) -> Result<WorkerTurnOutcome> {
+            Ok(self.result.clone())
+        }
+
         fn wait_for_outcome(&self) -> Result<WorkerOutcome> {
             Ok(worker_outcome_from_result(&self.result))
         }
@@ -1652,6 +2717,7 @@ mod tests {
             status: crate::state::TaskStatus::Pending,
             assigned_worker: Some("zed_agent".to_string()),
             attempt: 1,
+            parent_task_id: None,
             scope: Scope::new(Vec::new(), Vec::new(), 10),
             inputs: crate::state::TaskInputs::default(),
             outputs: crate::state::TaskOutputs::default(),
@@ -1706,6 +2772,7 @@ mod tests {
             status: crate::state::TaskStatus::Pending,
             assigned_worker: Some("opencode".to_string()),
             attempt: 1,
+            parent_task_id: None,
             scope: Scope::new(Vec::new(), Vec::new(), 10),
             inputs: crate::state::TaskInputs::default(),
             outputs: crate::state::TaskOutputs::default(),
@@ -1768,6 +2835,7 @@ mod tests {
             status: crate::state::TaskStatus::Pending,
             assigned_worker: Some("codex".to_string()),
             attempt: 1,
+            parent_task_id: None,
             scope: Scope::new(Vec::new(), Vec::new(), 10),
             inputs: crate::state::TaskInputs::default(),
             outputs: crate::state::TaskOutputs::default(),
@@ -1823,6 +2891,7 @@ mod tests {
             status: crate::state::TaskStatus::Pending,
             assigned_worker: Some("opencode".to_string()),
             attempt: 1,
+            parent_task_id: None,
             scope: Scope::new(Vec::new(), Vec::new(), 10),
             inputs: crate::state::TaskInputs::default(),
             outputs: crate::state::TaskOutputs::default(),
@@ -1880,6 +2949,7 @@ mod tests {
             status: crate::state::TaskStatus::Pending,
             assigned_worker: Some("custom".to_string()),
             attempt: 1,
+            parent_task_id: None,
             scope: Scope::new(Vec::new(), Vec::new(), 10),
             inputs: crate::state::TaskInputs::default(),
             outputs: crate::state::TaskOutputs::default(),
@@ -1944,6 +3014,7 @@ mod tests {
             status: crate::state::TaskStatus::Pending,
             assigned_worker: Some("opencode_session".to_string()),
             attempt: 1,
+            parent_task_id: None,
             scope: Scope::new(Vec::new(), Vec::new(), 10),
             inputs: crate::state::TaskInputs::default(),
             outputs: crate::state::TaskOutputs::default(),
@@ -1976,6 +3047,16 @@ mod tests {
             route_hint: None,
         })?;
 
+        let emitted_events = Arc::new(Mutex::new(Vec::new()));
+        let subscription = handle.subscribe(Arc::new({
+            let emitted_events = emitted_events.clone();
+            move |event| {
+                if let Ok(mut events) = emitted_events.lock() {
+                    events.push(event);
+                }
+            }
+        }))?;
+
         assert_eq!(
             handle.session_id().as_deref(),
             Some("task_opencode_session_session")
@@ -1997,6 +3078,25 @@ mod tests {
         );
         assert!(store.worker_dir(&task.id).join("follow-up-1.md").exists());
         assert!(store.worker_dir(&task.id).join("steer-2.md").exists());
+        assert!(store.worker_dir(&task.id).join("transcript.jsonl").exists());
+        assert!(
+            store
+                .worker_dir(&task.id)
+                .join("tool-events.jsonl")
+                .exists()
+        );
+        let transcript =
+            std::fs::read_to_string(store.worker_dir(&task.id).join("transcript.jsonl"))?;
+        assert!(transcript.contains("\"turn_started\""));
+        assert!(transcript.contains("\"turn_finished\""));
+        let events = emitted_events
+            .lock()
+            .map_err(|_| anyhow::anyhow!("worker event mutex poisoned"))?;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            WorkerEvent::TurnStarted { kind, .. } if kind == "run"
+        )));
+        drop(subscription);
         Ok(())
     }
 
@@ -2013,6 +3113,7 @@ mod tests {
             status: crate::state::TaskStatus::Pending,
             assigned_worker: Some("opencode_session".to_string()),
             attempt: 1,
+            parent_task_id: None,
             scope: Scope::new(Vec::new(), Vec::new(), 10),
             inputs: crate::state::TaskInputs::default(),
             outputs: crate::state::TaskOutputs::default(),
@@ -2073,6 +3174,7 @@ mod tests {
             status: crate::state::TaskStatus::Pending,
             assigned_worker: Some("opencode_session".to_string()),
             attempt: 1,
+            parent_task_id: None,
             scope: Scope::new(Vec::new(), Vec::new(), 10),
             inputs: crate::state::TaskInputs::default(),
             outputs: crate::state::TaskOutputs::default(),
@@ -2118,5 +3220,589 @@ mod tests {
         assert!(store.worker_dir(&task.id).join("interrupt-1.md").exists());
         assert!(store.worker_dir(&task.id).join("revive-1.md").exists());
         Ok(())
+    }
+
+    #[test]
+    fn worker_subscribe_writes_transcript_events() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = Task {
+            id: "task_subscribe_transcript".to_string(),
+            goal_id: "goal_test".to_string(),
+            title: "test subscribe transcript".to_string(),
+            kind: crate::state::TaskKind::Edit,
+            status: crate::state::TaskStatus::Pending,
+            assigned_worker: Some("opencode_session".to_string()),
+            attempt: 1,
+            parent_task_id: None,
+            scope: Scope::new(Vec::new(), Vec::new(), 10),
+            inputs: crate::state::TaskInputs::default(),
+            outputs: crate::state::TaskOutputs::default(),
+        };
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::OpencodeSession,
+            worker_command: Some("printf hello-worker".to_string()),
+            worker_model: None,
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: true,
+        };
+
+        let handle = OpencodeSessionWorker {}.start(WorkerStartRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &task,
+            route_attempt: 1,
+            goal: "test goal",
+            verification_commands: &[],
+            config: &config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        })?;
+
+        let received_events = Arc::new(Mutex::new(Vec::new()));
+        let _subscription = handle.subscribe(Arc::new({
+            let received_events = received_events.clone();
+            move |event| {
+                if let Ok(mut events) = received_events.lock() {
+                    events.push(event);
+                }
+            }
+        }))?;
+
+        handle.wait_for_result()?;
+
+        assert!(store.worker_dir(&task.id).join("transcript.jsonl").exists());
+        assert!(
+            store
+                .worker_dir(&task.id)
+                .join("tool-events.jsonl")
+                .exists()
+        );
+        let transcript =
+            std::fs::read_to_string(store.worker_dir(&task.id).join("transcript.jsonl"))?;
+        assert!(transcript.contains("\"turn_started\""));
+        assert!(transcript.contains("\"turn_finished\""));
+
+        let events = received_events
+            .lock()
+            .map_err(|_| anyhow::anyhow!("worker event mutex poisoned"))?;
+        let turn_started_count = events
+            .iter()
+            .filter(|event| matches!(event, WorkerEvent::TurnStarted { .. }))
+            .count();
+        assert_eq!(
+            turn_started_count, 1,
+            "should have received 1 turn_started event"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dispose_is_idempotent() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = Task {
+            id: "task_dispose_idempotent".to_string(),
+            goal_id: "goal_test".to_string(),
+            title: "test dispose idempotent".to_string(),
+            kind: crate::state::TaskKind::Edit,
+            status: crate::state::TaskStatus::Pending,
+            assigned_worker: Some("opencode_session".to_string()),
+            attempt: 1,
+            parent_task_id: None,
+            scope: Scope::new(Vec::new(), Vec::new(), 10),
+            inputs: crate::state::TaskInputs::default(),
+            outputs: crate::state::TaskOutputs::default(),
+        };
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::OpencodeSession,
+            worker_command: Some("printf disposable".to_string()),
+            worker_model: None,
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: true,
+        };
+
+        let handle = OpencodeSessionWorker {}.start(WorkerStartRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &task,
+            route_attempt: 1,
+            goal: "test goal",
+            verification_commands: &[],
+            config: &config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        })?;
+
+        handle.dispose()?;
+        handle.dispose()?;
+        handle.dispose()?;
+
+        assert!(store.worker_dir(&task.id).join("dispose.md").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn abort_after_cancel_does_not_prevent_dispose() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = Task {
+            id: "task_abort_cancel_dispose".to_string(),
+            goal_id: "goal_test".to_string(),
+            title: "test abort cancel dispose".to_string(),
+            kind: crate::state::TaskKind::Edit,
+            status: crate::state::TaskStatus::Pending,
+            assigned_worker: Some("opencode_session".to_string()),
+            attempt: 1,
+            parent_task_id: None,
+            scope: Scope::new(Vec::new(), Vec::new(), 10),
+            inputs: crate::state::TaskInputs::default(),
+            outputs: crate::state::TaskOutputs::default(),
+        };
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::OpencodeSession,
+            worker_command: Some("printf resilient".to_string()),
+            worker_model: None,
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: true,
+        };
+
+        let handle = OpencodeSessionWorker {}.start(WorkerStartRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &task,
+            route_attempt: 1,
+            goal: "test goal",
+            verification_commands: &[],
+            config: &config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        })?;
+
+        handle.wait_for_result()?;
+        handle.cancel()?;
+        handle.abort()?;
+        handle.dispose()?;
+
+        assert!(store.worker_dir(&task.id).join("dispose.md").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn follow_up_while_idle_begins_new_turn() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = Task {
+            id: "task_follow_up_idle_new_turn".to_string(),
+            goal_id: "goal_test".to_string(),
+            title: "test follow up idle new turn".to_string(),
+            kind: crate::state::TaskKind::Edit,
+            status: crate::state::TaskStatus::Pending,
+            assigned_worker: Some("opencode_session".to_string()),
+            attempt: 1,
+            parent_task_id: None,
+            scope: Scope::new(Vec::new(), Vec::new(), 10),
+            inputs: crate::state::TaskInputs::default(),
+            outputs: crate::state::TaskOutputs::default(),
+        };
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::OpencodeSession,
+            worker_command: Some("sh -c 'cat \"$GEARBOX_WORKER_PROMPT\"'".to_string()),
+            worker_model: None,
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: true,
+        };
+
+        let handle = OpencodeSessionWorker {}.start(WorkerStartRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &task,
+            route_attempt: 1,
+            goal: "test goal",
+            verification_commands: &[],
+            config: &config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        })?;
+
+        // Initial turn completes -> handle is idle
+        handle.wait_for_result()?;
+
+        // follow_up while idle should begin a new turn
+        handle.send_follow_up("second turn instruction".to_string())?;
+
+        assert!(
+            handle
+                .last_output()
+                .as_deref()
+                .is_some_and(|output| output.contains("second turn instruction"))
+        );
+        // The initial turn is turn-1, follow-up turn is turn-2
+        assert!(
+            store
+                .worker_dir(&task.id)
+                .join("turn-1-result.json")
+                .exists()
+        );
+        assert!(
+            store
+                .worker_dir(&task.id)
+                .join("turn-2-result.json")
+                .exists()
+        );
+        assert!(store.worker_dir(&task.id).join("follow-up-1.md").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn wait_for_idle_waits_for_latest_revived_turn() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = Task {
+            id: "task_wait_for_idle_revived".to_string(),
+            goal_id: "goal_test".to_string(),
+            title: "test wait for idle revived".to_string(),
+            kind: crate::state::TaskKind::Edit,
+            status: crate::state::TaskStatus::Pending,
+            assigned_worker: Some("opencode_session".to_string()),
+            attempt: 1,
+            parent_task_id: None,
+            scope: Scope::new(Vec::new(), Vec::new(), 10),
+            inputs: crate::state::TaskInputs::default(),
+            outputs: crate::state::TaskOutputs::default(),
+        };
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::OpencodeSession,
+            worker_command: Some("sh -c 'cat \"$GEARBOX_WORKER_PROMPT\"'".to_string()),
+            worker_model: None,
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: true,
+        };
+
+        let handle = OpencodeSessionWorker {}.start(WorkerStartRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &task,
+            route_attempt: 1,
+            goal: "test goal",
+            verification_commands: &[],
+            config: &config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        })?;
+
+        // Complete initial turn, cancel, then revive with follow_up
+        handle.wait_for_result()?;
+        handle.cancel()?;
+        handle.send_follow_up("revived instruction".to_string())?;
+
+        // wait_for_idle should wait for the revived follow-up turn
+        let revived_result = handle.wait_for_idle()?;
+        assert_eq!(revived_result.status, WorkerStatus::Succeeded);
+        assert!(revived_result.summary.contains("worker command completed."));
+        assert!(store.worker_dir(&task.id).join("revive-1.md").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn command_worker_unsupported_subscribe_is_explicit() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = Task {
+            id: "task_unsupported_subscribe".to_string(),
+            goal_id: "goal_test".to_string(),
+            title: "test unsupported subscribe".to_string(),
+            kind: crate::state::TaskKind::Edit,
+            status: crate::state::TaskStatus::Pending,
+            assigned_worker: Some("opencode".to_string()),
+            attempt: 1,
+            parent_task_id: None,
+            scope: Scope::new(Vec::new(), Vec::new(), 10),
+            inputs: crate::state::TaskInputs::default(),
+            outputs: crate::state::TaskOutputs::default(),
+        };
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::Opencode,
+            worker_command: Some("printf no-subscribe".to_string()),
+            worker_model: None,
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: true,
+        };
+
+        let handle = OpencodeCommandWorker {}.start(WorkerStartRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &task,
+            route_attempt: 1,
+            goal: "test goal",
+            verification_commands: &[],
+            config: &config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        })?;
+
+        let result = handle.subscribe(Arc::new(|_| {}));
+        assert!(
+            result.is_err(),
+            "command worker should explicitly reject subscribe"
+        );
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("do not support event subscriptions"),
+            "error should mention unsupported subscription, got: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn category_resolution_default_fields() {
+        let resolution = CategoryResolution::default();
+        assert_eq!(resolution.prompt_append, None);
+        assert!(resolution.available_categories.is_empty());
+        assert_eq!(resolution.nearest_fallback, None);
+        assert!(resolution.fallback_chain.is_empty());
+    }
+
+    #[test]
+    fn category_resolution_deserializes_missing_fields() {
+        let json = r#"{}"#;
+        let resolution: CategoryResolution = serde_json::from_str(json).expect("should parse");
+        assert_eq!(resolution.prompt_append, None);
+        assert!(resolution.available_categories.is_empty());
+        assert_eq!(resolution.nearest_fallback, None);
+        assert!(resolution.fallback_chain.is_empty());
+
+        let json_with_prompt = r#"{"prompt_append":"extra context"}"#;
+        let resolution: CategoryResolution =
+            serde_json::from_str(json_with_prompt).expect("should parse");
+        assert_eq!(resolution.prompt_append.as_deref(), Some("extra context"));
+        assert!(resolution.available_categories.is_empty());
+    }
+
+    #[test]
+    fn category_resolution_result_roundtrips_through_json() {
+        let resolved = CategoryResolutionResult::Resolved {
+            requested_category: "deep".to_string(),
+            available_categories: vec!["quick".to_string(), "deep".to_string()],
+            attempted_provider_model: Some("gpt-5".to_string()),
+            nearest_fallback: Some(FallbackRoute {
+                worker_kind: WorkerKind::Codex,
+                worker_model: Some("gpt-4".to_string()),
+            }),
+        };
+        let json = serde_json::to_string(&resolved).expect("should serialize");
+        let back: CategoryResolutionResult =
+            serde_json::from_str(&json).expect("should deserialize");
+        assert_eq!(back, resolved);
+
+        let disabled = CategoryResolutionResult::Disabled {
+            requested_category: "repair".to_string(),
+            available_categories: vec![],
+            attempted_provider_model: None,
+            nearest_fallback: None,
+        };
+        let json = serde_json::to_string(&disabled).expect("should serialize");
+        let back: CategoryResolutionResult =
+            serde_json::from_str(&json).expect("should deserialize");
+        assert_eq!(back, disabled);
+
+        let not_found = CategoryResolutionResult::NotFound {
+            requested_category: "unknown".to_string(),
+            available_categories: vec!["quick".to_string()],
+            attempted_provider_model: None,
+            nearest_fallback: None,
+        };
+        let json = serde_json::to_string(&not_found).expect("should serialize");
+        let back: CategoryResolutionResult =
+            serde_json::from_str(&json).expect("should deserialize");
+        assert_eq!(back, not_found);
+
+        let model_unavailable = CategoryResolutionResult::ModelUnavailable {
+            requested_category: "deep".to_string(),
+            available_categories: vec!["deep".to_string()],
+            attempted_provider_model: Some("slow-model".to_string()),
+            nearest_fallback: Some(FallbackRoute {
+                worker_kind: WorkerKind::Claude,
+                worker_model: None,
+            }),
+        };
+        let json = serde_json::to_string(&model_unavailable).expect("should serialize");
+        let back: CategoryResolutionResult =
+            serde_json::from_str(&json).expect("should deserialize");
+        assert_eq!(back, model_unavailable);
+    }
+
+    #[test]
+    fn sanitize_model_fields_redacts_secret_keys() {
+        let mut fields = HashMap::new();
+        fields.insert("apiKey".to_string(), "secret123".to_string());
+        fields.insert("Authorization".to_string(), "Bearer token".to_string());
+        fields.insert("client_secret".to_string(), "abc".to_string());
+        fields.insert("password".to_string(), "hunter2".to_string());
+        fields.insert("private_key".to_string(), "key-data".to_string());
+        fields.insert("secret".to_string(), "shh".to_string());
+        fields.insert("secretKey".to_string(), "sk-123".to_string());
+        fields.insert("token".to_string(), "tok-456".to_string());
+
+        let sanitized = sanitize_model_fields(&fields);
+        assert_eq!(sanitized.get("apiKey"), Some(&"***REDACTED***".to_string()));
+        assert_eq!(
+            sanitized.get("Authorization"),
+            Some(&"***REDACTED***".to_string())
+        );
+        assert_eq!(
+            sanitized.get("client_secret"),
+            Some(&"***REDACTED***".to_string())
+        );
+        assert_eq!(
+            sanitized.get("password"),
+            Some(&"***REDACTED***".to_string())
+        );
+        assert_eq!(
+            sanitized.get("private_key"),
+            Some(&"***REDACTED***".to_string())
+        );
+        assert_eq!(sanitized.get("secret"), Some(&"***REDACTED***".to_string()));
+        assert_eq!(
+            sanitized.get("secretKey"),
+            Some(&"***REDACTED***".to_string())
+        );
+        assert_eq!(sanitized.get("token"), Some(&"***REDACTED***".to_string()));
+    }
+
+    #[test]
+    fn sanitize_model_fields_preserves_non_secret_keys() {
+        let mut fields = HashMap::new();
+        fields.insert("model".to_string(), "gpt-5".to_string());
+        fields.insert("temperature".to_string(), "0.7".to_string());
+        fields.insert(
+            "endpoint".to_string(),
+            "https://api.example.com".to_string(),
+        );
+
+        let sanitized = sanitize_model_fields(&fields);
+        assert_eq!(sanitized.get("model"), Some(&"gpt-5".to_string()));
+        assert_eq!(sanitized.get("temperature"), Some(&"0.7".to_string()));
+        assert_eq!(
+            sanitized.get("endpoint"),
+            Some(&"https://api.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn sanitize_model_fields_handles_mixed_keys() {
+        let mut fields = HashMap::new();
+        fields.insert("apiKey".to_string(), "secret".to_string());
+        fields.insert("model".to_string(), "gpt-5".to_string());
+        fields.insert("bearer_token".to_string(), "tok".to_string());
+        fields.insert("timeout".to_string(), "30".to_string());
+
+        let sanitized = sanitize_model_fields(&fields);
+        assert_eq!(sanitized.get("apiKey"), Some(&"***REDACTED***".to_string()));
+        assert_eq!(sanitized.get("model"), Some(&"gpt-5".to_string()));
+        assert_eq!(
+            sanitized.get("bearer_token"),
+            Some(&"***REDACTED***".to_string())
+        );
+        assert_eq!(sanitized.get("timeout"), Some(&"30".to_string()));
+    }
+
+    #[test]
+    fn sanitize_model_fields_normalizes_bearer_token() {
+        let mut fields = HashMap::new();
+        fields.insert("bearer token".to_string(), "tok1".to_string());
+        fields.insert("BearerToken".to_string(), "tok2".to_string());
+        fields.insert("bearer-token".to_string(), "tok3".to_string());
+
+        let sanitized = sanitize_model_fields(&fields);
+        assert_eq!(
+            sanitized.get("bearer token"),
+            Some(&"***REDACTED***".to_string())
+        );
+        assert_eq!(
+            sanitized.get("BearerToken"),
+            Some(&"***REDACTED***".to_string())
+        );
+        assert_eq!(
+            sanitized.get("bearer-token"),
+            Some(&"***REDACTED***".to_string())
+        );
+    }
+
+    #[test]
+    fn fallback_route_equality_and_serde() {
+        let route_a = FallbackRoute {
+            worker_kind: WorkerKind::Codex,
+            worker_model: Some("gpt-5".to_string()),
+        };
+        let route_b = FallbackRoute {
+            worker_kind: WorkerKind::Codex,
+            worker_model: Some("gpt-5".to_string()),
+        };
+        let route_c = FallbackRoute {
+            worker_kind: WorkerKind::Claude,
+            worker_model: Some("gpt-5".to_string()),
+        };
+
+        assert_eq!(route_a, route_b);
+        assert_ne!(route_a, route_c);
+
+        let json = serde_json::to_string(&route_a).expect("should serialize");
+        let back: FallbackRoute = serde_json::from_str(&json).expect("should deserialize");
+        assert_eq!(back, route_a);
     }
 }

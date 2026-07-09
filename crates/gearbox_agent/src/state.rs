@@ -7,6 +7,8 @@ use chrono::Local;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::runtime::{DEFAULT_MAX_PROVIDER_UNKNOWN_STREAK, DEFAULT_MAX_RUNTIME_MINUTES};
+
 pub fn timestamp() -> String {
     Local::now().to_rfc3339()
 }
@@ -57,6 +59,11 @@ pub struct Budget {
     pub max_worker_calls: usize,
     pub max_premium_worker_calls: usize,
     pub max_repair_attempts_per_error: usize,
+    #[serde(default = "default_max_provider_unknown_streak")]
+    pub max_provider_unknown_streak: usize,
+    #[serde(default = "default_max_child_depth")]
+    pub max_child_depth: usize,
+    #[serde(default = "default_max_runtime_minutes")]
     pub max_runtime_minutes: usize,
 }
 
@@ -66,9 +73,23 @@ impl Default for Budget {
             max_worker_calls: 8,
             max_premium_worker_calls: 2,
             max_repair_attempts_per_error: 2,
-            max_runtime_minutes: 60,
+            max_provider_unknown_streak: DEFAULT_MAX_PROVIDER_UNKNOWN_STREAK,
+            max_child_depth: usize::MAX,
+            max_runtime_minutes: DEFAULT_MAX_RUNTIME_MINUTES,
         }
     }
+}
+
+fn default_max_provider_unknown_streak() -> usize {
+    DEFAULT_MAX_PROVIDER_UNKNOWN_STREAK
+}
+
+fn default_max_child_depth() -> usize {
+    usize::MAX
+}
+
+fn default_max_runtime_minutes() -> usize {
+    DEFAULT_MAX_RUNTIME_MINUTES
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,6 +126,8 @@ impl GoalStatus {
 pub struct Task {
     pub id: String,
     pub goal_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_task_id: Option<String>,
     pub title: String,
     pub kind: TaskKind,
     pub status: TaskStatus,
@@ -216,6 +239,7 @@ pub enum EventKind {
     WorkerWaiting,
     WorkerFinished,
     WorkerFailed,
+    CompletionNotified,
     DiffDetected,
     VerificationStarted,
     VerificationFailed,
@@ -351,6 +375,25 @@ impl StateStore {
         fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
         let path = dir.join(file_name);
         fs::write(&path, contents)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        Ok(path)
+    }
+
+    pub fn append_worker_file(
+        &self,
+        task_id: &str,
+        file_name: &str,
+        contents: &str,
+    ) -> Result<PathBuf> {
+        let dir = self.worker_dir(task_id);
+        fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+        let path = dir.join(file_name);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        file.write_all(contents.as_bytes())
             .with_context(|| format!("failed to write {}", path.display()))?;
         Ok(path)
     }

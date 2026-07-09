@@ -450,7 +450,9 @@ fn zed_ai_description(
         Some(Plan::ZedPro) => {
             "You have access to Gearbox hosted models through your Pro subscription."
         }
-        Some(Plan::ZedProTrial) => "You have access to Gearbox hosted models through your Pro trial.",
+        Some(Plan::ZedProTrial) => {
+            "You have access to Gearbox hosted models through your Pro trial."
+        }
         Some(Plan::ZedStudent) => {
             "You have access to Gearbox hosted models through your Student subscription."
         }
@@ -522,17 +524,24 @@ impl RenderOnce for ZedAiConfiguration {
                 .gap_2()
                 .when(!self.compact, |this| this.child(Label::new(description)))
                 .child(
-                    Button::new("sign_in", if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") { "登录以使用 Gearbox AI" } else { "Sign In to use Zed AI" })
-                        .start_icon(
-                            Icon::new(IconName::Github)
-                                .size(IconSize::Small)
-                                .color(Color::Muted),
-                        )
-                        .when(!self.compact, |this| this.full_width())
-                        .on_click({
-                            let callback = self.sign_in_callback.clone();
-                            move |_, window, cx| (callback)(window, cx)
-                        }),
+                    Button::new(
+                        "sign_in",
+                        if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") {
+                            "登录以使用 Gearbox AI"
+                        } else {
+                            "Sign In to use Zed AI"
+                        },
+                    )
+                    .start_icon(
+                        Icon::new(IconName::Github)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .when(!self.compact, |this| this.full_width())
+                    .on_click({
+                        let callback = self.sign_in_callback.clone();
+                        move |_, window, cx| (callback)(window, cx)
+                    }),
                 );
         }
 

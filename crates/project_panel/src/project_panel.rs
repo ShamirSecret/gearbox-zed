@@ -1166,11 +1166,10 @@ impl ProjectPanel {
                                 )
                             })
                             .when(is_dir, |menu| {
-                                menu.separator()
-                                    .action(
-                                        gearbox_label("Find in Folder…", "在文件夹中查找..."),
-                                        Box::new(NewSearchInDirectory),
-                                    )
+                                menu.separator().action(
+                                    gearbox_label("Find in Folder…", "在文件夹中查找..."),
+                                    Box::new(NewSearchInDirectory),
+                                )
                             })
                             .when(is_unfoldable, |menu| {
                                 menu.action(
@@ -1185,11 +1184,10 @@ impl ProjectPanel {
                                 )
                             })
                             .when(should_show_compare, |menu| {
-                                menu.separator()
-                                    .action(
-                                        gearbox_label("Compare Marked Files", "比较已标记文件"),
-                                        Box::new(CompareMarkedFiles),
-                                    )
+                                menu.separator().action(
+                                    gearbox_label("Compare Marked Files", "比较已标记文件"),
+                                    Box::new(CompareMarkedFiles),
+                                )
                             })
                             .separator()
                             .action(gearbox_label("Cut", "剪切"), Box::new(Cut))
@@ -1213,11 +1211,10 @@ impl ProjectPanel {
                                 )
                             })
                             .when(is_remote, |menu| {
-                                menu.separator()
-                                    .action(
-                                        gearbox_label("Download...", "下载..."),
-                                        Box::new(DownloadFromRemote),
-                                    )
+                                menu.separator().action(
+                                    gearbox_label("Download...", "下载..."),
+                                    Box::new(DownloadFromRemote),
+                                )
                             })
                             .separator()
                             .action(

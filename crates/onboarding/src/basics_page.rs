@@ -61,48 +61,48 @@ fn render_theme_section(tab_index: &mut isize, cx: &mut App) -> impl IntoElement
                 .justify_between()
                 .child(Label::new(gearbox_text("Theme", "主题")))
                 .child(
-                ToggleButtonGroup::single_row(
-                    "theme-selector-onboarding-dark-light",
-                    [
-                        ThemeAppearanceMode::Light,
-                        ThemeAppearanceMode::Dark,
-                        ThemeAppearanceMode::System,
-                    ]
-                    .map(|mode| {
-                        const MODE_NAMES: [SharedString; 3] = [
-                            SharedString::new_static("Light"),
-                            SharedString::new_static("Dark"),
-                            SharedString::new_static("System"),
-                        ];
-                        const GEARBOX_MODE_NAMES: [SharedString; 3] = [
-                            SharedString::new_static("浅色"),
-                            SharedString::new_static("深色"),
-                            SharedString::new_static("跟随系统"),
-                        ];
-                        ToggleButtonSimple::new(
-                            if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") {
-                                GEARBOX_MODE_NAMES[mode as usize].clone()
-                            } else {
-                                MODE_NAMES[mode as usize].clone()
-                            },
-                            move |_, _, cx| {
-                                write_mode_change(mode, cx);
+                    ToggleButtonGroup::single_row(
+                        "theme-selector-onboarding-dark-light",
+                        [
+                            ThemeAppearanceMode::Light,
+                            ThemeAppearanceMode::Dark,
+                            ThemeAppearanceMode::System,
+                        ]
+                        .map(|mode| {
+                            const MODE_NAMES: [SharedString; 3] = [
+                                SharedString::new_static("Light"),
+                                SharedString::new_static("Dark"),
+                                SharedString::new_static("System"),
+                            ];
+                            const GEARBOX_MODE_NAMES: [SharedString; 3] = [
+                                SharedString::new_static("浅色"),
+                                SharedString::new_static("深色"),
+                                SharedString::new_static("跟随系统"),
+                            ];
+                            ToggleButtonSimple::new(
+                                if std::env::var("GEARBOX_GUI").as_deref() == Ok("1") {
+                                    GEARBOX_MODE_NAMES[mode as usize].clone()
+                                } else {
+                                    MODE_NAMES[mode as usize].clone()
+                                },
+                                move |_, _, cx| {
+                                    write_mode_change(mode, cx);
 
-                                telemetry::event!(
-                                    "Welcome Theme mode Changed",
-                                    from = theme_mode,
-                                    to = mode
-                                );
-                            },
-                        )
-                    }),
-                )
-                .size(ToggleButtonGroupSize::Medium)
-                .tab_index(tab_index)
-                .selected_index(theme_mode as usize)
-                .style(ui::ToggleButtonGroupStyle::Outlined)
-                .width(rems_from_px(3. * 64.)),
-            ),
+                                    telemetry::event!(
+                                        "Welcome Theme mode Changed",
+                                        from = theme_mode,
+                                        to = mode
+                                    );
+                                },
+                            )
+                        }),
+                    )
+                    .size(ToggleButtonGroupSize::Medium)
+                    .tab_index(tab_index)
+                    .selected_index(theme_mode as usize)
+                    .style(ui::ToggleButtonGroupStyle::Outlined)
+                    .width(rems_from_px(3. * 64.)),
+                ),
         )
         .child(
             h_flex()
@@ -304,12 +304,10 @@ fn render_telemetry_section(tab_index: &mut isize, cx: &App) -> impl IntoElement
             SwitchField::new(
                 "onboarding-telemetry-crash-reports",
                 None::<&str>,
-                Some(
-                    gearbox_text(
-                        "Help fix Zed by sending crash reports so we can fix critical issues fast",
-                        "发送崩溃报告，帮助我们更快修复严重问题",
-                    ),
-                ),
+                Some(gearbox_text(
+                    "Help fix Zed by sending crash reports so we can fix critical issues fast",
+                    "发送崩溃报告，帮助我们更快修复严重问题",
+                )),
                 if TelemetrySettings::get_global(cx).diagnostics {
                     ui::ToggleState::Selected
                 } else {
@@ -361,39 +359,47 @@ fn render_base_keymap_section(tab_index: &mut isize, cx: &mut App) -> impl IntoE
         .gap_2()
         .child(Label::new(gearbox_text("Base Keymap", "基础快捷键方案")))
         .child(
-        ToggleButtonGroup::two_rows(
-            "base_keymap_selection",
-            [
-                ToggleButtonWithIcon::new("VS Code", IconName::EditorVsCode, |_, _, cx| {
-                    write_keymap_base(BaseKeymap::VSCode, cx);
-                }),
-                ToggleButtonWithIcon::new("JetBrains", IconName::EditorJetBrains, |_, _, cx| {
-                    write_keymap_base(BaseKeymap::JetBrains, cx);
-                }),
-                ToggleButtonWithIcon::new("Sublime Text", IconName::EditorSublime, |_, _, cx| {
-                    write_keymap_base(BaseKeymap::SublimeText, cx);
-                }),
-            ],
-            [
-                ToggleButtonWithIcon::new("Atom", IconName::EditorAtom, |_, _, cx| {
-                    write_keymap_base(BaseKeymap::Atom, cx);
-                }),
-                ToggleButtonWithIcon::new("Emacs", IconName::EditorEmacs, |_, _, cx| {
-                    write_keymap_base(BaseKeymap::Emacs, cx);
-                }),
-                ToggleButtonWithIcon::new("Cursor", IconName::EditorCursor, |_, _, cx| {
-                    write_keymap_base(BaseKeymap::Cursor, cx);
-                }),
-            ],
-        )
-        .when_some(base_keymap, |this, base_keymap| {
-            this.selected_index(base_keymap)
-        })
-        .full_width()
-        .tab_index(tab_index)
-        .size(ui::ToggleButtonGroupSize::Medium)
-        .style(ui::ToggleButtonGroupStyle::Outlined),
-    );
+            ToggleButtonGroup::two_rows(
+                "base_keymap_selection",
+                [
+                    ToggleButtonWithIcon::new("VS Code", IconName::EditorVsCode, |_, _, cx| {
+                        write_keymap_base(BaseKeymap::VSCode, cx);
+                    }),
+                    ToggleButtonWithIcon::new(
+                        "JetBrains",
+                        IconName::EditorJetBrains,
+                        |_, _, cx| {
+                            write_keymap_base(BaseKeymap::JetBrains, cx);
+                        },
+                    ),
+                    ToggleButtonWithIcon::new(
+                        "Sublime Text",
+                        IconName::EditorSublime,
+                        |_, _, cx| {
+                            write_keymap_base(BaseKeymap::SublimeText, cx);
+                        },
+                    ),
+                ],
+                [
+                    ToggleButtonWithIcon::new("Atom", IconName::EditorAtom, |_, _, cx| {
+                        write_keymap_base(BaseKeymap::Atom, cx);
+                    }),
+                    ToggleButtonWithIcon::new("Emacs", IconName::EditorEmacs, |_, _, cx| {
+                        write_keymap_base(BaseKeymap::Emacs, cx);
+                    }),
+                    ToggleButtonWithIcon::new("Cursor", IconName::EditorCursor, |_, _, cx| {
+                        write_keymap_base(BaseKeymap::Cursor, cx);
+                    }),
+                ],
+            )
+            .when_some(base_keymap, |this, base_keymap| {
+                this.selected_index(base_keymap)
+            })
+            .full_width()
+            .tab_index(tab_index)
+            .size(ui::ToggleButtonGroupSize::Medium)
+            .style(ui::ToggleButtonGroupStyle::Outlined),
+        );
 
     fn write_keymap_base(keymap_base: BaseKeymap, cx: &App) {
         let fs = <dyn Fs>::global(cx);
@@ -462,7 +468,10 @@ fn render_worktree_auto_trust_switch(tab_index: &mut isize, cx: &mut App) -> imp
 
     SwitchField::new(
         "onboarding-auto-trust-worktrees",
-        Some(gearbox_text("Trust All Projects By Default", "默认信任所有项目")),
+        Some(gearbox_text(
+            "Trust All Projects By Default",
+            "默认信任所有项目",
+        )),
         Some(gearbox_text(
             "Automatically mark all new projects as trusted to unlock all Zed's features",
             "自动将所有新项目标记为受信任，以启用 Gearbox 的完整功能",
@@ -555,7 +564,7 @@ fn render_import_settings_section(tab_index: &mut isize, cx: &mut App) -> impl I
                         "Automatically pull your settings from other editors",
                         "自动从其他编辑器导入你的设置",
                     ))
-                        .color(Color::Muted),
+                    .color(Color::Muted),
                 ),
         )
         .child(h_flex().gap_1().child(vscode).child(cursor))
@@ -735,7 +744,7 @@ fn render_ai_section(user_store: &Entity<UserStore>, cx: &mut App) -> impl IntoE
                 "Install your favorite agents and start your first thread.",
                 "安装你常用的 Agent，然后开始第一个对话。",
             ))
-                .color(Color::Muted),
+            .color(Color::Muted),
         )
         .child(grid)
 }
