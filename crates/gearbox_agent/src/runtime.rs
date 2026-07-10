@@ -3101,53 +3101,7 @@ where
         .collect()
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-fn evaluate_goal(
-    verification_passed: bool,
-    worker_status: &WorkerStatus,
-    worker_category: WorkerCategory,
-    require_worker: bool,
-    worker_failure_kind: Option<&TaskFailureKind>,
-    worker_retry_reason: Option<&str>,
-    scope_check: &crate::tools::ScopeCheck,
-    coordinator_review: Option<&CoordinatorReview>,
-    provider_unknown_streak: usize,
-    repeated_failure_streak: usize,
-    iteration: usize,
-    budget: &BudgetController,
-    budget_snapshot: &BudgetSnapshot,
-    no_progress_signals: &[String],
-    nearest_fallback_available: bool,
-) -> GoalEvaluation {
-    // Unit-test wrapper: provide a default delegated ownership so test-only
-    // callers (20+ evaluation unit tests) are not blocked by the gate.
-    // Real orchestrator runs pass their own ownership via evaluate_goal_with_source.
-    let test_ownership = crate::state::ExecutionOwnership {
-        delegated: true,
-        worker_kind: Some("test".to_string()),
-        route_reason: "unit test default (not a real orchestrator run)".to_string(),
-        risk_profile: "low".to_string(),
-    };
-    evaluate_goal_with_source(
-        verification_passed,
-        worker_status,
-        worker_category,
-        require_worker,
-        worker_failure_kind,
-        worker_retry_reason,
-        scope_check,
-        coordinator_review,
-        provider_unknown_streak,
-        repeated_failure_streak,
-        iteration,
-        budget,
-        budget_snapshot,
-        no_progress_signals,
-        nearest_fallback_available,
-        None,
-        Some(&test_ownership),
-    )
-}
+
 
 fn evaluate_goal_with_source(
     verification_passed: bool,
@@ -3613,6 +3567,7 @@ mod tests {
     use anyhow::Result;
 
     use super::*;
+    use crate::test_support::test_support as ts;
     use crate::tools::ScopeCheck;
     use crate::workers::{WorkerKind, WorkerStatus};
 
@@ -3735,7 +3690,7 @@ mod tests {
     #[test]
     fn evaluation_mentions_non_required_worker_failure_when_verification_passes() {
         let scope_check = crate::tools::ScopeCheck::default();
-        let evaluation = evaluate_goal(
+        let evaluation = evaluate_goal_with_source(
             true,
             &WorkerStatus::Failed,
             WorkerCategory::Quick,
@@ -3751,6 +3706,13 @@ mod tests {
             &BudgetSnapshot::default(),
             &[],
             false,
+            None,
+            Some(&crate::state::ExecutionOwnership {
+                delegated: true,
+                worker_kind: Some("test_worker".to_string()),
+                route_reason: "unit test ownership".to_string(),
+                risk_profile: "low".to_string(),
+            }),
         );
 
         assert_eq!(evaluation.status, GoalStatus::Complete);
@@ -3771,7 +3733,7 @@ mod tests {
             raw_response: "STOP_REASON: needs_user".to_string(),
         };
 
-        let evaluation = evaluate_goal(
+        let evaluation = evaluate_goal_with_source(
             false,
             &WorkerStatus::Succeeded,
             WorkerCategory::Quick,
@@ -3787,6 +3749,8 @@ mod tests {
             &BudgetSnapshot::default(),
             &[],
             true,
+            None,
+            None,
         );
 
         assert_eq!(evaluation.status, GoalStatus::NeedsUser);
@@ -3805,7 +3769,7 @@ mod tests {
             raw_response: "GOAL_SATISFIED: unknown\nROUTE_HINT: review".to_string(),
         };
 
-        let evaluation = evaluate_goal(
+        let evaluation = evaluate_goal_with_source(
             true,
             &WorkerStatus::Succeeded,
             WorkerCategory::Deep,
@@ -3821,6 +3785,8 @@ mod tests {
             &BudgetSnapshot::default(),
             &[],
             false,
+            None,
+            None,
         );
 
         assert_eq!(evaluation.status, GoalStatus::Running);
@@ -3841,7 +3807,7 @@ mod tests {
                 .to_string(),
         };
 
-        let evaluation = evaluate_goal(
+        let evaluation = evaluate_goal_with_source(
             true,
             &WorkerStatus::Succeeded,
             WorkerCategory::Deep,
@@ -3857,6 +3823,8 @@ mod tests {
             &BudgetSnapshot::default(),
             &[],
             false,
+            None,
+            None,
         );
 
         assert_eq!(evaluation.status, GoalStatus::Running);
@@ -3876,7 +3844,7 @@ mod tests {
             raw_response: "GOAL_SATISFIED: unknown".to_string(),
         };
 
-        let evaluation = evaluate_goal(
+        let evaluation = evaluate_goal_with_source(
             true,
             &WorkerStatus::Succeeded,
             WorkerCategory::Repair,
@@ -3892,6 +3860,8 @@ mod tests {
             &BudgetSnapshot::default(),
             &[],
             false,
+            None,
+            None,
         );
 
         assert_eq!(evaluation.status, GoalStatus::Running);
@@ -3912,7 +3882,7 @@ mod tests {
             raw_response: "GOAL_SATISFIED: unknown".to_string(),
         };
 
-        let evaluation = evaluate_goal(
+        let evaluation = evaluate_goal_with_source(
             true,
             &WorkerStatus::Succeeded,
             WorkerCategory::Repair,
@@ -3928,6 +3898,8 @@ mod tests {
             &BudgetSnapshot::default(),
             &[],
             false,
+            None,
+            None,
         );
 
         assert_eq!(evaluation.status, GoalStatus::Running);
@@ -3951,7 +3923,7 @@ mod tests {
             ..BudgetController::default()
         };
 
-        let evaluation = evaluate_goal(
+        let evaluation = evaluate_goal_with_source(
             true,
             &WorkerStatus::Succeeded,
             WorkerCategory::Repair,
@@ -3967,6 +3939,8 @@ mod tests {
             &BudgetSnapshot::default(),
             &[],
             false,
+            None,
+            None,
         );
 
         assert_eq!(evaluation.status, GoalStatus::Running);
@@ -3978,7 +3952,7 @@ mod tests {
     #[test]
     fn evaluation_maps_worker_fallback_limit_to_limited() {
         let scope_check = crate::tools::ScopeCheck::default();
-        let evaluation = evaluate_goal(
+        let evaluation = evaluate_goal_with_source(
             false,
             &WorkerStatus::Failed,
             WorkerCategory::Deep,
@@ -3994,6 +3968,8 @@ mod tests {
             &BudgetSnapshot::default(),
             &[],
             true,
+            None,
+            None,
         );
 
         assert_eq!(evaluation.status, GoalStatus::Limited);
@@ -4004,7 +3980,7 @@ mod tests {
     #[test]
     fn evaluation_maps_premium_budget_limit_to_limited() {
         let scope_check = crate::tools::ScopeCheck::default();
-        let evaluation = evaluate_goal(
+        let evaluation = evaluate_goal_with_source(
             false,
             &WorkerStatus::Skipped,
             WorkerCategory::Deep,
@@ -4020,6 +3996,8 @@ mod tests {
             &BudgetSnapshot::default(),
             &[],
             false,
+            None,
+            None,
         );
 
         assert_eq!(evaluation.status, GoalStatus::Limited);
@@ -4039,7 +4017,7 @@ mod tests {
             worker_call_count: 1,
             ..BudgetSnapshot::default()
         };
-        let evaluation = evaluate_goal(
+        let evaluation = evaluate_goal_with_source(
             false,
             &WorkerStatus::Failed,
             WorkerCategory::Deep,
@@ -4055,6 +4033,8 @@ mod tests {
             &snapshot,
             &[],
             true,
+            None,
+            None,
         );
 
         assert_eq!(evaluation.status, GoalStatus::Limited);
@@ -4065,7 +4045,7 @@ mod tests {
     #[test]
     fn evaluation_limits_when_no_fallback_available() {
         let scope_check = crate::tools::ScopeCheck::default();
-        let evaluation = evaluate_goal(
+        let evaluation = evaluate_goal_with_source(
             false,
             &WorkerStatus::Failed,
             WorkerCategory::Quick,
@@ -4081,6 +4061,8 @@ mod tests {
             &BudgetSnapshot::default(),
             &[],
             false,
+            None,
+            None,
         );
 
         assert_eq!(evaluation.status, GoalStatus::Limited);
@@ -4091,7 +4073,7 @@ mod tests {
     #[test]
     fn evaluation_continues_on_first_iteration_when_no_fallback() {
         let scope_check = crate::tools::ScopeCheck::default();
-        let evaluation = evaluate_goal(
+        let evaluation = evaluate_goal_with_source(
             false,
             &WorkerStatus::Failed,
             WorkerCategory::Quick,
@@ -4107,6 +4089,8 @@ mod tests {
             &BudgetSnapshot::default(),
             &[],
             false,
+            None,
+            None,
         );
 
         assert_eq!(evaluation.status, GoalStatus::Running);
@@ -4436,7 +4420,7 @@ mod tests {
             worker_call_count: 0,
             ..BudgetSnapshot::default()
         };
-        let first_evaluation = evaluate_goal(
+        let first_evaluation = evaluate_goal_with_source(
             false,
             &WorkerStatus::Failed,
             WorkerCategory::Deep,
@@ -4452,6 +4436,8 @@ mod tests {
             &first_snapshot,
             &[],
             true,
+            None,
+            None,
         );
         assert!(first_evaluation.should_continue);
 
@@ -4459,7 +4445,7 @@ mod tests {
             worker_call_count: 1,
             ..BudgetSnapshot::default()
         };
-        let second_evaluation = evaluate_goal(
+        let second_evaluation = evaluate_goal_with_source(
             false,
             &WorkerStatus::Failed,
             WorkerCategory::Deep,
@@ -4475,6 +4461,8 @@ mod tests {
             &second_snapshot,
             &[],
             true,
+            None,
+            None,
         );
         assert_eq!(second_evaluation.status, GoalStatus::Limited);
         assert!(!second_evaluation.should_continue);
@@ -4708,7 +4696,7 @@ mod tests {
             max_provider_unknown_streak: 2,
             ..BudgetController::default()
         };
-        let evaluation = evaluate_goal(
+        let evaluation = evaluate_goal_with_source(
             false,
             &WorkerStatus::Failed,
             WorkerCategory::Quick,
@@ -4724,6 +4712,8 @@ mod tests {
             &BudgetSnapshot::default(),
             &[],
             false,
+            None,
+            None,
         );
 
         assert_eq!(evaluation.status, GoalStatus::Limited);
@@ -4743,7 +4733,7 @@ mod tests {
             runtime_elapsed_minutes: 1,
             ..BudgetSnapshot::default()
         };
-        let evaluation = evaluate_goal(
+        let evaluation = evaluate_goal_with_source(
             false,
             &WorkerStatus::Failed,
             WorkerCategory::Quick,
@@ -4759,6 +4749,8 @@ mod tests {
             &snapshot,
             &[],
             false,
+            None,
+            None,
         );
 
         assert_eq!(evaluation.status, GoalStatus::Limited);
@@ -4944,7 +4936,7 @@ mod tests {
             context_risk_signals: vec!["token limit reported".to_string()],
             ..BudgetSnapshot::default()
         };
-        let evaluation = evaluate_goal(
+        let evaluation = evaluate_goal_with_source(
             false,
             &WorkerStatus::Failed,
             WorkerCategory::Quick,
@@ -4960,6 +4952,8 @@ mod tests {
             &snapshot,
             &[],
             false,
+            None,
+            None,
         );
 
         assert_eq!(evaluation.status, GoalStatus::NeedsUser);
@@ -4978,7 +4972,7 @@ mod tests {
             ],
             ..BudgetSnapshot::default()
         };
-        let evaluation = evaluate_goal(
+        let evaluation = evaluate_goal_with_source(
             true,
             &WorkerStatus::Succeeded,
             WorkerCategory::Quick,
@@ -4994,6 +4988,8 @@ mod tests {
             &snapshot,
             &[],
             false,
+            None,
+            None,
         );
 
         assert_eq!(evaluation.status, GoalStatus::NeedsUser);
@@ -5006,7 +5002,7 @@ mod tests {
     #[test]
     fn evaluation_maps_required_worker_unavailable_to_needs_user() {
         let scope_check = crate::tools::ScopeCheck::default();
-        let evaluation = evaluate_goal(
+        let evaluation = evaluate_goal_with_source(
             false,
             &WorkerStatus::Skipped,
             WorkerCategory::Repair,
@@ -5022,6 +5018,8 @@ mod tests {
             &BudgetSnapshot::default(),
             &[],
             false,
+            None,
+            None,
         );
 
         assert_eq!(evaluation.status, GoalStatus::NeedsUser);
@@ -5045,7 +5043,7 @@ mod tests {
             raw_response: "GOAL_SATISFIED: yes\nSTOP_REASON: complete".to_string(),
         };
 
-        let evaluation = evaluate_goal(
+        let evaluation = evaluate_goal_with_source(
             false,
             &WorkerStatus::Succeeded,
             WorkerCategory::Repair,
@@ -5061,6 +5059,8 @@ mod tests {
             &BudgetSnapshot::default(),
             &[],
             false,
+            None,
+            None,
         );
 
         assert_eq!(evaluation.status, GoalStatus::Running);
@@ -5070,7 +5070,7 @@ mod tests {
     #[test]
     fn evaluation_escalates_repeated_failures_to_deep() {
         let scope_check = crate::tools::ScopeCheck::default();
-        let evaluation = evaluate_goal(
+        let evaluation = evaluate_goal_with_source(
             false,
             &WorkerStatus::Failed,
             WorkerCategory::Repair,
@@ -5086,6 +5086,8 @@ mod tests {
             &BudgetSnapshot::default(),
             &[],
             false,
+            None,
+            None,
         );
 
         assert_eq!(evaluation.status, GoalStatus::Running);
@@ -5912,7 +5914,7 @@ mod tests {
             max_provider_unknown_streak: 2,
             ..BudgetController::default()
         };
-        let evaluation = evaluate_goal(
+        let evaluation = evaluate_goal_with_source(
             false,
             &WorkerStatus::Failed,
             WorkerCategory::Quick,
@@ -5928,6 +5930,8 @@ mod tests {
             &BudgetSnapshot::default(),
             &[],
             false,
+            None,
+            None,
         );
         assert_eq!(evaluation.status, GoalStatus::Limited);
         assert!(evaluation.summary.contains("file change limit"));
@@ -5942,7 +5946,7 @@ mod tests {
             ..BudgetController::default()
         };
         let signals = vec!["No file changes detected for 2 consecutive iterations.".to_string()];
-        let evaluation = evaluate_goal(
+        let evaluation = evaluate_goal_with_source(
             false,
             &WorkerStatus::Failed,
             WorkerCategory::Quick,
@@ -5958,6 +5962,8 @@ mod tests {
             &BudgetSnapshot::default(),
             &signals,
             false,
+            None,
+            None,
         );
         assert_eq!(evaluation.status, GoalStatus::Running);
         assert!(evaluation.should_continue);
@@ -6158,5 +6164,141 @@ mod tests {
             "GBX-003-005: parent_session_id should be 'parent'"
         );
         Ok(())
+    }
+
+    // ── GBX-003 regression tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_ownership_not_enforced_before_execution() {
+        let scope_check = crate::tools::ScopeCheck::default();
+        let budget = test_budget(DEFAULT_MAX_ITERATIONS);
+        let ownership = crate::state::ExecutionOwnership {
+            delegated: false,
+            worker_kind: Some("zed_agent".to_string()),
+            route_reason: "test: ownership not enforced".to_string(),
+            risk_profile: "low".to_string(),
+        };
+        // Using Explore (not in the ownership gate's match of
+        // Quick|Deep|Repair|Visual) proves ownership is not enforced
+        // before execution for non-obvious code-modifying categories.
+        let evaluation = evaluate_goal_with_source(
+            true,
+            &WorkerStatus::Succeeded,
+            WorkerCategory::Explore,
+            false,
+            None,
+            None,
+            &scope_check,
+            None,
+            0,
+            0,
+            1,
+            &budget,
+            &BudgetSnapshot::default(),
+            &[],
+            false,
+            None,
+            Some(&ownership),
+        );
+        assert!(
+            !matches!(evaluation.status, GoalStatus::Complete),
+            "GBX-003 GAP: ownership ({:?}) should block completion but got {:?}; summary: {}",
+            ownership, evaluation.status, evaluation.summary
+        );
+    }
+
+    #[test]
+    fn test_adapter_not_captured_through_real_registry() -> Result<()> {
+        // GBX-003 GAP: WorkerRegistry::start returns a handle but does not
+        // store/track the binding between session_id and adapter. Command
+        // workers return session_id=None when supports_interaction=false.
+        let temp_dir = tempfile::tempdir()?;
+        let store = crate::state::StateStore::new(temp_dir.path());
+        store.initialize()?;
+
+        let registry = ts::worker_registry_for_test();
+        let task = ts::default_task();
+        let config = ts::make_worker_config(WorkerKind::Opencode);
+        let request = ts::make_worker_start_request(
+            &store,
+            temp_dir.path(),
+            &task,
+            "test-goal",
+            &config,
+        );
+
+        let result = registry.start(request);
+        assert!(
+            result.is_ok(),
+            "GBX-003 GAP: WorkerRegistry::start should succeed but got: {:?}",
+            result.err()
+        );
+        let handle = result?;
+        assert!(
+            handle.session_id().is_some(),
+            "GBX-003 GAP: adapter session_id should be captured by registry"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_lineage_not_participating_in_completion() {
+        // GBX-003 GAP: WorkLineage tracks active_task_ids but has no
+        // production callers. Lineage does not participate in
+        // evaluate_goal_with_source / GoalDecisionPolicy completion decisions.
+        let scope_check = crate::tools::ScopeCheck::default();
+        let budget = test_budget(DEFAULT_MAX_ITERATIONS);
+        let ownership = crate::state::ExecutionOwnership {
+            delegated: true,
+            worker_kind: Some("test".to_string()),
+            route_reason: "test: lineage".to_string(),
+            risk_profile: "low".to_string(),
+        };
+        let _evaluation = evaluate_goal_with_source(
+            true, &WorkerStatus::Succeeded, WorkerCategory::Deep,
+            false, None, None, &scope_check, None,
+            0, 0, 1, &budget, &BudgetSnapshot::default(),
+            &[], false, None, Some(&ownership),
+        );
+        assert!(
+            false,
+            "GBX-003 GAP: WorkLineage has no production callers \
+             and does not participate in completion decisions"
+        );
+    }
+
+    #[test]
+    fn test_synthetic_review_still_completes_goal() {
+        // GBX-003 GAP: ReviewGate::from_inputs accepts synthetic evidence
+        // (no real task_attempts) for all dimensions, and evaluate_goal
+        // returns Complete as long as the coordinator does not set
+        // route_hint=review. Synthetic-only evidence should block completion.
+        let scope_check = crate::tools::ScopeCheck::default();
+        let budget = test_budget(DEFAULT_MAX_ITERATIONS);
+        let ownership = crate::state::ExecutionOwnership {
+            delegated: true,
+            worker_kind: Some("test".to_string()),
+            route_reason: "test: synthetic review".to_string(),
+            risk_profile: "low".to_string(),
+        };
+        let review = CoordinatorReview {
+            goal_satisfied: Some(true),
+            summary: "All looks good (synthetic)".to_string(),
+            repair_request: None,
+            route_hint: None,
+            stop_reason: Some("complete".to_string()),
+            raw_response: "GOAL_SATISFIED: yes\nSTOP_REASON: complete".to_string(),
+        };
+        let evaluation = evaluate_goal_with_source(
+            true, &WorkerStatus::Succeeded, WorkerCategory::Deep,
+            false, None, None, &scope_check, Some(&review),
+            0, 0, 1, &budget, &BudgetSnapshot::default(),
+            &[], false, None, Some(&ownership),
+        );
+        assert!(
+            !matches!(evaluation.status, GoalStatus::Complete),
+            "GBX-003 GAP: synthetic review should not allow completion but got {:?}",
+            evaluation.status
+        );
     }
 }

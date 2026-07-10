@@ -5,13 +5,10 @@ pub mod test_support {
 
     use anyhow::Result;
 
-    use crate::state::{ContinuationStatus, CoordinatorModel, Scope, StateStore, Task, TaskInputs, TaskKind, TaskOutputs, TaskStatus, WorkLineage};
-    use crate::task_manager::{ManagedTaskStatus, ResidencyState, TaskAttempt, TaskFailureKind, TaskRecord};
-    use crate::tools::CancellationToken;
+    use crate::state::{Scope, StateStore, Task, TaskInputs, TaskKind, TaskOutputs, TaskStatus, WorkLineage};
     use crate::workers::{
-        NativeWorkerBackend, WorkerAdapter, WorkerCapabilities, WorkerConfig, WorkerKind,
-        WorkerOutcome, WorkerResult, WorkerRoute, WorkerRunRequest, WorkerSessionHandle,
-        WorkerStartRequest, WorkerStatus, WorkerSubscription,
+        NativeWorkerBackend, WorkerAdapter, WorkerConfig, WorkerKind, WorkerOutcome, WorkerResult,
+        WorkerRunRequest, WorkerRegistry, WorkerSessionHandle, WorkerStartRequest, WorkerStatus,
     };
 
     // ── FakeWorkerState ──────────────────────────────────────────────────
