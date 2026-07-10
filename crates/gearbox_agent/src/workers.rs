@@ -1647,9 +1647,90 @@ impl WorkerRegistry {
     /// capabilities.
     fn capabilities_for_kind(kind: WorkerKind, has_native_backend: bool) -> WorkerCapabilities {
         match kind {
-            WorkerKind::OpencodeSession => WorkerCapabilities::resident_command(),
-            WorkerKind::ZedAgent if has_native_backend => WorkerCapabilities::resident_command(),
-            _ => WorkerCapabilities::command(),
+            WorkerKind::Opencode => WorkerCapabilities {
+                supports_follow_up: false,
+                supports_steering: false,
+                supports_cancellation: true,
+                supports_resident_session: false,
+                supports_code_edit: true,
+                supports_review: true,
+                supports_explore: true,
+                supports_model_selection: false,
+                supports_tool_policy_enforcement: false,
+                supports_artifact_contract: false,
+            },
+            WorkerKind::OpencodeSession => WorkerCapabilities {
+                supports_follow_up: true,
+                supports_steering: true,
+                supports_cancellation: true,
+                supports_resident_session: true,
+                supports_code_edit: true,
+                supports_review: true,
+                supports_explore: true,
+                supports_model_selection: true,
+                supports_tool_policy_enforcement: true,
+                supports_artifact_contract: true,
+            },
+            WorkerKind::Codex => WorkerCapabilities {
+                supports_follow_up: false,
+                supports_steering: false,
+                supports_cancellation: true,
+                supports_resident_session: false,
+                supports_code_edit: true,
+                supports_review: true,
+                supports_explore: true,
+                supports_model_selection: true,
+                supports_tool_policy_enforcement: false,
+                supports_artifact_contract: true,
+            },
+            WorkerKind::Claude => WorkerCapabilities {
+                supports_follow_up: false,
+                supports_steering: false,
+                supports_cancellation: true,
+                supports_resident_session: false,
+                supports_code_edit: true,
+                supports_review: false,
+                supports_explore: true,
+                supports_model_selection: false,
+                supports_tool_policy_enforcement: false,
+                supports_artifact_contract: false,
+            },
+            WorkerKind::ZedAgent if has_native_backend => WorkerCapabilities {
+                supports_follow_up: true,
+                supports_steering: true,
+                supports_cancellation: true,
+                supports_resident_session: true,
+                supports_code_edit: true,
+                supports_review: true,
+                supports_explore: true,
+                supports_model_selection: true,
+                supports_tool_policy_enforcement: true,
+                supports_artifact_contract: true,
+            },
+            WorkerKind::ZedAgent => WorkerCapabilities {
+                supports_follow_up: false,
+                supports_steering: false,
+                supports_cancellation: true,
+                supports_resident_session: false,
+                supports_code_edit: true,
+                supports_review: true,
+                supports_explore: true,
+                supports_model_selection: false,
+                supports_tool_policy_enforcement: false,
+                supports_artifact_contract: false,
+            },
+            WorkerKind::Custom => WorkerCapabilities {
+                supports_follow_up: false,
+                supports_steering: false,
+                supports_cancellation: true,
+                supports_resident_session: false,
+                supports_code_edit: false,
+                supports_review: false,
+                supports_explore: false,
+                supports_model_selection: false,
+                supports_tool_policy_enforcement: false,
+                supports_artifact_contract: false,
+            },
         }
     }
 
@@ -5713,5 +5794,284 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    // ── Adapter startup-contract tests ─────────────────────────────────
+
+    fn default_task_with_id(id: &str) -> Task {
+        Task {
+            id: id.to_string(),
+            goal_id: "goal_test".to_string(),
+            title: "test".to_string(),
+            kind: crate::state::TaskKind::Edit,
+            status: crate::state::TaskStatus::Pending,
+            assigned_worker: None,
+            attempt: 1,
+            parent_task_id: None,
+            scope: Scope::new(Vec::new(), Vec::new(), 10),
+            inputs: crate::state::TaskInputs::default(),
+            outputs: crate::state::TaskOutputs::default(),
+        }
+    }
+
+    #[test]
+    fn adapter_opencode_startup_contract() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = StateStore::new(temp.path());
+        store.initialize()?;
+        let task = default_task_with_id("task_opencode_contract");
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::Opencode,
+            worker_command: Some("sh -c 'echo opencode-contract'".to_string()),
+            ..WorkerConfig::default()
+        };
+
+        // Opencode dispatches through OpencodeCommandWorker (non-interactive)
+        let handle = WorkerRegistry::default().start(WorkerStartRequest {
+            store: &store,
+            workspace: temp.path(),
+            task: &task,
+            route_attempt: 1,
+            goal: "test goal",
+            verification_commands: &[],
+            config: &config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        })?;
+        // Non-interactive command workers return None for session_id
+        assert!(handle.session_id().is_none());
+        let result = handle.wait_for_result()?;
+        // echo is always available → should succeed
+        assert_eq!(result.status, WorkerStatus::Succeeded);
+        Ok(())
+    }
+
+    #[test]
+    fn adapter_codex_startup_contract() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = StateStore::new(temp.path());
+        store.initialize()?;
+        let task = default_task_with_id("task_codex_contract");
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::Codex,
+            worker_command: Some("sh -c 'echo codex-contract'".to_string()),
+            ..WorkerConfig::default()
+        };
+
+        // Codex dispatches through CodexCommandWorker (non-interactive)
+        let handle = WorkerRegistry::default().start(WorkerStartRequest {
+            store: &store,
+            workspace: temp.path(),
+            task: &task,
+            route_attempt: 1,
+            goal: "test goal",
+            verification_commands: &[],
+            config: &config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        })?;
+        assert!(handle.session_id().is_none());
+        let result = handle.wait_for_result()?;
+        assert_eq!(result.status, WorkerStatus::Succeeded);
+        Ok(())
+    }
+
+    #[test]
+    fn adapter_claude_startup_contract() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = StateStore::new(temp.path());
+        store.initialize()?;
+        let task = default_task_with_id("task_claude_contract");
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::Claude,
+            worker_command: Some("sh -c 'echo claude-contract'".to_string()),
+            ..WorkerConfig::default()
+        };
+
+        // Claude dispatches through ClaudeCommandWorker (non-interactive)
+        let handle = WorkerRegistry::default().start(WorkerStartRequest {
+            store: &store,
+            workspace: temp.path(),
+            task: &task,
+            route_attempt: 1,
+            goal: "test goal",
+            verification_commands: &[],
+            config: &config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        })?;
+        assert!(handle.session_id().is_none());
+        let result = handle.wait_for_result()?;
+        assert_eq!(result.status, WorkerStatus::Succeeded);
+        Ok(())
+    }
+
+    #[test]
+    fn adapter_zed_agent_startup_contract() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = StateStore::new(temp.path());
+        store.initialize()?;
+        let task = default_task_with_id("task_zed_agent_contract");
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::ZedAgent,
+            ..WorkerConfig::default()
+        };
+
+        // ZedAgent dispatches through native backend when available.
+        // Uses the locally-defined FakeNativeBackend (already in this test module).
+        let started = Arc::new(AtomicBool::new(false));
+        let registry = WorkerRegistry::with_native_backend(Arc::new(FakeNativeBackend {
+            started: started.clone(),
+        }));
+        let handle = registry.start(WorkerStartRequest {
+            store: &store,
+            workspace: temp.path(),
+            task: &task,
+            route_attempt: 1,
+            goal: "test goal",
+            verification_commands: &[],
+            config: &config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        })?;
+        // FakeNativeWorkerBackend always returns a session_id
+        assert!(
+            handle.session_id().is_some(),
+            "ZedAgent adapter with native backend should return session_id"
+        );
+        assert_eq!(
+            handle.session_id().as_deref(),
+            Some("native-zed-session")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn custom_worker_fail_closed() {
+        // Custom workers fail closed on ALL code operations — they have no
+        // known external tool contract, so Gear defaults to denying everything.
+        let caps = WorkerRegistry::capabilities_for_kind(WorkerKind::Custom, false);
+
+        // All code capabilities fail closed
+        assert!(
+            !caps.supports_code_edit,
+            "Custom worker should fail closed on code_edit"
+        );
+        assert!(
+            !caps.supports_review,
+            "Custom worker should fail closed on review"
+        );
+        assert!(
+            !caps.supports_explore,
+            "Custom worker should fail closed on explore"
+        );
+
+        // Advanced features also fail closed
+        assert!(
+            !caps.supports_model_selection,
+            "Custom worker should fail closed on model_selection"
+        );
+        assert!(
+            !caps.supports_tool_policy_enforcement,
+            "Custom worker should fail closed on tool_policy_enforcement"
+        );
+        assert!(
+            !caps.supports_artifact_contract,
+            "Custom worker should fail closed on artifact_contract"
+        );
+        assert!(
+            !caps.supports_follow_up,
+            "Custom worker should fail closed on follow_up"
+        );
+        assert!(
+            !caps.supports_steering,
+            "Custom worker should fail closed on steering"
+        );
+        assert!(
+            !caps.supports_resident_session,
+            "Custom worker should fail closed on resident_session"
+        );
+
+        // Only cancellation is available
+        assert!(
+            caps.supports_cancellation,
+            "Custom worker should support cancellation"
+        );
+    }
+
+    #[test]
+    fn capability_mismatch_before_start() {
+        // Verify that different worker kinds declare distinct capability sets.
+        // Some adapters intentionally lack support for certain categories
+        // (e.g., Claude does not support Review).
+
+        // Claude's capabilities: supports code_edit and explore, but
+        // does NOT support review, model_selection, or artifact_contract.
+        let claude = WorkerRegistry::capabilities_for_kind(WorkerKind::Claude, false);
+        assert!(claude.supports_code_edit, "Claude supports code_edit");
+        assert!(
+            !claude.supports_review,
+            "Claude should not support Review category"
+        );
+        assert!(claude.supports_explore, "Claude supports explore");
+        assert!(
+            !claude.supports_model_selection,
+            "Claude does not support model_selection"
+        );
+        assert!(
+            !claude.supports_artifact_contract,
+            "Claude does not support artifact_contract"
+        );
+
+        // OpencodeSession (resident_command) has full capabilities including
+        // review, model_selection, follow_up, and artifact_contract.
+        let resident = WorkerRegistry::capabilities_for_kind(WorkerKind::OpencodeSession, false);
+        assert!(resident.supports_review, "Resident worker supports review");
+        assert!(
+            resident.supports_model_selection,
+            "Resident worker supports model_selection"
+        );
+        assert!(
+            resident.supports_artifact_contract,
+            "Resident worker supports artifact_contract"
+        );
+        assert!(resident.supports_follow_up, "Resident worker supports follow_up");
+        assert!(
+            resident.supports_tool_policy_enforcement,
+            "Resident worker supports tool_policy_enforcement"
+        );
+
+        // ZedAgent with native backend also gets full resident capabilities.
+        let native = WorkerRegistry::capabilities_for_kind(WorkerKind::ZedAgent, true);
+        assert!(native.supports_review, "Native ZedAgent supports review");
+        assert!(
+            native.supports_model_selection,
+            "Native ZedAgent supports model_selection"
+        );
+
+        // Verify the capability mismatch would be caught by start():
+        // if a Review task were dispatched to Claude, the capability
+        // check in WorkerRegistry::start would reject it because
+        // claude.supports_review is false.
+        assert!(
+            !claude.supports_category(WorkerCategory::Review),
+            "Claude.supports_category(Review) should return false"
+        );
+        assert!(
+            resident.supports_category(WorkerCategory::Review),
+            "Resident worker should support Review category"
+        );
+        assert!(
+            claude.supports_category(WorkerCategory::Explore),
+            "Claude should support Explore category"
+        );
     }
 }
