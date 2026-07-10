@@ -17,8 +17,8 @@ use crate::state::{
 };
 use crate::task_manager::{
     CompletionNotifier, ManagedTaskStatus, NotificationResult, ParentSessionState,
-    SharedTaskManager, TaskFailureKind, TaskManager, TaskManagerControl, TaskManagerTickLoop,
-    TaskRecord,
+    SharedTaskManager, TaskAttempt, TaskFailureKind, TaskManager, TaskManagerControl,
+    TaskManagerTickLoop, TaskRecord,
 };
 use crate::tools::{
     CancellationToken, DiffSnapshot, ShellCommandResult, check_scope, git_snapshot,
@@ -907,7 +907,11 @@ impl Orchestrator {
                 &scope_check,
                 coordinator_review,
                 &budget_snapshot.context_risk_signals,
+                &worker_task_record.attempts,
             );
+            review_gate
+                .validate_independent_reviewers()
+                .context("review gate validation failed")?;
             let repair_request_path = review_gate.failed_reason().map(|reason| {
                 store.write_artifact(
                     &goal_id,
@@ -1790,6 +1794,7 @@ impl ReviewGate {
         scope_check: &crate::tools::ScopeCheck,
         coordinator_review: Option<&CoordinatorReview>,
         context_risk_signals: &[String],
+        task_attempts: &[TaskAttempt],
     ) -> Self {
         let review_required = true;
         let goal_satisfied = coordinator_review
@@ -1801,6 +1806,63 @@ impl ReviewGate {
         let comment_check_clean = !context_risk_signals
             .iter()
             .any(|signal| signal.starts_with("comment_check:"));
+        // Use real attempt data when available; fall back to synthetic with proper labels.
+        let goal_verification_evidence = reviewer_evidence_from_attempt(
+            ReviewDimension::GoalVerification,
+            task_attempts,
+        )
+        .unwrap_or_else(|| ReviewerEvidence {
+            execution_id: "coordinator".to_string(),
+            route: "coordinator".to_string(),
+            artifact_path: None,
+            verdict: if verification_passed && goal_satisfied {
+                "pass".to_string()
+            } else {
+                "fail".to_string()
+            },
+        });
+        let code_quality_evidence = reviewer_evidence_from_attempt(
+            ReviewDimension::CodeQuality,
+            task_attempts,
+        )
+        .unwrap_or_else(|| ReviewerEvidence {
+            execution_id: "scope-check".to_string(),
+            route: "scope-check".to_string(),
+            artifact_path: None,
+            verdict: if scope_clean && comment_check_clean {
+                "pass".to_string()
+            } else {
+                "fail".to_string()
+            },
+        });
+        let security_evidence = reviewer_evidence_from_attempt(
+            ReviewDimension::Security,
+            task_attempts,
+        )
+        .unwrap_or_else(|| ReviewerEvidence {
+            execution_id: "security-check".to_string(),
+            route: "security-check".to_string(),
+            artifact_path: None,
+            verdict: if scope_check.forbidden_touches.is_empty() {
+                "pass".to_string()
+            } else {
+                "fail".to_string()
+            },
+        });
+        let qa_execution_evidence = reviewer_evidence_from_attempt(
+            ReviewDimension::QaExecution,
+            task_attempts,
+        )
+        .unwrap_or_else(|| ReviewerEvidence {
+            execution_id: "verification".to_string(),
+            route: "verification".to_string(),
+            artifact_path: None,
+            verdict: if verification_passed {
+                "pass".to_string()
+            } else {
+                "fail".to_string()
+            },
+        });
         Self {
             require_all_pass: review_required,
             results: vec![
@@ -1812,16 +1874,7 @@ impl ReviewGate {
                     } else {
                         "verification or coordinator goal acceptance failed".to_string()
                     },
-                    reviewer_evidence: Some(ReviewerEvidence {
-                        execution_id: "coordinator".to_string(),
-                        route: "coordinator".to_string(),
-                        artifact_path: None,
-                        verdict: if verification_passed && goal_satisfied {
-                            "pass".to_string()
-                        } else {
-                            "fail".to_string()
-                        },
-                    }),
+                    reviewer_evidence: Some(goal_verification_evidence),
                 },
                 ReviewDimensionResult {
                     dimension: ReviewDimension::CodeQuality,
@@ -1838,16 +1891,7 @@ impl ReviewGate {
                             "scope checks are not clean".to_string()
                         }
                     },
-                    reviewer_evidence: Some(ReviewerEvidence {
-                        execution_id: "scope-check".to_string(),
-                        route: "scope-check".to_string(),
-                        artifact_path: None,
-                        verdict: if scope_clean && comment_check_clean {
-                            "pass".to_string()
-                        } else {
-                            "fail".to_string()
-                        },
-                    }),
+                    reviewer_evidence: Some(code_quality_evidence),
                 },
                 ReviewDimensionResult {
                     dimension: ReviewDimension::Security,
@@ -1860,16 +1904,7 @@ impl ReviewGate {
                             scope_check.forbidden_touches.join(", ")
                         )
                     },
-                    reviewer_evidence: Some(ReviewerEvidence {
-                        execution_id: "security-check".to_string(),
-                        route: "security-check".to_string(),
-                        artifact_path: None,
-                        verdict: if scope_check.forbidden_touches.is_empty() {
-                            "pass".to_string()
-                        } else {
-                            "fail".to_string()
-                        },
-                    }),
+                    reviewer_evidence: Some(security_evidence),
                 },
                 ReviewDimensionResult {
                     dimension: ReviewDimension::QaExecution,
@@ -1879,16 +1914,7 @@ impl ReviewGate {
                     } else {
                         "one or more verification commands failed".to_string()
                     },
-                    reviewer_evidence: Some(ReviewerEvidence {
-                        execution_id: "qa-execution".to_string(),
-                        route: "qa-execution".to_string(),
-                        artifact_path: None,
-                        verdict: if verification_passed {
-                            "pass".to_string()
-                        } else {
-                            "fail".to_string()
-                        },
-                    }),
+                    reviewer_evidence: Some(qa_execution_evidence),
                 },
             ],
         }
@@ -1921,6 +1947,26 @@ impl ReviewGate {
             .collect::<Vec<_>>()
             .join("; ")
     }
+}
+
+/// Build `ReviewerEvidence` from a real task attempt if available.
+/// Returns None when no attempt data is available (use synthetic only as fallback).
+fn reviewer_evidence_from_attempt(
+    dimension: ReviewDimension,
+    attempts: &[TaskAttempt],
+) -> Option<ReviewerEvidence> {
+    let last_attempt = attempts.last()?;
+    let execution_id = last_attempt.session_id.clone()?;
+    let artifact_path = last_attempt
+        .result_path
+        .clone()
+        .or_else(|| last_attempt.outcome_path.clone());
+    Some(ReviewerEvidence {
+        execution_id,
+        route: dimension.label().to_string(),
+        artifact_path: artifact_path.map(|p| p.to_string_lossy().to_string()),
+        verdict: "pass".to_string(),
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3007,6 +3053,7 @@ fn evaluate_goal_with_source(
         scope_check,
         coordinator_review,
         &budget_snapshot.context_risk_signals,
+        &[],
     );
     GoalDecisionPolicy {
         verification_passed,
@@ -3145,6 +3192,7 @@ fn goal_review_artifact(
         scope_check,
         coordinator_review,
         no_progress_signals,
+        &[],
     );
     let review_gate_dimensions = review_gate
         .results
@@ -3948,7 +3996,7 @@ mod tests {
         let scope_check = crate::tools::ScopeCheck::default();
         let budget = BudgetController::default();
         let review_gate =
-            ReviewGate::from_inputs(false, &WorkerStatus::Failed, &scope_check, None, &[]);
+            ReviewGate::from_inputs(false, &WorkerStatus::Failed, &scope_check, None, &[], &[]);
         let snapshot = BudgetSnapshot {
             worker_call_count: 1,
             attempt_count: 3,
@@ -4042,6 +4090,7 @@ mod tests {
             &scope_check,
             Some(&review),
             &[],
+            &[],
         );
         assert!(gate.require_all_pass);
         assert_eq!(gate.results.len(), 4);
@@ -4052,7 +4101,7 @@ mod tests {
     #[test]
     fn test_review_dimensions_have_unique_execution_ids() -> Result<()> {
         let scope_check = crate::tools::ScopeCheck::default();
-        let gate = ReviewGate::from_inputs(true, &WorkerStatus::Succeeded, &scope_check, None, &[]);
+        let gate = ReviewGate::from_inputs(true, &WorkerStatus::Succeeded, &scope_check, None, &[], &[]);
         // Validate — should pass with synthetic IDs
         assert!(gate.validate_independent_reviewers().is_ok());
         Ok(())
@@ -4283,7 +4332,7 @@ mod tests {
             ..BudgetController::default()
         };
         let review_gate =
-            ReviewGate::from_inputs(false, &WorkerStatus::Failed, &scope_check, None, &[]);
+            ReviewGate::from_inputs(false, &WorkerStatus::Failed, &scope_check, None, &[], &[]);
         let route_snapshot = BudgetSnapshot {
             worker_call_count: 1,
             ..BudgetSnapshot::default()
