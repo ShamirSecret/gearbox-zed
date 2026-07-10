@@ -199,3 +199,101 @@ Rules emerge from validated patterns, not one-off observations. The workflow is:
 1. Agent notes a pattern during a session.
 2. Team validates the pattern in code review.
 3. A dedicated commit adds the rule with context on *why* it exists.
+
+---
+
+# PROJECT KNOWLEDGE BASE
+<!-- /init-deep generated sections below -->
+
+## OVERVIEW
+
+**Gearbox** — 基于开源 Rust/GPUI 编辑器上游的高性能本地代码编辑器 GUI，面向中文用户。核心栈：Rust + GPUI (GPU-accelerated UI framework) + async (Tokio-based executor)。当前仓库是 Gearbox fork，需要在承载独立品牌、中文界面和设置资源的同时持续跟随上游更新。
+
+**关键架构层：**
+- **GUI Entry (`crates/gearbox/`)** — 应用入口、菜单、品牌资源、打包
+- **Orchestration Agent (`crates/gearbox_agent/`)** — 编排运行时，任务调度，worker 管理，review gate
+- **Settings Layer (`crates/gearbox_settings/`)** — 独立设置资源、快捷键、上游同步记录
+- **Shared UI (`crates/ui/`, `crates/settings_ui/`)** — 通用UI组件，部分条件汉化
+- **Agent System (`crates/agent/`)** — 上游 AI agent 框架，Gearbox 通过 gearbox_agent 扩展
+
+## STRUCTURE
+```
+/
+├── crates/gearbox/          # [GEARBOX] GUI 入口 main.rs, 应用菜单, 品牌资源
+├── crates/gearbox_agent/    # [GEARBOX] 编排运行时: runtime, state, workers
+├── crates/gearbox_settings/  # [GEARBOX] 独立设置层 + UPSTREAM_SYNC_NOTES.md
+├── crates/agent/            # 上游 agent 框架 (56 文件, 86K 行)
+├── crates/gpui/             # GPUI UI 框架 (124 文件, 69K 行)
+├── crates/ui/               # 上游通用 UI 组件
+├── crates/workspace/        # 工作区管理
+├── crates/project/           # 项目管理
+├── crates/editor/            # 编辑器核心
+├── crates/agent_ui/          # Agent UI 面板
+├── .omo/                    # OpenCode 工单/计划/证据文件
+├── .dogfood/                 # Gearbox 修复计划与报告
+└── docs/                    # mdBook 用户文档
+```
+
+## WHERE TO LOOK
+| Task | Location | Notes |
+|------|----------|-------|
+| Gearbox GUI 入口 | `crates/gearbox/src/main.rs` | main(), GEARBOX_GUI=1 |
+| 编排运行时核心 | `crates/gearbox_agent/src/runtime.rs` | Orchestrator::run, 6K 行 |
+| 编排状态/lineage | `crates/gearbox_agent/src/state.rs` | WorkLineage, StateStore |
+| Worker 路由/能力 | `crates/gearbox_agent/src/workers.rs` | WorkerKind, WorkerRegistry, capabilities |
+| 任务管理器 | `crates/gearbox_agent/src/task_manager.rs` | TaskManager, tick loop |
+| 上游同步记录 | `crates/gearbox_settings/UPSTREAM_SYNC_NOTES.md` | **必须先读**再改共享源码 |
+| 设置加载 | `crates/gearbox_settings/src/gearbox_settings.rs` | 独立设置资源 |
+| AI Agent 框架 | `crates/agent/src/agent.rs` | 上游 agent，Gearbox 扩展点 |
+| Agent 测试 | `crates/agent/src/tests/` | GPUI 集成测试 |
+| UI 组件 | `crates/ui/src/components/` | Label, Button, Modal 等 |
+| GPUI 核心 | `crates/gpui/src/` | App, Window, Entity, Context |
+| 修复计划 | `.dogfood/` | GBX-00X 系列修复计划 |
+| OpenCode 工单 | `.omo/plans/` | 当前执行计划 |
+| 用户文档 | `docs/src/` | mdBook 格式 |
+
+## CODE MAP (Key Gearbox Symbols)
+| Symbol | Type | Location | Role |
+|--------|------|----------|------|
+| `Orchestrator::run` | method | `gearbox_agent/src/runtime.rs:167` | 编排主循环入口 |
+| `WorkLineage` | struct | `gearbox_agent/src/state.rs:56` | 任务层级追踪 |
+| `StateStore` | struct | `gearbox_agent/src/state.rs:332` | 持久化存储 |
+| `WorkerKind` | enum | `gearbox_agent/src/workers.rs:46` | 路由目标类型 |
+| `WorkerCapabilities` | struct | `gearbox_agent/src/workers.rs:1302` | 能力声明 |
+| `WorkerRegistry` | struct | `gearbox_agent/src/workers.rs:1417` | Worker 注册与启动 |
+| `GoalDecisionPolicy` | struct | `gearbox_agent/src/runtime.rs:2024` | 完成判定策略 |
+| `ReviewGate` | struct | `gearbox_agent/src/runtime.rs:1776` | Review 门禁 |
+| `ExecutionOwnership` | struct | `gearbox_agent/src/state.rs:100` | 执行所有权决策 |
+
+## COMMANDS
+```bash
+# 构建 Gearbox
+cargo run -p gearbox
+cargo check -p gearbox
+
+# 编译检查更完整
+cargo check -p settings_ui -p agent_ui -p ui -p language_models -p context_server -p gearbox
+
+# 运行 gearbox_agent 测试
+cargo test -p gearbox_agent -- --nocapture
+
+# 运行 agent crate 中 gearbox 相关测试
+cargo test -p agent -- gearbox --nocapture
+
+# 运行 GPUI 集成测试
+cargo test -p agent --test '*' -- gearbox --nocapture
+
+# Clippy (使用项目脚本)
+./script/clippy -p gearbox_agent
+
+# 文档预览
+cd docs && npx prettier --write src/ && cd ..
+mdbook serve docs
+```
+
+## NOTES
+- AGENTS.md 和 CLAUDE.md 内容完全一致，同步更新两者。
+- `.rules` 文件被每个 agent session 读取——保持高信号量。
+- `.omo/**` 是 OpenCode 工作文件，Gearbox fork 不变量禁止修改。
+- 共享源码修改必须先在 `crates/gearbox_settings/UPSTREAM_SYNC_NOTES.md` 检查并记录。
+- docs 使用 mdBook + 自定义 preprocessor，改动前阅读 `docs/AGENTS.md`。
