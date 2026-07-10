@@ -4238,6 +4238,33 @@ mod tests {
     }
 
     #[test]
+    fn test_continuation_isolation_with_caller_session_id() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+
+        let path_a =
+            store.write_continuation_state("acp-session-A", "goal_A", ContinuationStatus::Running)?;
+        let path_b =
+            store.write_continuation_state("acp-session-B", "goal_B", ContinuationStatus::Stopped)?;
+
+        assert_ne!(path_a, path_b);
+        assert!(store.continuation_is_stopped_for_session("acp-session-B")?);
+        assert!(!store.continuation_is_stopped_for_session("acp-session-A")?);
+
+        let a_content = std::fs::read_to_string(&path_a)?;
+        assert!(a_content.contains("acp-session-A"));
+        let b_content = std::fs::read_to_string(&path_b)?;
+        assert!(b_content.contains("acp-session-B"));
+
+        store.clear_continuation_stop_for_session("acp-session-A")?;
+        assert!(!store.continuation_is_stopped_for_session("acp-session-A")?);
+        assert!(store.continuation_is_stopped_for_session("acp-session-B")?);
+
+        Ok(())
+    }
+
+    #[test]
     fn budget_uses_goal_max_worker_calls() {
         let mut goal_budget = Budget::default();
         goal_budget.max_worker_calls = 1;

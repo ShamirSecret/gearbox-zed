@@ -9569,4 +9569,68 @@ mod tests {
         }
         Ok(())
     }
+
+    #[test]
+    fn test_accepted_outcome_has_task_id_and_epoch() -> Result<()> {
+        let ctx = OutcomeContext {
+            task_id: Some("task_accepted".to_string()),
+            run_epoch: Some(3),
+            queue_position: None,
+        };
+        let ctx_revive = OutcomeContext {
+            task_id: Some("task_revive".to_string()),
+            run_epoch: Some(5),
+            queue_position: None,
+        };
+
+        let sent = SendOutcome::Sent(ctx.clone());
+        assert!(sent.is_accepted());
+        match &sent {
+            SendOutcome::Sent(c) => {
+                assert_eq!(c.task_id.as_deref(), Some("task_accepted"));
+                assert_eq!(c.run_epoch, Some(3));
+            }
+            _ => panic!("expected Sent"),
+        }
+
+        let queued = SendOutcome::Queued(ctx);
+        assert!(queued.is_accepted());
+        match &queued {
+            SendOutcome::Queued(c) => {
+                assert_eq!(c.task_id.as_deref(), Some("task_accepted"));
+                assert_eq!(c.run_epoch, Some(3));
+            }
+            _ => panic!("expected Queued"),
+        }
+
+        let revive = SendOutcome::Revive(ctx_revive);
+        assert!(revive.is_accepted());
+        match &revive {
+            SendOutcome::Revive(c) => {
+                assert_eq!(c.task_id.as_deref(), Some("task_revive"));
+                assert_eq!(c.run_epoch, Some(5));
+            }
+            _ => panic!("expected Revive"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_queued_outcome_has_queue_position() -> Result<()> {
+        let ctx = OutcomeContext {
+            task_id: Some("task_queued_pos".to_string()),
+            run_epoch: Some(1),
+            queue_position: Some(3),
+        };
+        let outcome = SendOutcome::Queued(ctx);
+        match &outcome {
+            SendOutcome::Queued(c) => {
+                assert_eq!(c.queue_position, Some(3));
+                assert_eq!(c.task_id.as_deref(), Some("task_queued_pos"));
+            }
+            _ => panic!("expected Queued"),
+        }
+        Ok(())
+    }
 }
