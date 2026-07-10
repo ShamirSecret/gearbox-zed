@@ -12,8 +12,8 @@ use crate::languages::{LanguageDetection, detect_with_request};
 use crate::product;
 use crate::state::{
     Budget, ContinuationStatus, CoordinatorModel, Event, EventKind, Goal, GoalStatus, Scope,
-    Session, StateStore, Task, TaskInputs, TaskKind, TaskOutputs, TaskStatus, event, id_timestamp,
-    timestamp,
+    Session, StateStore, Task, TaskInputs, TaskKind, TaskOutputs, TaskStatus, WorkLineage,
+    event, id_timestamp, timestamp,
 };
 use crate::task_manager::{
     CompletionNotifier, ManagedTaskStatus, NotificationResult, ParentSessionState,
@@ -392,6 +392,18 @@ impl Orchestrator {
             goal_id: goal_id.clone(),
         };
 
+        // Initialize or restore WorkLineage for this session.
+        // Lineage tracks worker lifecycle and participates in completion gating.
+        let mut lineage = store.read_lineage(&session_id)?.unwrap_or_else(|| {
+            let mut l = WorkLineage::new(session_id.clone());
+            // Count non-completed tasks as plan_remaining_items.
+            l.plan_remaining_items = tasks
+                .iter()
+                .filter(|t| t.status != TaskStatus::Complete)
+                .count();
+            l
+        });
+
         #[allow(clippy::explicit_counter_loop)]
         for iteration in 1..=max_iterations {
             check_run_cancelled(options.cancellation_token.as_ref())?;
@@ -473,6 +485,12 @@ impl Orchestrator {
                 worker_task_id: Some(worker_task_id.clone()),
                 decided_at: crate::state::timestamp(),
             };
+
+            // Track this worker in the lineage and persist.
+            lineage.worker_session_ids.push(worker_task_id.clone());
+            lineage.active_task_ids.push(worker_task_id.clone());
+            lineage.updated_at = timestamp();
+            store.write_lineage(&lineage)?;
 
             start_task(&mut tasks, &worker_task_id);
             goal.status = GoalStatus::Running;
@@ -601,6 +619,13 @@ impl Orchestrator {
                 &worker_task_record,
             );
             store.write_tasks(&goal_id, &tasks)?;
+
+            // Worker has completed (success, failure, or skip); remove from
+            // active_task_ids so lineage no longer blocks completion on this worker.
+            lineage.active_task_ids.retain(|id| id != &worker_task_id);
+            lineage.updated_at = timestamp();
+            store.write_lineage(&lineage)?;
+
             append_event(
                 &store,
                 &options.event_sink,
@@ -884,6 +909,7 @@ impl Orchestrator {
                 has_fallback,
                 Some(current_route_change_type),
                 Some(&ownership),
+                None,
             );
             next_route_hint_override = evaluation.route_hint_override.clone();
             let review_path = store.write_artifact(
@@ -2046,6 +2072,9 @@ struct GoalDecisionPolicy<'a> {
     /// Ownership decision: whether the work was delegated to a worker.
     /// `None` means no decision was made — completion must be denied.
     ownership: Option<&'a crate::state::ExecutionOwnership>,
+    /// WorkLineage for lineage-based completion gating.
+    /// `None` means no lineage record exists.
+    lineage: Option<&'a WorkLineage>,
 }
 
 #[derive(Clone, Debug)]
@@ -2286,6 +2315,26 @@ impl<'a> GoalDecisionPolicy<'a> {
         } else {
             None
         }
+    }
+
+    fn lineage_gate_reason(&self) -> Option<String> {
+        // If there is a WorkLineage with active descendant tasks, deny completion.
+        self.lineage.and_then(|lineage| {
+            if !lineage.active_task_ids.is_empty() {
+                Some(format!(
+                    "WorkLineage has {} active task(s) still running: {:?}",
+                    lineage.active_task_ids.len(),
+                    lineage.active_task_ids
+                ))
+            } else if lineage.plan_remaining_items > 0 {
+                Some(format!(
+                    "WorkLineage has {} remaining plan items",
+                    lineage.plan_remaining_items
+                ))
+            } else {
+                None
+            }
+        })
     }
 
     fn evaluate(&self) -> GoalEvaluation {
@@ -2607,6 +2656,27 @@ impl<'a> GoalDecisionPolicy<'a> {
                     should_continue: false,
                     summary: format!(
                         "Ownership gate blocked at the iteration limit: {ownership_reason}"
+                    ),
+                    route_hint_override: None,
+                };
+            }
+
+            // Lineage gate: work cannot complete while there are active descendant
+            // tasks still running or remaining plan items that need execution.
+            if let Some(lineage_reason) = self.lineage_gate_reason() {
+                if self.iteration < self.budget.max_iterations {
+                    return GoalEvaluation {
+                        status: GoalStatus::Running,
+                        should_continue: true,
+                        summary: format!("Lineage gate requires repair: {lineage_reason}"),
+                        route_hint_override: Some("deep".to_string()),
+                    };
+                }
+                return GoalEvaluation {
+                    status: GoalStatus::NeedsUser,
+                    should_continue: false,
+                    summary: format!(
+                        "Lineage gate blocked at the iteration limit: {lineage_reason}"
                     ),
                     route_hint_override: None,
                 };
@@ -3125,6 +3195,7 @@ fn evaluate_goal_with_source(
     nearest_fallback_available: bool,
     trigger_source: Option<RouteChangeType>,
     ownership: Option<&crate::state::ExecutionOwnership>,
+    lineage: Option<&WorkLineage>,
 ) -> GoalEvaluation {
     let review_gate = ReviewGate::from_inputs(
         verification_passed,
@@ -3153,6 +3224,7 @@ fn evaluate_goal_with_source(
         trigger_source,
         ownership,
         review_gate: &review_gate,
+        lineage,
     }
     .evaluate()
 }
@@ -3720,6 +3792,7 @@ mod tests {
                 worker_task_id: Some("task_003".to_string()),
                 decided_at: crate::state::timestamp(),
             }),
+            None,
         );
 
         assert_eq!(evaluation.status, GoalStatus::Complete);
@@ -3758,6 +3831,7 @@ mod tests {
             true,
             None,
             None,
+            None,
         );
 
         assert_eq!(evaluation.status, GoalStatus::NeedsUser);
@@ -3792,6 +3866,7 @@ mod tests {
             &BudgetSnapshot::default(),
             &[],
             false,
+            None,
             None,
             None,
         );
@@ -3832,6 +3907,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         );
 
         assert_eq!(evaluation.status, GoalStatus::Running);
@@ -3867,6 +3943,7 @@ mod tests {
             &BudgetSnapshot::default(),
             &[],
             false,
+            None,
             None,
             None,
         );
@@ -3905,6 +3982,7 @@ mod tests {
             &BudgetSnapshot::default(),
             &[],
             false,
+            None,
             None,
             None,
         );
@@ -3948,6 +4026,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         );
 
         assert_eq!(evaluation.status, GoalStatus::Running);
@@ -3977,6 +4056,7 @@ mod tests {
             true,
             None,
             None,
+            None,
         );
 
         assert_eq!(evaluation.status, GoalStatus::Limited);
@@ -4003,6 +4083,7 @@ mod tests {
             &BudgetSnapshot::default(),
             &[],
             false,
+            None,
             None,
             None,
         );
@@ -4042,6 +4123,7 @@ mod tests {
             true,
             None,
             None,
+            None,
         );
 
         assert_eq!(evaluation.status, GoalStatus::Limited);
@@ -4070,6 +4152,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         );
 
         assert_eq!(evaluation.status, GoalStatus::Limited);
@@ -4096,6 +4179,7 @@ mod tests {
             &BudgetSnapshot::default(),
             &[],
             false,
+            None,
             None,
             None,
         );
@@ -4145,6 +4229,7 @@ mod tests {
             trigger_source: None,
             ownership: None,
             review_gate: &review_gate,
+            lineage: None,
         };
         assert!(
             policy.budget_guard_reason().is_none(),
@@ -4173,6 +4258,7 @@ mod tests {
             trigger_source: None,
             ownership: None,
             review_gate: &review_gate,
+            lineage: None,
         };
         assert!(
             limited_policy.budget_guard_reason().is_some(),
@@ -4445,6 +4531,7 @@ mod tests {
             true,
             None,
             None,
+            None,
         );
         assert!(first_evaluation.should_continue);
 
@@ -4468,6 +4555,7 @@ mod tests {
             &second_snapshot,
             &[],
             true,
+            None,
             None,
             None,
         );
@@ -4509,6 +4597,7 @@ mod tests {
             trigger_source: Some(RouteChangeType::RouteChange),
             ownership: None,
             review_gate: &review_gate,
+            lineage: None,
         };
         let reason = policy
             .budget_guard_reason()
@@ -4721,6 +4810,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         );
 
         assert_eq!(evaluation.status, GoalStatus::Limited);
@@ -4756,6 +4846,7 @@ mod tests {
             &snapshot,
             &[],
             false,
+            None,
             None,
             None,
         );
@@ -4961,6 +5052,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         );
 
         assert_eq!(evaluation.status, GoalStatus::NeedsUser);
@@ -4997,6 +5089,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         );
 
         assert_eq!(evaluation.status, GoalStatus::NeedsUser);
@@ -5025,6 +5118,7 @@ mod tests {
             &BudgetSnapshot::default(),
             &[],
             false,
+            None,
             None,
             None,
         );
@@ -5068,6 +5162,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         );
 
         assert_eq!(evaluation.status, GoalStatus::Running);
@@ -5093,6 +5188,7 @@ mod tests {
             &BudgetSnapshot::default(),
             &[],
             false,
+            None,
             None,
             None,
         );
@@ -5946,6 +6042,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         );
         assert_eq!(evaluation.status, GoalStatus::Limited);
         assert!(evaluation.summary.contains("file change limit"));
@@ -5976,6 +6073,7 @@ mod tests {
             &BudgetSnapshot::default(),
             &signals,
             false,
+            None,
             None,
             None,
         );
@@ -6079,6 +6177,7 @@ mod tests {
             true,
             None,
             None,
+            None,
         );
         // GBX-003-002 must add an ExecutionOwnershipDecision check before
         // completion. Without a delegating worker task, Complete must be denied.
@@ -6140,6 +6239,7 @@ mod tests {
             &BudgetSnapshot::default(),
             &[],
             true,
+            None,
             None,
             None,
         );
@@ -6213,6 +6313,7 @@ mod tests {
             false,
             None,
             Some(&ownership),
+            None,
         );
         assert!(
             !matches!(evaluation.status, GoalStatus::Complete),
@@ -6257,29 +6358,45 @@ mod tests {
 
     #[test]
     fn test_lineage_not_participating_in_completion() {
-        // GBX-003 GAP: WorkLineage tracks active_task_ids but has no
-        // production callers. Lineage does not participate in
-        // evaluate_goal_with_source / GoalDecisionPolicy completion decisions.
+        // WorkLineage's active_task_ids must gate completion: when there are
+        // active descendant tasks, evaluate_goal_with_source must deny Complete.
         let scope_check = crate::tools::ScopeCheck::default();
         let budget = test_budget(DEFAULT_MAX_ITERATIONS);
         let ownership = crate::state::ExecutionOwnership {
             delegated: true,
             worker_kind: Some("test".to_string()),
-            route_reason: "test: lineage".to_string(),
+            route_reason: "test: lineage gate".to_string(),
             risk_profile: "low".to_string(),
-            worker_task_id: Some("task_lineage".to_string()),
+            worker_task_id: Some("task_test".to_string()),
             decided_at: crate::state::timestamp(),
         };
-        let _evaluation = evaluate_goal_with_source(
+        // Create a lineage with an active task → the lineage gate must fire.
+        let mut lineage = WorkLineage::new("test_session".to_string());
+        lineage.active_task_ids.push("active_task_001".to_string());
+
+        let evaluation = evaluate_goal_with_source(
             true, &WorkerStatus::Succeeded, WorkerCategory::Deep,
             false, None, None, &scope_check, None,
             0, 0, 1, &budget, &BudgetSnapshot::default(),
             &[], false, None, Some(&ownership),
+            Some(&lineage),
+        );
+        // Lineage has active tasks → must NOT be Complete
+        assert!(
+            !matches!(evaluation.status, GoalStatus::Complete),
+            "Lineage gate should reject completion with active tasks but got {:?}",
+            evaluation.status
+        );
+        // Must be Running (since iteration < max_iterations)
+        assert!(
+            matches!(evaluation.status, GoalStatus::Running),
+            "Lineage gate should return Running with active tasks but got {:?}",
+            evaluation.status
         );
         assert!(
-            false,
-            "GBX-003 GAP: WorkLineage has no production callers \
-             and does not participate in completion decisions"
+            evaluation.summary.contains("Lineage gate"),
+            "Summary should mention lineage gate but got: {}",
+            evaluation.summary
         );
     }
 
@@ -6312,6 +6429,7 @@ mod tests {
             false, None, None, &scope_check, Some(&review),
             0, 0, 1, &budget, &BudgetSnapshot::default(),
             &[], false, None, Some(&ownership),
+            None,
         );
         assert!(
             !matches!(evaluation.status, GoalStatus::Complete),
