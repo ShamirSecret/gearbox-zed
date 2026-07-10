@@ -189,6 +189,7 @@ fn worker_config_from_command(command: &RunCommand) -> Result<WorkerConfig> {
         stale_task_timeout_secs: command.stale_task_timeout_secs.max(1),
         skip_worker: command.skip_worker,
         require_worker,
+        default_worker_for_small_tasks: WorkerKind::ZedAgent,
     })
 }
 

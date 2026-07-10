@@ -26,6 +26,26 @@ pub struct WorkerConfig {
     pub stale_task_timeout_secs: usize,
     pub skip_worker: bool,
     pub require_worker: bool,
+    pub default_worker_for_small_tasks: WorkerKind,
+}
+
+impl Default for WorkerConfig {
+    fn default() -> Self {
+        Self {
+            worker_kind: WorkerKind::default(),
+            worker_command: None,
+            worker_model: None,
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: false,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -338,6 +358,14 @@ impl CategoryRouter {
     ) -> SelectedWorkerRoute<'a> {
         let hinted_category = route_hint.and_then(normalized_route_hint);
         if let Some(category) = hinted_category {
+            // For Quick (small/low-risk) tasks, prefer the configured
+            // small-task worker (defaults to ZedAgent) when available
+            // and no explicit worker command is configured.
+            if category == WorkerCategory::Quick && config.worker_command.is_none() {
+                if let Some(route) = self.resolve_small_task(config) {
+                    return route;
+                }
+            }
             let matching_routes = category
                 .preferred_worker_kinds()
                 .iter()
@@ -430,6 +458,61 @@ impl CategoryRouter {
         self.sequence_route(config, attempt, hinted_category)
     }
 
+    /// Try the configured `default_worker_for_small_tasks` (defaults to
+    /// ZedAgent) as the preferred route for Quick-category tasks.
+    /// Returns `None` when the preferred kind has no configured route
+    /// and does not match the config's default `worker_kind`.
+    fn resolve_small_task<'a>(
+        &self,
+        config: &'a WorkerConfig,
+    ) -> Option<SelectedWorkerRoute<'a>> {
+        let preferred = config.default_worker_for_small_tasks;
+
+        // Check configured routes first.
+        if let Some(route) = self.matching_configured_route(config, preferred) {
+            return Some(SelectedWorkerRoute {
+                worker_kind: route.worker_kind,
+                worker_command: route.worker_command.as_deref(),
+                worker_model: route.worker_model.as_deref(),
+                require_worker: config.require_worker || route.worker_command.is_some(),
+                category: WorkerCategory::Quick,
+                route_reason: format!(
+                    "small-task category `quick` matched configured `{}` route",
+                    preferred.as_str()
+                ),
+                prompt_append: combined_prompt_append(
+                    WorkerCategory::Quick.prompt_append(),
+                    worker_prompt_append_from_env(),
+                ),
+                tools: tool_policy_for_category(WorkerCategory::Quick),
+                variant: worker_variant_for_category(WorkerCategory::Quick),
+            });
+        }
+
+        // Fall back to config's own worker_kind when it matches.
+        if config.worker_kind == preferred {
+            return Some(SelectedWorkerRoute {
+                worker_kind: config.worker_kind,
+                worker_command: config.worker_command.as_deref(),
+                worker_model: config.worker_model.as_deref(),
+                require_worker: config.require_worker,
+                category: WorkerCategory::Quick,
+                route_reason: format!(
+                    "small-task category `quick` matched default `{}` worker",
+                    preferred.as_str()
+                ),
+                prompt_append: combined_prompt_append(
+                    WorkerCategory::Quick.prompt_append(),
+                    worker_prompt_append_from_env(),
+                ),
+                tools: tool_policy_for_category(WorkerCategory::Quick),
+                variant: worker_variant_for_category(WorkerCategory::Quick),
+            });
+        }
+
+        None
+    }
+
     fn matching_configured_route<'a>(
         &self,
         config: &'a WorkerConfig,
@@ -460,22 +543,42 @@ impl CategoryRouter {
         });
 
         if config.worker_routes.is_empty() {
+            // For Quick (small/low-risk) tasks, prefer the configured
+            // small-task worker (defaults to ZedAgent) when no explicit
+            // worker command is configured — a configured command means
+            // the user has selected a specific worker.
+            let worker_kind = if category == WorkerCategory::Quick
+                && config.worker_command.is_none()
+            {
+                config.default_worker_for_small_tasks
+            } else {
+                config.worker_kind
+            };
+            let worker_command = config.worker_command.as_deref();
+            let require_worker = config.require_worker;
             return SelectedWorkerRoute {
-                worker_kind: config.worker_kind,
-                worker_command: config.worker_command.as_deref(),
+                worker_kind,
+                worker_command,
                 worker_model: config.worker_model.as_deref(),
-                require_worker: config.require_worker,
+                require_worker,
                 category,
                 route_reason: if hinted_category.is_some() {
                     format!(
-                        "category `{}` fell back to default `{}` worker",
+                        "category `{}` fell back to `{}` worker",
                         category.as_str(),
-                        config.worker_kind.as_str()
+                        worker_kind.as_str()
                     )
                 } else {
                     format!(
-                        "attempt {attempt} used default `{}` worker",
-                        config.worker_kind.as_str()
+                        "attempt {attempt} used `{}` worker{}",
+                        worker_kind.as_str(),
+                        if category == WorkerCategory::Quick
+                            && worker_kind != config.worker_kind
+                        {
+                            " (small-task default)"
+                        } else {
+                            ""
+                        }
                     )
                 },
                 prompt_append: combined_prompt_append(
@@ -2872,6 +2975,7 @@ mod tests {
             max_parallel_per_key: 1,
             stale_task_timeout_secs: 30,
             skip_worker: false,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
             require_worker: false,
         };
 
@@ -2955,6 +3059,7 @@ mod tests {
             max_parallel_per_key: 1,
             stale_task_timeout_secs: 30,
             skip_worker: false,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
             require_worker: false,
         };
 
@@ -3032,6 +3137,7 @@ mod tests {
             max_parallel_per_key: 1,
             stale_task_timeout_secs: 30,
             skip_worker: false,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
             require_worker: false,
         };
 
@@ -3090,6 +3196,7 @@ mod tests {
             max_parallel_per_key: 1,
             stale_task_timeout_secs: 30,
             skip_worker: false,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
             require_worker: false,
         };
 
@@ -3126,6 +3233,7 @@ mod tests {
             max_parallel_per_key: 1,
             stale_task_timeout_secs: 30,
             skip_worker: false,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
             require_worker: false,
         };
 
@@ -3169,6 +3277,7 @@ mod tests {
             max_parallel_per_key: 1,
             stale_task_timeout_secs: 30,
             skip_worker: false,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
             require_worker: false,
         };
 
@@ -3243,6 +3352,7 @@ mod tests {
             max_parallel_per_key: 1,
             stale_task_timeout_secs: 30,
             skip_worker: true,
+            default_worker_for_small_tasks: WorkerKind::Codex,
             require_worker: false,
         };
 
@@ -3422,6 +3532,7 @@ mod tests {
             max_parallel_per_key: 1,
             stale_task_timeout_secs: 30,
             skip_worker: false,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
             require_worker: false,
         };
         let started = Arc::new(AtomicBool::new(false));
@@ -3541,6 +3652,7 @@ mod tests {
             max_parallel_per_key: 1,
             stale_task_timeout_secs: 30,
             skip_worker: false,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
             require_worker: false,
         };
 
@@ -3671,6 +3783,7 @@ mod tests {
             max_parallel_per_key: 1,
             stale_task_timeout_secs: 30,
             skip_worker: false,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
             require_worker: true,
         };
 
@@ -3746,6 +3859,7 @@ mod tests {
             max_parallel_per_key: 1,
             stale_task_timeout_secs: 30,
             skip_worker: false,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
             require_worker: false,
         };
 
@@ -3827,6 +3941,7 @@ mod tests {
             max_parallel_per_key: 1,
             stale_task_timeout_secs: 30,
             skip_worker: false,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
             require_worker: true,
         };
 
@@ -3913,6 +4028,7 @@ mod tests {
             max_parallel_per_key: 1,
             stale_task_timeout_secs: 30,
             skip_worker: true,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
             require_worker: false,
         };
 
@@ -3976,6 +4092,7 @@ mod tests {
             max_parallel_per_key: 1,
             stale_task_timeout_secs: 30,
             skip_worker: false,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
             require_worker: true,
         };
 
@@ -4034,6 +4151,7 @@ mod tests {
             max_parallel_per_key: 1,
             stale_task_timeout_secs: 30,
             skip_worker: false,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
             require_worker: true,
         };
 
@@ -4093,6 +4211,7 @@ mod tests {
             max_parallel_per_key: 1,
             stale_task_timeout_secs: 30,
             skip_worker: false,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
             require_worker: true,
         };
 
@@ -4155,6 +4274,7 @@ mod tests {
             max_parallel_per_key: 1,
             stale_task_timeout_secs: 30,
             skip_worker: false,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
             require_worker: true,
         };
 
@@ -4254,6 +4374,7 @@ mod tests {
             max_parallel_per_key: 1,
             stale_task_timeout_secs: 30,
             skip_worker: false,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
             require_worker: true,
         };
 
@@ -4315,6 +4436,7 @@ mod tests {
             max_parallel_per_key: 1,
             stale_task_timeout_secs: 30,
             skip_worker: false,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
             require_worker: true,
         };
 
@@ -4376,6 +4498,7 @@ mod tests {
             max_parallel_per_key: 1,
             stale_task_timeout_secs: 30,
             skip_worker: false,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
             require_worker: true,
         };
 
@@ -4462,6 +4585,7 @@ mod tests {
             max_parallel_per_key: 1,
             stale_task_timeout_secs: 30,
             skip_worker: false,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
             require_worker: true,
         };
 
@@ -4901,6 +5025,7 @@ mod tests {
             max_parallel_per_key: 1,
             stale_task_timeout_secs: 30,
             skip_worker: false,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
             require_worker: true,
         };
 
@@ -4955,6 +5080,7 @@ mod tests {
             max_parallel_per_key: 1,
             stale_task_timeout_secs: 30,
             skip_worker: false,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
             require_worker: true,
         };
 
@@ -5010,6 +5136,7 @@ mod tests {
             max_parallel_per_key: 1,
             stale_task_timeout_secs: 30,
             skip_worker: false,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
             require_worker: true,
         };
 
@@ -5085,6 +5212,7 @@ mod tests {
             max_parallel_per_key: 1,
             stale_task_timeout_secs: 30,
             skip_worker: false,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
             require_worker: true,
         };
 
@@ -5144,6 +5272,7 @@ mod tests {
             max_parallel_per_key: 1,
             stale_task_timeout_secs: 30,
             skip_worker: false,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
             require_worker: true,
         };
 
@@ -5414,6 +5543,7 @@ mod tests {
             max_parallel_per_key: 1,
             stale_task_timeout_secs: 30,
             skip_worker: false,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
             require_worker: true,
         };
 

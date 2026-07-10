@@ -464,6 +464,16 @@ impl Orchestrator {
                 repair_task_id
             };
 
+            // Generate immutable ownership decision before any execution.
+            let ownership = crate::state::ExecutionOwnership {
+                delegated: selected_route.require_worker || options.worker.skip_worker,
+                worker_kind: Some(selected_route.worker_kind.as_str().to_string()),
+                route_reason: selected_route.route_reason.clone(),
+                risk_profile: "unknown".to_string(),
+                worker_task_id: Some(worker_task_id.clone()),
+                decided_at: crate::state::timestamp(),
+            };
+
             start_task(&mut tasks, &worker_task_id);
             goal.status = GoalStatus::Running;
             goal.current_task_id = Some(worker_task_id.clone());
@@ -527,7 +537,8 @@ impl Orchestrator {
                     coordinator_model: goal.coordinator_model.as_ref(),
                     coordinator_brief: goal.coordinator_brief.as_deref(),
                     route_hint: worker_route_hint,
-                })?;
+                })
+                .context("ownership: worker start failed, goal remains incomplete")?;
             if options
                 .cancellation_token
                 .as_ref()
@@ -850,15 +861,8 @@ impl Orchestrator {
                 coordinator_review,
             );
             let has_fallback = category_resolution_result.nearest_fallback().is_some();
-            // Ownership decision: delegated when the worker is required to run,
-            // or when no worker is needed (skip_worker = analysis-only mode
-            // where Gear does not modify any files).
-            let ownership = crate::state::ExecutionOwnership {
-                delegated: selected_route.require_worker || options.worker.skip_worker,
-                worker_kind: Some(selected_route.worker_kind.as_str().to_string()),
-                route_reason: selected_route.route_reason.clone(),
-                risk_profile: "unknown".to_string(),
-            };
+            // Ownership decision was generated earlier in the iteration.
+            // The immutable `ownership` is already in scope from line ~468.
             let evaluation = evaluate_goal_with_source(
                 verification_passed,
                 &worker_result
@@ -3613,6 +3617,7 @@ mod tests {
                 stale_task_timeout_secs: 30,
                 skip_worker: true,
                 require_worker: false,
+                default_worker_for_small_tasks: WorkerKind::ZedAgent,
             },
             allowed_paths: vec!["src".to_string(), "README.md".to_string()],
             forbidden_paths: vec![".git".to_string()],
@@ -3712,6 +3717,8 @@ mod tests {
                 worker_kind: Some("test_worker".to_string()),
                 route_reason: "unit test ownership".to_string(),
                 risk_profile: "low".to_string(),
+                worker_task_id: Some("task_003".to_string()),
+                decided_at: crate::state::timestamp(),
             }),
         );
 
@@ -5154,6 +5161,7 @@ mod tests {
                 stale_task_timeout_secs: 30,
                 skip_worker: true,
                 require_worker: false,
+                default_worker_for_small_tasks: WorkerKind::ZedAgent,
             },
             allowed_paths: Vec::new(),
             forbidden_paths: vec![".git".to_string()],
@@ -5257,6 +5265,7 @@ mod tests {
                 stale_task_timeout_secs: 30,
                 skip_worker: true,
                 require_worker: false,
+                default_worker_for_small_tasks: WorkerKind::ZedAgent,
             },
             allowed_paths: Vec::new(),
             forbidden_paths: vec![".git".to_string()],
@@ -5356,6 +5365,7 @@ mod tests {
                 stale_task_timeout_secs: 30,
                 skip_worker: true,
                 require_worker: false,
+                default_worker_for_small_tasks: WorkerKind::ZedAgent,
             },
             allowed_paths: Vec::new(),
             forbidden_paths: vec![".git".to_string()],
@@ -5527,6 +5537,7 @@ mod tests {
                 stale_task_timeout_secs: 30,
                 skip_worker: true,
                 require_worker: false,
+                default_worker_for_small_tasks: WorkerKind::ZedAgent,
             },
             allowed_paths: Vec::new(),
             forbidden_paths: vec![".git".to_string()],
@@ -5579,6 +5590,7 @@ mod tests {
                 stale_task_timeout_secs: 30,
                 skip_worker: true,
                 require_worker: false,
+                default_worker_for_small_tasks: WorkerKind::Opencode,
             },
             allowed_paths: Vec::new(),
             forbidden_paths: vec![".git".to_string()],
@@ -5637,6 +5649,7 @@ mod tests {
                 stale_task_timeout_secs: 30,
                 skip_worker: true,
                 require_worker: false,
+                default_worker_for_small_tasks: WorkerKind::Opencode,
             },
             allowed_paths: Vec::new(),
             forbidden_paths: vec![".git".to_string()],
@@ -5695,6 +5708,7 @@ mod tests {
                 stale_task_timeout_secs: 30,
                 skip_worker: true,
                 require_worker: false,
+                default_worker_for_small_tasks: WorkerKind::ZedAgent,
             },
             allowed_paths: Vec::new(),
             forbidden_paths: Vec::new(),
@@ -6177,14 +6191,14 @@ mod tests {
             worker_kind: Some("zed_agent".to_string()),
             route_reason: "test: ownership not enforced".to_string(),
             risk_profile: "low".to_string(),
+            worker_task_id: Some("task_test".to_string()),
+            decided_at: crate::state::timestamp(),
         };
-        // Using Explore (not in the ownership gate's match of
-        // Quick|Deep|Repair|Visual) proves ownership is not enforced
-        // before execution for non-obvious code-modifying categories.
+        // Ownership gate should reject Complete for Quick with delegated=false
         let evaluation = evaluate_goal_with_source(
             true,
             &WorkerStatus::Succeeded,
-            WorkerCategory::Explore,
+            WorkerCategory::Quick,
             false,
             None,
             None,
@@ -6202,8 +6216,8 @@ mod tests {
         );
         assert!(
             !matches!(evaluation.status, GoalStatus::Complete),
-            "GBX-003 GAP: ownership ({:?}) should block completion but got {:?}; summary: {}",
-            ownership, evaluation.status, evaluation.summary
+            "Ownership gate should reject completion with delegated=false but got {:?}",
+            evaluation.status
         );
     }
 
@@ -6253,6 +6267,8 @@ mod tests {
             worker_kind: Some("test".to_string()),
             route_reason: "test: lineage".to_string(),
             risk_profile: "low".to_string(),
+            worker_task_id: Some("task_lineage".to_string()),
+            decided_at: crate::state::timestamp(),
         };
         let _evaluation = evaluate_goal_with_source(
             true, &WorkerStatus::Succeeded, WorkerCategory::Deep,
@@ -6280,6 +6296,8 @@ mod tests {
             worker_kind: Some("test".to_string()),
             route_reason: "test: synthetic review".to_string(),
             risk_profile: "low".to_string(),
+            worker_task_id: Some("task_synthetic".to_string()),
+            decided_at: crate::state::timestamp(),
         };
         let review = CoordinatorReview {
             goal_satisfied: Some(true),

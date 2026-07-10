@@ -332,6 +332,7 @@ pub mod test_support {
             stale_task_timeout_secs: 30,
             skip_worker: false,
             require_worker: false,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
         }
     }
 

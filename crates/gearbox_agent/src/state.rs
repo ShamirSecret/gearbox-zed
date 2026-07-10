@@ -107,7 +107,18 @@ pub struct ExecutionOwnership {
     pub route_reason: String,
     /// Risk profile used for routing: "low", "medium", "high", or "unknown".
     pub risk_profile: String,
+    /// The worker task ID assigned to handle this execution, if any.
+    pub worker_task_id: Option<String>,
+    /// Timestamp when this ownership decision was made.
+    pub decided_at: String,
 }
+
+/// @see ExecutionOwnership
+#[deprecated(
+    since = "0.1.0",
+    note = "use ExecutionOwnership directly with worker_task_id and decided_at fields"
+)]
+pub type OwnershipDecision = ExecutionOwnership;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Goal {

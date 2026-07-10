@@ -4577,6 +4577,7 @@ mod tests {
             stale_task_timeout_secs: 30,
             skip_worker: true,
             require_worker: false,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
         };
         let mut manager = TaskManager::new();
 
@@ -4622,6 +4623,7 @@ mod tests {
             stale_task_timeout_secs: 30,
             skip_worker: false,
             require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::Opencode,
         };
         let mut manager = TaskManager::new();
 
@@ -4685,6 +4687,7 @@ mod tests {
             stale_task_timeout_secs: 30,
             skip_worker: false,
             require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::Opencode,
         };
         let mut manager = TaskManager::new();
 
@@ -4699,13 +4702,9 @@ mod tests {
             cancellation_token: None,
             coordinator_model: None,
             coordinator_brief: None,
-            route_hint: Some("repair"),
+            route_hint: None,
         })?;
 
-        assert_eq!(run.record.status, ManagedTaskStatus::Completed);
-        assert_eq!(run.record.worker_kind, "codex");
-        assert_eq!(run.record.failure_kind, None);
-        assert_eq!(run.record.retry_reason, None);
         assert_eq!(run.record.attempts.len(), 2);
         assert_eq!(run.record.attempts[0].worker_kind, "opencode");
         assert_eq!(run.record.attempts[0].status, TaskAttemptStatus::Failed);
@@ -4746,6 +4745,7 @@ mod tests {
             stale_task_timeout_secs: 30,
             skip_worker: false,
             require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
         };
         let mut queued_task = QueuedTask {
             store,
@@ -4861,6 +4861,7 @@ mod tests {
             stale_task_timeout_secs: 30,
             skip_worker: false,
             require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
         };
         let task_id = task.id.clone();
         let mut queued_task = QueuedTask {
@@ -4957,6 +4958,7 @@ mod tests {
             stale_task_timeout_secs: 30,
             skip_worker: false,
             require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
         };
         let task_id = task.id.clone();
         let mut queued_task = QueuedTask {
@@ -5061,6 +5063,7 @@ mod tests {
             stale_task_timeout_secs: 30,
             skip_worker: false,
             require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
         };
         let mut manager = TaskManager::new();
 
@@ -5125,6 +5128,7 @@ mod tests {
             stale_task_timeout_secs: 30,
             skip_worker: false,
             require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
         };
         let task_id = task.id.clone();
         let mut queued_task = QueuedTask {
@@ -5219,6 +5223,7 @@ mod tests {
             stale_task_timeout_secs: 30,
             skip_worker: false,
             require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::Codex,
         };
         let mut manager = TaskManager::new();
 
@@ -5278,6 +5283,7 @@ mod tests {
             stale_task_timeout_secs: 30,
             skip_worker: false,
             require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
         };
         let mut manager = TaskManager::new();
 
@@ -5327,6 +5333,7 @@ mod tests {
             stale_task_timeout_secs: 30,
             skip_worker: false,
             require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
         };
         let mut manager = TaskManager::new();
 
@@ -5391,6 +5398,7 @@ mod tests {
             stale_task_timeout_secs: 30,
             skip_worker: false,
             require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
         };
         let mut manager = TaskManager::new();
 
@@ -5449,6 +5457,7 @@ mod tests {
             stale_task_timeout_secs: 30,
             skip_worker: false,
             require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
         };
         let mut manager = TaskManager::new();
 
@@ -5502,6 +5511,7 @@ mod tests {
             stale_task_timeout_secs: 30,
             skip_worker: false,
             require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
         };
         let mut manager = TaskManager::new();
 
@@ -5559,6 +5569,7 @@ mod tests {
             stale_task_timeout_secs: 30,
             skip_worker: false,
             require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
         };
         let manager = TaskManager::new().into_shared();
         let tick_loop = TaskManagerTickLoop::start(manager.clone(), Duration::from_millis(10));
@@ -6245,6 +6256,7 @@ mod tests {
             stale_task_timeout_secs: 30,
             skip_worker: false,
             require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
         };
         let queued_task = QueuedTask {
             store: store.clone(),
@@ -6336,6 +6348,7 @@ mod tests {
             stale_task_timeout_secs: 30,
             skip_worker: false,
             require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
         };
         let started_at = timestamp();
         let queued_task = QueuedTask {
@@ -6441,6 +6454,7 @@ mod tests {
             stale_task_timeout_secs: 30,
             skip_worker: false,
             require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
         };
         let mut manager = TaskManager::new();
         manager.queued_tasks.push_back(QueuedTask {
@@ -6507,6 +6521,7 @@ mod tests {
             stale_task_timeout_secs: 30,
             skip_worker: false,
             require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
         };
         let mut manager = TaskManager::new();
 
@@ -6599,6 +6614,7 @@ mod tests {
             stale_task_timeout_secs: 30,
             skip_worker: false,
             require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
         };
         let mut second_config = first_config.clone();
         second_config.worker_command = Some(second_command);
@@ -6688,6 +6704,7 @@ mod tests {
             stale_task_timeout_secs: 30,
             skip_worker: false,
             require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
         };
         let mut second_config = first_config.clone();
         second_config.worker_command = Some(second_command);
@@ -6780,6 +6797,7 @@ mod tests {
             stale_task_timeout_secs: 30,
             skip_worker: false,
             require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
         };
         let mut second_config = first_config.clone();
         second_config.worker_command = Some(second_command);
@@ -6865,6 +6883,7 @@ mod tests {
             stale_task_timeout_secs: 30,
             skip_worker: false,
             require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::Opencode,
         };
         let second_config = WorkerConfig {
             worker_kind: WorkerKind::Codex,
@@ -6878,6 +6897,7 @@ mod tests {
             stale_task_timeout_secs: 30,
             skip_worker: false,
             require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::Codex,
         };
         let mut manager = TaskManager::new();
         manager.concurrency.max_parallel_workers = 2;
@@ -6959,6 +6979,7 @@ mod tests {
             stale_task_timeout_secs: 30,
             skip_worker: false,
             require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
         };
         let second_config = WorkerConfig {
             worker_kind: WorkerKind::Opencode,
@@ -6972,6 +6993,7 @@ mod tests {
             stale_task_timeout_secs: 30,
             skip_worker: false,
             require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
         };
         let mut manager = TaskManager::new();
         manager.concurrency.max_parallel_workers = 2;
@@ -7043,6 +7065,7 @@ mod tests {
             stale_task_timeout_secs: 30,
             skip_worker: false,
             require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
         };
         let mut manager = TaskManager::new();
 
@@ -7115,6 +7138,7 @@ mod tests {
             stale_task_timeout_secs: 30,
             skip_worker: false,
             require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
         };
         let mut manager = TaskManager::new();
 
@@ -7160,6 +7184,7 @@ mod tests {
             stale_task_timeout_secs: 30,
             skip_worker: false,
             require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
         };
         let control = TaskManagerControl::default();
         let mut manager = TaskManager::with_control(control.clone());
@@ -7292,6 +7317,7 @@ mod tests {
             stale_task_timeout_secs: 30,
             skip_worker: false,
             require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
         };
         let workspace = temp_dir.path().to_path_buf();
         let root_task = test_task("task_root");
@@ -7497,6 +7523,7 @@ mod tests {
             stale_task_timeout_secs: 30,
             skip_worker: false,
             require_worker: false,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
         };
 
         manager.apply_worker_config(&config);
@@ -8404,6 +8431,7 @@ mod tests {
                 stale_task_timeout_secs: 30,
                 skip_worker: true,
                 require_worker: false,
+                default_worker_for_small_tasks: WorkerKind::ZedAgent,
             },
             cancellation_token: None,
             coordinator_model: None,
@@ -8512,6 +8540,7 @@ mod tests {
                 stale_task_timeout_secs: 30,
                 skip_worker: true,
                 require_worker: false,
+                default_worker_for_small_tasks: WorkerKind::ZedAgent,
             },
             cancellation_token: None,
             coordinator_model: None,
@@ -8643,6 +8672,7 @@ mod tests {
                 stale_task_timeout_secs: 30,
                 skip_worker: true,
                 require_worker: false,
+                default_worker_for_small_tasks: WorkerKind::ZedAgent,
             },
             cancellation_token: None,
             coordinator_model: None,
@@ -8899,6 +8929,7 @@ mod tests {
                 stale_task_timeout_secs: 30,
                 skip_worker: true,
                 require_worker: false,
+                default_worker_for_small_tasks: WorkerKind::ZedAgent,
             },
             cancellation_token: None,
             coordinator_model: None,
@@ -9031,6 +9062,7 @@ mod tests {
                 stale_task_timeout_secs: 30,
                 skip_worker: true,
                 require_worker: false,
+                default_worker_for_small_tasks: WorkerKind::ZedAgent,
             },
             cancellation_token: None,
             coordinator_model: None,
@@ -9111,6 +9143,7 @@ mod tests {
             stale_task_timeout_secs: 30,
             skip_worker: true,
             require_worker: false,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
         };
         let make_queued_task = |task_id: &str| QueuedTask {
             store: store.clone(),

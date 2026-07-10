@@ -3558,6 +3558,7 @@ fn gear_worker_config_from_values(
         stale_task_timeout_secs: stale_task_timeout_secs.max(1),
         skip_worker: false,
         require_worker,
+        default_worker_for_small_tasks: WorkerKind::ZedAgent,
     }
 }
 
@@ -6731,6 +6732,7 @@ mod internal_tests {
             stale_task_timeout_secs: 30,
             skip_worker: false,
             require_worker: false,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
         };
         let handle = backend
             .start_zed_agent(WorkerStartRequest {
@@ -9877,6 +9879,95 @@ mod internal_tests {
         // silently mangling unrelated user text.
         assert_eq!(strip_slash_command_prefix("hello world"), "hello world",);
     }
+}
+
+/// Create a Zed native agent sub-session for a one-shot quick task.
+///
+/// The subagent is created under the given parent Gear session and runs the
+/// provided prompt through a fresh Zed Agent thread. Returns the assistant's
+/// response text on success.
+///
+/// This is a simplified wrapper around the native Zed worker sub-agent
+/// creation path, intended for small/low-risk "小修" tasks dispatched by
+/// the Gearbox orchestrator.
+pub fn create_gearbox_agent_session(
+    agent: WeakEntity<NativeAgent>,
+    parent_session_id: &acp::SessionId,
+    task_id: String,
+    prompt: String,
+    cx: &mut App,
+) -> Task<Result<String>> {
+    let parent_session_id = parent_session_id.clone();
+    cx.spawn(async move |cx| {
+        let (_parent_thread, subagent_thread, acp_thread) = agent
+            .update(cx, |agent, cx| -> Result<_> {
+                let parent_session = agent
+                    .sessions
+                    .get(&parent_session_id)
+                    .context("parent Gear session not found")?;
+                let parent_thread = parent_session.thread.clone();
+                let subagent_thread = cx.new(|cx| {
+                    let mut thread = Thread::new_subagent(&parent_thread, cx);
+                    thread
+                        .set_title(format!("Gear Quick Worker {task_id}").into(), cx);
+                    thread
+                });
+                let acp_thread = agent.register_session(
+                    subagent_thread.clone(),
+                    parent_session.project_id,
+                    1,
+                    None,
+                    ZED_AGENT_ID.clone(),
+                    "zed".into(),
+                    cx,
+                );
+                parent_thread
+                    .update(cx, |thread, _cx| {
+                        thread.register_running_subagent(subagent_thread.downgrade())
+                    });
+                Ok((parent_thread, subagent_thread, acp_thread))
+            })??;
+
+        let acp_response = acp_thread
+            .update(cx, |acp_thread, cx| {
+                acp_thread.send(vec![prompt.into()], cx)
+            })
+            .await?;
+
+        if let Some(ref acp_response) = acp_response {
+            match acp_response.stop_reason {
+                acp::StopReason::EndTurn | acp::StopReason::MaxTokens => {}
+                acp::StopReason::Cancelled => {
+                    anyhow::bail!("Zed agent sub-session was cancelled");
+                }
+                _ => {
+                    anyhow::bail!(
+                        "Zed agent sub-session stopped: {:?}",
+                        acp_response.stop_reason
+                    );
+                }
+            }
+        }
+
+        let assistant_text = subagent_thread.read_with(cx, |thread, _cx| {
+            thread
+                .last_message()
+                .and_then(|message| {
+                    let content = message
+                        .as_agent_message()?
+                        .content
+                        .iter()
+                        .filter_map(|content| match content {
+                            AgentMessageContent::Text(text) => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .join("\n\n");
+                    (!content.is_empty()).then_some(content)
+                })
+                .unwrap_or_default()
+        });
+        Ok(assistant_text)
+    })
 }
 
 fn mcp_message_content_to_acp_content_block(
