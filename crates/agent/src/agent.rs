@@ -59,8 +59,9 @@ use gearbox_agent::runtime::{
 };
 use gearbox_agent::state::{CoordinatorModel, StateStore};
 use gearbox_agent::task_manager::{
-    ManagedTaskStatus, SharedTaskManager, TaskAttemptSnapshot, TaskManager, TaskManagerControl,
-    TaskManagerSnapshot, TaskManagerTickLoop, TaskSnapshot,
+    ActionOutcome, ManagedTaskStatus, SendOutcome, SharedTaskManager, SteerOutcome,
+    TaskAttemptSnapshot, TaskManager, TaskManagerControl, TaskManagerSnapshot, TaskManagerTickLoop,
+    TaskSnapshot,
 };
 use gearbox_agent::tools::CancellationToken;
 use gearbox_agent::workers::{
@@ -2251,15 +2252,19 @@ impl NativeAgentConnection {
             .and_then(|session| session.gear_task_manager_control.clone())
     }
 
-    pub fn interrupt_gear_task(&self, session_id: &acp::SessionId, cx: &App) -> Result<bool> {
+    pub fn interrupt_gear_task(
+        &self,
+        session_id: &acp::SessionId,
+        cx: &App,
+    ) -> Result<ActionOutcome> {
         let Some(control) = self.gear_task_manager_control(session_id, cx) else {
-            return Ok(false);
+            return Ok(ActionOutcome::Noop);
         };
         let Some(task_id) = control.current_task_id()? else {
-            return Ok(false);
+            return Ok(ActionOutcome::Noop);
         };
         let Some(task_manager) = self.gear_task_manager(session_id, cx) else {
-            return Ok(false);
+            return Ok(ActionOutcome::Noop);
         };
         task_manager
             .lock()
@@ -2267,21 +2272,24 @@ impl NativeAgentConnection {
             .interrupt_task(&task_id)
     }
 
-    pub fn cancel_gear_task(&self, session_id: &acp::SessionId, cx: &App) -> Result<bool> {
+    pub fn cancel_gear_task(
+        &self,
+        session_id: &acp::SessionId,
+        cx: &App,
+    ) -> Result<ActionOutcome> {
         let Some(control) = self.gear_task_manager_control(session_id, cx) else {
-            return Ok(false);
+            return Ok(ActionOutcome::Noop);
         };
         let Some(task_id) = control.current_task_id()? else {
-            return Ok(false);
+            return Ok(ActionOutcome::Noop);
         };
         let Some(task_manager) = self.gear_task_manager(session_id, cx) else {
-            return Ok(false);
+            return Ok(ActionOutcome::Noop);
         };
         task_manager
             .lock()
             .map_err(|_| anyhow::anyhow!("gear task manager mutex poisoned"))?
-            .cancel_task(&task_id)
-            .map(|_| true)
+            .cancel_task_with_outcome(&task_id)
     }
 
     pub fn send_follow_up_gear_task(
@@ -2289,28 +2297,20 @@ impl NativeAgentConnection {
         session_id: &acp::SessionId,
         prompt: String,
         cx: &App,
-    ) -> Result<bool> {
-        let Some(control) = self.gear_task_manager_control(session_id, cx) else {
-            return Ok(false);
+    ) -> Result<SendOutcome> {
+        let Some(task_manager) = self.gear_task_manager(session_id, cx) else {
+            return Ok(SendOutcome::Noop);
         };
-        let Some(task_id) = control.current_task_id()? else {
-            return Ok(false);
+        let Some(task_id) = self
+            .gear_task_manager_control(session_id, cx)
+            .and_then(|control| control.current_task_id().ok().flatten())
+        else {
+            return Ok(SendOutcome::Noop);
         };
-        match control.current_task_status()? {
-            Some(ManagedTaskStatus::Pending) | Some(ManagedTaskStatus::Running) => {
-                control.send_follow_up_task(&task_id, prompt)
-            }
-            Some(_) => {
-                let Some(task_manager) = self.gear_task_manager(session_id, cx) else {
-                    return Ok(false);
-                };
-                task_manager
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("gear task manager mutex poisoned"))?
-                    .send_follow_up_task(&task_id, prompt)
-            }
-            None => Ok(false),
-        }
+        task_manager
+            .lock()
+            .map_err(|_| anyhow::anyhow!("gear task manager mutex poisoned"))?
+            .send_follow_up_task(&task_id, prompt)
     }
 
     pub fn steer_gear_task(
@@ -2318,28 +2318,20 @@ impl NativeAgentConnection {
         session_id: &acp::SessionId,
         prompt: String,
         cx: &App,
-    ) -> Result<bool> {
-        let Some(control) = self.gear_task_manager_control(session_id, cx) else {
-            return Ok(false);
+    ) -> Result<SteerOutcome> {
+        let Some(task_manager) = self.gear_task_manager(session_id, cx) else {
+            return Ok(SteerOutcome::Noop);
         };
-        let Some(task_id) = control.current_task_id()? else {
-            return Ok(false);
+        let Some(task_id) = self
+            .gear_task_manager_control(session_id, cx)
+            .and_then(|control| control.current_task_id().ok().flatten())
+        else {
+            return Ok(SteerOutcome::Noop);
         };
-        match control.current_task_status()? {
-            Some(ManagedTaskStatus::Pending) | Some(ManagedTaskStatus::Running) => {
-                control.steer_task(&task_id, prompt)
-            }
-            Some(_) => {
-                let Some(task_manager) = self.gear_task_manager(session_id, cx) else {
-                    return Ok(false);
-                };
-                task_manager
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("gear task manager mutex poisoned"))?
-                    .steer_task(&task_id, prompt)
-            }
-            None => Ok(false),
-        }
+        task_manager
+            .lock()
+            .map_err(|_| anyhow::anyhow!("gear task manager mutex poisoned"))?
+            .steer_task(&task_id, prompt)
     }
 
     /// Forwards to [`NativeAgent::ensure_skills_scan_started`]. The

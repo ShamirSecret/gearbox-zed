@@ -863,6 +863,25 @@ pub enum CategoryResolutionResult {
     },
 }
 
+impl CategoryResolutionResult {
+    pub fn nearest_fallback(&self) -> Option<&FallbackRoute> {
+        match self {
+            CategoryResolutionResult::Resolved {
+                nearest_fallback, ..
+            }
+            | CategoryResolutionResult::Disabled {
+                nearest_fallback, ..
+            }
+            | CategoryResolutionResult::NotFound {
+                nearest_fallback, ..
+            }
+            | CategoryResolutionResult::ModelUnavailable {
+                nearest_fallback, ..
+            } => nearest_fallback.as_ref(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VerificationContract {
     pub preferred_commands: Vec<String>,
@@ -1566,6 +1585,8 @@ impl CommandWorkerSessionHandle {
                 output.stdout, output.stderr
             ),
         )?;
+        // Parse stdout for tool call patterns and emit granular deltas
+        self.parse_and_emit_tool_events(&output.stdout, &turn_kind)?;
         self.emit_event(WorkerEvent::WorkerStdout {
             kind: turn_kind.clone(),
             output: output.stdout.clone(),
@@ -1683,6 +1704,166 @@ impl CommandWorkerSessionHandle {
             .result
             .lock()
             .map_err(|_| anyhow::anyhow!("worker result mutex poisoned"))? = None;
+        Ok(())
+    }
+
+    fn parse_and_emit_tool_events(&self, stdout: &str, kind: &str) -> Result<()> {
+        if !self.supports_interaction || stdout.is_empty() {
+            return Ok(());
+        }
+
+        let mut pos = 0;
+        let bytes = stdout.as_bytes();
+
+        while pos < bytes.len() {
+            // Look for <function_calls> or <tool_use> tag
+            let function_calls_tag = b"<function_calls>";
+            let tool_use_tag = b"<tool_use>";
+            let mut found_start = None;
+
+            // Scan for the earliest opening tag
+            if let Some(p) = find_subsequence(&bytes[pos..], function_calls_tag) {
+                found_start = Some((pos + p, function_calls_tag.len(), "function_calls"));
+            }
+            if let Some(p) = find_subsequence(&bytes[pos..], tool_use_tag) {
+                let abs_p = pos + p;
+                match found_start {
+                    Some((existing, _, _)) if abs_p < existing => {
+                        found_start = Some((abs_p, tool_use_tag.len(), "tool_use"));
+                    }
+                    None => {
+                        found_start = Some((abs_p, tool_use_tag.len(), "tool_use"));
+                    }
+                    _ => {}
+                }
+            }
+
+            let Some((start, tag_len, _tag_name)) = found_start else {
+                // No more tool call groups, emit remaining text
+                let delta = &stdout[pos..];
+                if !delta.is_empty() {
+                    self.emit_event(WorkerEvent::AssistantTextDelta {
+                        kind: kind.to_string(),
+                        delta: delta.to_string(),
+                    })?;
+                }
+                break;
+            };
+
+            if start > pos {
+                // Emit text before tool call group
+                self.emit_event(WorkerEvent::AssistantTextDelta {
+                    kind: kind.to_string(),
+                    delta: stdout[pos..start].to_string(),
+                })?;
+            }
+
+            // Find the closing tag: </function_calls> or </tool_use>
+            let closing_function_calls = b"</function_calls>";
+            let closing_tool_use = b"</tool_use>";
+            let group_content_start = start + tag_len;
+            let closing_pos =
+                find_subsequence(&bytes[group_content_start..], closing_function_calls)
+                    .or_else(|| find_subsequence(&bytes[group_content_start..], closing_tool_use));
+
+            let Some(closing_offset) = closing_pos else {
+                // No closing tag found, emit remaining as text
+                let delta = &stdout[pos..];
+                if !delta.is_empty() {
+                    self.emit_event(WorkerEvent::AssistantTextDelta {
+                        kind: kind.to_string(),
+                        delta: delta.to_string(),
+                    })?;
+                }
+                break;
+            };
+
+            let group_end = group_content_start + closing_offset;
+            let group_content = &stdout[group_content_start..group_end];
+
+            // Parse individual tool invocations within the group
+            let mut invoke_pos = 0;
+            let invoke_bytes = group_content.as_bytes();
+            let invoke_tag = b"<invoke";
+
+            while invoke_pos < invoke_bytes.len() {
+                if let Some(invoke_start) =
+                    find_subsequence(&invoke_bytes[invoke_pos..], invoke_tag)
+                {
+                    let abs_invoke_start = invoke_pos + invoke_start;
+
+                    // Emit any text before this invoke
+                    if abs_invoke_start > invoke_pos {
+                        let text_before = &group_content[invoke_pos..abs_invoke_start];
+                        if !text_before.trim().is_empty() {
+                            self.emit_event(WorkerEvent::AssistantTextDelta {
+                                kind: kind.to_string(),
+                                delta: text_before.to_string(),
+                            })?;
+                        }
+                    }
+
+                    // Extract tool name from the invoke tag
+                    let after_tag = &group_content[abs_invoke_start + 7..]; // skip "<invoke"
+                    let tool_name = extract_xml_attr(after_tag, "name").unwrap_or("unknown");
+                    let tool_name = tool_name.to_string();
+
+                    // Extract arguments from inside the invoke block
+                    let invoke_close =
+                        find_subsequence(&invoke_bytes[abs_invoke_start..], b"</invoke>");
+                    let args = if let Some(close_offset) = invoke_close {
+                        let content_end = abs_invoke_start + close_offset;
+                        let inner = &group_content[abs_invoke_start + 7..content_end];
+                        extract_invoke_arguments(inner)
+                    } else {
+                        String::new()
+                    };
+
+                    self.emit_event(WorkerEvent::ToolCallStarted {
+                        kind: kind.to_string(),
+                        tool_name: tool_name.clone(),
+                        arguments: args,
+                    })?;
+
+                    // Emit ToolCallFinished right after start for post-hoc parsing
+                    // (we don't have a separate result stream for command-backed workers)
+                    self.emit_event(WorkerEvent::ToolCallFinished {
+                        kind: kind.to_string(),
+                        tool_name,
+                        result: String::new(),
+                    })?;
+
+                    if let Some(close_offset) = invoke_close {
+                        invoke_pos = abs_invoke_start + close_offset + 9; // skip "</invoke>"
+                    } else {
+                        break;
+                    }
+                } else {
+                    // No more invokes, emit remaining text
+                    let remaining = &group_content[invoke_pos..];
+                    if !remaining.trim().is_empty() {
+                        self.emit_event(WorkerEvent::AssistantTextDelta {
+                            kind: kind.to_string(),
+                            delta: remaining.to_string(),
+                        })?;
+                    }
+                    break;
+                }
+            }
+
+            let closing_tag_len = if find_subsequence(
+                &bytes[group_content_start..],
+                closing_function_calls,
+            )
+            .is_some()
+            {
+                closing_function_calls.len()
+            } else {
+                closing_tool_use.len()
+            };
+            pos = group_end + closing_tag_len;
+        }
+
         Ok(())
     }
 
@@ -2088,6 +2269,64 @@ fn output_from_result(result: &WorkerResult) -> Result<Option<String>> {
         );
     }
     Ok(Some(output))
+}
+
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn extract_xml_attr<'a>(text: &'a str, attr_name: &str) -> Option<&'a str> {
+    let pattern = format!("{}=\"", attr_name);
+    let start = text.find(&pattern)?;
+    let value_start = start + pattern.len();
+    let value_end = text[value_start..].find('"')?;
+    Some(&text[value_start..value_start + value_end])
+}
+
+fn extract_invoke_arguments(text: &str) -> String {
+    let mut args = Vec::new();
+    let mut pos = 0;
+    let bytes = text.as_bytes();
+    let param_tag = b"<parameter";
+
+    while pos < bytes.len() {
+        if let Some(start) = find_subsequence(&bytes[pos..], param_tag) {
+            let abs_start = pos + start;
+            let after_tag = &text[abs_start + 10..];
+            if let Some(param_name) = extract_xml_attr(after_tag, "name") {
+                if let Some(content_start) = after_tag.find('>') {
+                    let content_begin = content_start + 1;
+                    let close_tag = "</parameter>";
+                    if let Some(content_end) = after_tag[content_begin..].find(close_tag) {
+                        let value = &after_tag[content_begin..content_begin + content_end];
+                        args.push(format!("{}={}", param_name, value));
+                        pos = abs_start + 10 + content_begin + content_end + close_tag.len();
+                        continue;
+                    }
+                }
+            }
+            pos = abs_start + 1;
+        } else {
+            break;
+        }
+    }
+
+    if args.is_empty() {
+        // Fallback: return the raw text content
+        let stripped = text
+            .trim()
+            .trim_start_matches("<parameter")
+            .trim_end_matches("</parameter>")
+            .trim();
+        if !stripped.is_empty() && stripped.len() < text.len() {
+            return stripped.to_string();
+        }
+        return String::new();
+    }
+
+    args.join(", ")
 }
 
 fn unavailable_command_summary(command: &str) -> Option<String> {
@@ -3303,6 +3542,430 @@ mod tests {
             turn_started_count, 1,
             "should have received 1 turn_started event"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn worker_transcript_includes_tool_call_deltas() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = Task {
+            id: "task_tool_deltas".to_string(),
+            goal_id: "goal_test".to_string(),
+            title: "test tool call deltas".to_string(),
+            kind: crate::state::TaskKind::Edit,
+            status: crate::state::TaskStatus::Pending,
+            assigned_worker: Some("opencode_session".to_string()),
+            attempt: 1,
+            parent_task_id: None,
+            scope: Scope::new(Vec::new(), Vec::new(), 10),
+            inputs: crate::state::TaskInputs::default(),
+            outputs: crate::state::TaskOutputs::default(),
+        };
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::OpencodeSession,
+            worker_command: Some(
+                r#"printf 'Before tool.\n<function_calls>\n<invoke name="read_file">\n<parameter name="path">src/main.rs</parameter>\n</invoke>\n</function_calls>\nAfter tool.'"#.to_string(),
+            ),
+            worker_model: None,
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: true,
+        };
+
+        let handle = OpencodeSessionWorker {}.start(WorkerStartRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &task,
+            route_attempt: 1,
+            goal: "test goal",
+            verification_commands: &[],
+            config: &config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        })?;
+
+        let received_events = Arc::new(Mutex::new(Vec::new()));
+        let _subscription = handle.subscribe(Arc::new({
+            let received_events = received_events.clone();
+            move |event| {
+                if let Ok(mut events) = received_events.lock() {
+                    events.push(event);
+                }
+            }
+        }))?;
+
+        handle.wait_for_result()?;
+
+        let transcript =
+            std::fs::read_to_string(store.worker_dir(&task.id).join("transcript.jsonl"))?;
+        assert!(
+            transcript.contains("\"tool_call_started\""),
+            "transcript should contain tool_call_started"
+        );
+        assert!(
+            transcript.contains("\"tool_call_finished\""),
+            "transcript should contain tool_call_finished"
+        );
+        assert!(
+            transcript.contains("\"assistant_text_delta\""),
+            "transcript should contain assistant_text_delta"
+        );
+        assert!(
+            transcript.contains("\"read_file\""),
+            "transcript should contain the tool name read_file"
+        );
+
+        let tool_events =
+            std::fs::read_to_string(store.worker_dir(&task.id).join("tool-events.jsonl"))?;
+        assert!(
+            tool_events.contains("\"tool_call_started\""),
+            "tool-events should contain tool_call_started"
+        );
+        assert!(
+            tool_events.contains("\"tool_call_finished\""),
+            "tool-events should contain tool_call_finished"
+        );
+
+        let events = received_events
+            .lock()
+            .map_err(|_| anyhow::anyhow!("worker event mutex poisoned"))?;
+        let tool_started_count = events
+            .iter()
+            .filter(|e| matches!(e, WorkerEvent::ToolCallStarted { .. }))
+            .count();
+        assert_eq!(
+            tool_started_count, 1,
+            "should have received 1 tool_call_started event"
+        );
+        let text_delta_count = events
+            .iter()
+            .filter(|e| matches!(e, WorkerEvent::AssistantTextDelta { .. }))
+            .count();
+        assert!(
+            text_delta_count >= 2,
+            "should have received at least 2 assistant_text_delta events (before + after tool call), got {text_delta_count}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn parse_and_emit_events_for_function_calls() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task_id = "task_parse_function_calls";
+
+        store.write_worker_file(task_id, "transcript.jsonl", "")?;
+        store.write_worker_file(task_id, "tool-events.jsonl", "")?;
+
+        let subscriptions = Arc::new(WorkerSessionSubscriptions::default());
+        let received_events = Arc::new(Mutex::new(Vec::new()));
+        let _subscription = subscriptions.subscribe(Arc::new({
+            let received_events = received_events.clone();
+            move |event| {
+                if let Ok(mut events) = received_events.lock() {
+                    events.push(event);
+                }
+            }
+        }))?;
+
+        let handle = CommandWorkerSessionHandle {
+            store: store.clone(),
+            workspace: temp_dir.path().to_path_buf(),
+            task_id: task_id.to_string(),
+            worker_name: "test_worker".to_string(),
+            skip_worker: false,
+            command: None,
+            packet_path: temp_dir.path().join("packet.json"),
+            prompt_path: temp_dir.path().join("prompt.md"),
+            subscriptions,
+            session_state: Mutex::new(ResidentSessionState {
+                cancellation_token: CancellationToken::new(),
+                active_command: false,
+                revive_count: 0,
+                interrupt_count: 0,
+                turn_epoch: 0,
+                stale_reason: None,
+            }),
+            result: Mutex::new(None),
+            last_output: Mutex::new(None),
+            follow_up_count: Mutex::new(0),
+            supports_interaction: true,
+        };
+
+        let stdout = "Some text before.\n<function_calls>\n<invoke name=\"read_file\">\n<parameter name=\"path\">src/main.rs</parameter>\n</invoke>\n<invoke name=\"write_file\">\n<parameter name=\"path\">src/lib.rs</parameter>\n<parameter name=\"content\">hello</parameter>\n</invoke>\n</function_calls>\nSome text after.";
+
+        handle.parse_and_emit_tool_events(stdout, "test")?;
+
+        let events = received_events
+            .lock()
+            .map_err(|_| anyhow::anyhow!("worker event mutex poisoned"))?;
+
+        let text_delta_count = events
+            .iter()
+            .filter(|e| matches!(e, WorkerEvent::AssistantTextDelta { .. }))
+            .count();
+        let tool_started_count = events
+            .iter()
+            .filter(|e| matches!(e, WorkerEvent::ToolCallStarted { .. }))
+            .count();
+        let tool_finished_count = events
+            .iter()
+            .filter(|e| matches!(e, WorkerEvent::ToolCallFinished { .. }))
+            .count();
+
+        assert_eq!(
+            text_delta_count, 2,
+            "should have 2 AssistantTextDelta events (before and after function_calls group)"
+        );
+        assert_eq!(
+            tool_started_count, 2,
+            "should have 2 ToolCallStarted events (read_file + write_file)"
+        );
+        assert_eq!(
+            tool_finished_count, 2,
+            "should have 2 ToolCallFinished events"
+        );
+
+        let tool_starts: Vec<&WorkerEvent> = events
+            .iter()
+            .filter(|e| matches!(e, WorkerEvent::ToolCallStarted { .. }))
+            .collect();
+        if let WorkerEvent::ToolCallStarted {
+            tool_name, arguments, ..
+        } = tool_starts[0]
+        {
+            assert_eq!(tool_name, "read_file");
+            assert_eq!(arguments, "path=src/main.rs");
+        } else {
+            panic!("expected ToolCallStarted");
+        }
+        if let WorkerEvent::ToolCallStarted {
+            tool_name, arguments, ..
+        } = tool_starts[1]
+        {
+            assert_eq!(tool_name, "write_file");
+            assert_eq!(arguments, "path=src/lib.rs, content=hello");
+        } else {
+            panic!("expected ToolCallStarted");
+        }
+
+        let transcript =
+            std::fs::read_to_string(store.worker_dir(task_id).join("transcript.jsonl"))?;
+        assert!(transcript.contains("\"assistant_text_delta\""),
+            "transcript should contain assistant_text_delta"
+        );
+        assert!(transcript.contains("\"tool_call_started\""),
+            "transcript should contain tool_call_started"
+        );
+        assert!(transcript.contains("\"tool_call_finished\""),
+            "transcript should contain tool_call_finished"
+        );
+        assert!(transcript.contains("\"read_file\""),
+            "transcript should contain read_file tool name"
+        );
+        assert!(transcript.contains("\"write_file\""),
+            "transcript should contain write_file tool name"
+        );
+
+        let tool_events =
+            std::fs::read_to_string(store.worker_dir(task_id).join("tool-events.jsonl"))?;
+        assert!(tool_events.contains("\"tool_call_started\""),
+            "tool-events should contain tool_call_started"
+        );
+        assert!(tool_events.contains("\"tool_call_finished\""),
+            "tool-events should contain tool_call_finished"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn parse_and_emit_events_for_tool_use_format() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task_id = "task_parse_tool_use";
+
+        store.write_worker_file(task_id, "transcript.jsonl", "")?;
+        store.write_worker_file(task_id, "tool-events.jsonl", "")?;
+
+        let subscriptions = Arc::new(WorkerSessionSubscriptions::default());
+        let received_events = Arc::new(Mutex::new(Vec::new()));
+        let _subscription = subscriptions.subscribe(Arc::new({
+            let received_events = received_events.clone();
+            move |event| {
+                if let Ok(mut events) = received_events.lock() {
+                    events.push(event);
+                }
+            }
+        }))?;
+
+        let handle = CommandWorkerSessionHandle {
+            store: store.clone(),
+            workspace: temp_dir.path().to_path_buf(),
+            task_id: task_id.to_string(),
+            worker_name: "test_worker".to_string(),
+            skip_worker: false,
+            command: None,
+            packet_path: temp_dir.path().join("packet.json"),
+            prompt_path: temp_dir.path().join("prompt.md"),
+            subscriptions,
+            session_state: Mutex::new(ResidentSessionState {
+                cancellation_token: CancellationToken::new(),
+                active_command: false,
+                revive_count: 0,
+                interrupt_count: 0,
+                turn_epoch: 0,
+                stale_reason: None,
+            }),
+            result: Mutex::new(None),
+            last_output: Mutex::new(None),
+            follow_up_count: Mutex::new(0),
+            supports_interaction: true,
+        };
+
+        let stdout = "Some text.\n<tool_use>\n<invoke name=\"read_file\">\n<parameter name=\"path\">src/main.rs</parameter>\n</invoke>\n</tool_use>\nMore text.";
+
+        handle.parse_and_emit_tool_events(stdout, "test")?;
+
+        let events = received_events
+            .lock()
+            .map_err(|_| anyhow::anyhow!("worker event mutex poisoned"))?;
+
+        let text_delta_count = events
+            .iter()
+            .filter(|e| matches!(e, WorkerEvent::AssistantTextDelta { .. }))
+            .count();
+        let tool_started_count = events
+            .iter()
+            .filter(|e| matches!(e, WorkerEvent::ToolCallStarted { .. }))
+            .count();
+        let tool_finished_count = events
+            .iter()
+            .filter(|e| matches!(e, WorkerEvent::ToolCallFinished { .. }))
+            .count();
+
+        assert_eq!(
+            text_delta_count, 2,
+            "should have 2 AssistantTextDelta events (before and after tool_use group)"
+        );
+        assert_eq!(
+            tool_started_count, 1,
+            "should have 1 ToolCallStarted event"
+        );
+        assert_eq!(
+            tool_finished_count, 1,
+            "should have 1 ToolCallFinished event"
+        );
+
+        let tool_starts: Vec<&WorkerEvent> = events
+            .iter()
+            .filter(|e| matches!(e, WorkerEvent::ToolCallStarted { .. }))
+            .collect();
+        if let WorkerEvent::ToolCallStarted { tool_name, .. } = tool_starts[0] {
+            assert_eq!(tool_name, "read_file");
+        } else {
+            panic!("expected ToolCallStarted");
+        }
+
+        let transcript =
+            std::fs::read_to_string(store.worker_dir(task_id).join("transcript.jsonl"))?;
+        assert!(transcript.contains("\"assistant_text_delta\""),
+            "transcript should contain assistant_text_delta"
+        );
+        assert!(transcript.contains("\"tool_call_started\""),
+            "transcript should contain tool_call_started"
+        );
+        assert!(transcript.contains("\"tool_call_finished\""),
+            "transcript should contain tool_call_finished"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn parse_and_emit_events_for_malformed_output() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task_id = "task_parse_malformed";
+
+        store.write_worker_file(task_id, "transcript.jsonl", "")?;
+        store.write_worker_file(task_id, "tool-events.jsonl", "")?;
+
+        let subscriptions = Arc::new(WorkerSessionSubscriptions::default());
+
+        let handle = CommandWorkerSessionHandle {
+            store: store.clone(),
+            workspace: temp_dir.path().to_path_buf(),
+            task_id: task_id.to_string(),
+            worker_name: "test_worker".to_string(),
+            skip_worker: false,
+            command: None,
+            packet_path: temp_dir.path().join("packet.json"),
+            prompt_path: temp_dir.path().join("prompt.md"),
+            subscriptions,
+            session_state: Mutex::new(ResidentSessionState {
+                cancellation_token: CancellationToken::new(),
+                active_command: false,
+                revive_count: 0,
+                interrupt_count: 0,
+                turn_epoch: 0,
+                stale_reason: None,
+            }),
+            result: Mutex::new(None),
+            last_output: Mutex::new(None),
+            follow_up_count: Mutex::new(0),
+            supports_interaction: true,
+        };
+
+        let stdout1 = "This is just random text with no XML tool call patterns.";
+        assert!(
+            handle.parse_and_emit_tool_events(stdout1, "test").is_ok(),
+            "plain text should not cause panic"
+        );
+
+        let stdout2 = "<function_calls>no closing tag here";
+        assert!(
+            handle.parse_and_emit_tool_events(stdout2, "test").is_ok(),
+            "unclosed function_calls tag should not cause panic"
+        );
+
+        let stdout3 = "<tool_use>\n<invoke name=\"read_file\"></invoke>\n";
+        assert!(
+            handle.parse_and_emit_tool_events(stdout3, "test").is_ok(),
+            "unclosed tool_use tag should not cause panic"
+        );
+
+        assert!(
+            handle.parse_and_emit_tool_events("", "test").is_ok(),
+            "empty string should return Ok(())"
+        );
+
+        let stdout5 = "<function_calls><invoke name=>no value</invoke></function_calls>";
+        assert!(
+            handle.parse_and_emit_tool_events(stdout5, "test").is_ok(),
+            "malformed invoke should not cause panic"
+        );
+
+        let transcript =
+            std::fs::read_to_string(store.worker_dir(task_id).join("transcript.jsonl"))?;
+        assert!(
+            transcript.contains("\"assistant_text_delta\""),
+            "transcript should contain assistant_text_delta even for malformed output"
+        );
+
         Ok(())
     }
 

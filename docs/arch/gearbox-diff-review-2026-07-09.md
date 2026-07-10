@@ -189,7 +189,84 @@ if iteration > 1 {
 
 ---
 
-## 四、总体评价
+## 五、Round 2：P1 补齐（typed outcomes、completion flush、unified budget）
+
+> 实施时间：2026-07-09 ~ 2026-07-10，代码未合入 diff 范围（在 HEAD~9 之后）
+> 回归基线：153 tests → 159 tests → 169 tests
+
+### P1-1：TaskManagerControl 状态控制语义收口
+
+| 项目 | 内容 |
+|------|------|
+| **问题** | `TaskManagerControl` 未与 `TaskManager` 共享 "先 transition 后 handle" 路径；send/steer 返回 `bool`，无法区分 `NotContinuable`/`Noop`/`Steer` |
+| **改动** | `crates/gearbox_agent/src/task_manager.rs` — `SendOutcome`/`SteerOutcome` 枚举，终态任务返回 `NotContinuable` |
+| **改动** | `crates/agent/src/agent.rs` — 适配新返回类型，GUI 侧错误文案映射 |
+| **测试** | pending/queued/steer/revive 路径全覆盖，Cancelled/Lost 返回 `NotContinuable` 验证 |
+| **commit** | `c99b6572dc` (部分，与 P1-3 混合) — "Add sha2 dependency and new task attempt status types" |
+
+### P1-2：父会话 completion 通知串行化与重排
+
+| 项目 | 内容 |
+|------|------|
+| **问题** | 同一 parent session 的多个 completion 可能乱序到达；忙状态时不应注入 completion |
+| **改动** | `crates/gearbox_agent/src/task_manager.rs` — `CompletionNotifier` 增加 `flush_serializer`（per-session 串行锁）、`pending_flush`（排队唤醒）、flush 时状态重验证 |
+| **改动** | `crates/gearbox_agent/src/runtime.rs` — `read_record` 闭包传入 flush 路径，实现 storage 级重检查 |
+| **测试** | `completion_flush_serializes_rapid_arrivals` — 3 个并发 completion 串行验证 |
+| **测试** | `completion_flush_works_after_idle_transition` — Streaming 入 buffer、Idle flush 去重、epoch bump 后 skip 验证 |
+| **commit** | `067d783c82` — "Fix Gear completion flush and teardown lifecycle" |
+
+### P1-3：provider-aware/depth 统一预算策略
+
+| 项目 | 内容 |
+|------|------|
+| **问题** | route 变更、fallback、review 触发未统一扣减预算；budget_guard_reason 不包含触发源标记 |
+| **改动** | `crates/gearbox_agent/src/runtime.rs` — 新增 `RouteChangeType` enum（`RouteChange`/`Fallback`/`ReviewTrigger`）、`BudgetController::apply_budget_for_route_change()`、`evaluate_goal_with_source()` 重载 |
+| **改动** | `GoalDecisionPolicy.trigger_source: Option<RouteChangeType>`、`budget_guard_reason()` 输出附加 `(route change)`/`(fallback)`/`(review)` 标记 |
+| **测试** | `budget_guard_reason_includes_trigger_source_label` — 三种触发源标记验证 |
+| **测试** | `apply_budget_for_route_change_distinguishes_triggers` — BudgetController 为不同触发源返回不同错误消息 |
+| **测试** | `budget_summary_matches_across_coordinator_review_and_goal_review` — budget_summary 在 goal_review_artifact 中一致嵌入 |
+| **commit** | `c99b6572dc` (部分) — 与 P1-1 同 commit 提交 |
+
+---
+
+## 六、Round 3：P2 补齐（stagnation 归一化、tool-call delta、文档收口）
+
+> 实施时间：2026-07-10，代码未合入 diff 范围
+> 回归基线：169 tests
+
+### P2-1：停滞信号来源增强（无效迭代更稳）
+
+| 项目 | 内容 |
+|------|------|
+| **问题** | `detect_stagnation` 的 repair request 比较使用全相等，大小写/空白差异导致漏检 |
+| **改动** | `crates/gearbox_agent/src/runtime.rs` — 新增 `normalize_repair()` 辅助函数（lowercase + collapse whitespace），`detect_stagnation()` 中 repair_requests 和 worker_outputs 比较改为归一化后比较 |
+| **测试** | `stagnation_normalizes_repair_variations` — 大小写/空白变体触发 stagnation，语义不同不误报 |
+| **commit** | 未独立 commit，与 P0-5 收口一并提交 |
+
+### P2-2：Worker stream 深度（真正 tool-call delta）
+
+| 项目 | 内容 |
+|------|------|
+| **问题** | `execute_command_with_prompt` 只输出 TurnStarted/Stdout/Stderr/TurnFinished，无 tool call 粒度事件 |
+| **改动** | `crates/gearbox_agent/src/workers.rs` — 新增 `parse_and_emit_tool_events()` 扫描 stdout 中的 XML tool call 模式并 emit `AssistantTextDelta`/`ToolCallStarted`/`ToolCallFinished` 到 transcript + tool-events |
+| **改动** | `crates/gearbox_agent/src/task_manager.rs` — 新增 `TranscriptEntry` 枚举（Parsed/Raw）、`TaskRecord::transcript_entries()` 方法 |
+| **改动** | `crates/gearbox_agent/src/runtime.rs` — `collect_context_risk_texts()` 增加 tool-events 序列文本 |
+| **测试** | `worker_transcript_includes_tool_call_deltas` — 验证 transcript/tool-events 包含 tool_call_started/finished、subscription 收到 ≥1 ToolCallStarted |
+| **commit** | `c99b6572dc` (部分) — 与 P1-1/P1-3 同 commit 提交 |
+
+### P2-3：文档收口（本文件）
+
+| 项目 | 内容 |
+|------|------|
+| **改动** | 当前 diff review → 新增 Round 2/3 章节 |
+| **改动** | 各 phase 文档 → 添加 completion notes |
+| **改动** | dogfood plan → 完成状态更新 |
+| **改动** | learnings.md → 追加文档映射 |
+| **验证** | `cargo test -p gearbox_agent` — 169 tests pass |
+
+---
+
+## 七、总体评价（更新版）
 
 | 维度 | 评分 | 说明 |
 |------|------|------|

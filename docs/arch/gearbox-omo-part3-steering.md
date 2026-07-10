@@ -270,3 +270,19 @@ pub fn interrupt_task(&self, task_id: &str) -> Result<bool>
 | 4 | **`notifyStarted()` drain** | pending 期间的 message 丢失 | 新增消息队列，worker start 后按序投递 |
 | 5 | **`scopeDenied()`** | 无控制路径的会话隔离 | 新增 `caller_session_id` 参数和范围检查 |
 | 6 | **中断/取消的 `noop` 区分** | Gear 无法区分 task 不存在 vs 状态不符合 | 改用枚举返回类型而非 `Result<bool>` |
+
+---
+
+## 3.8 已补完成项（P2-2）
+
+### P2-2：Worker stream 深度（tool-call delta） ✅
+
+| 项目 | 内容 |
+|------|------|
+| **问题** | `execute_command_with_prompt` 只输出 TurnStarted/Stdout/Stderr/TurnFinished/Error，无 tool call 粒度事件，`transcript.jsonl` 和 `tool-events.jsonl` 缺少细粒度数据 |
+| **改动** | `crates/gearbox_agent/src/workers.rs` — 新增 `parse_and_emit_tool_events()` 方法，扫描 stdout 中 XML tool call 模式（`<function_calls>`、`<tool_use>`、`<invoke>`）并 emit `AssistantTextDelta`/`ToolCallStarted`/`ToolCallFinished` 到 transcript 和 tool-events |
+| **改动** | `crates/gearbox_agent/src/task_manager.rs` — 新增 `TranscriptEntry` 枚举（`Parsed`/`Raw`）、`TaskRecord::transcript_entries()` 方法 |
+| **改动** | `crates/gearbox_agent/src/runtime.rs` — `collect_context_risk_texts()` 增加 tool-events 事件序列文本 |
+| **测试** | `worker_transcript_includes_tool_call_deltas` — 验证 transcript 含 `tool_call_started`/`finished`/`assistant_text_delta`、tool-events 含 start/finish、subscription 收到 ≥1 ToolCallStarted |
+| **文件** | `crates/gearbox_agent/src/workers.rs`, `crates/gearbox_agent/src/task_manager.rs`, `crates/gearbox_agent/src/runtime.rs` |
+| **commit** | `c99b6572dc` (部分) |

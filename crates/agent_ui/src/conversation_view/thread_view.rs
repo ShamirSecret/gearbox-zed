@@ -2011,12 +2011,16 @@ impl ThreadView {
             return Ok(false);
         };
 
-        let dispatched = if steer {
-            connection.steer_gear_task(&self.session_id, prompt, cx)?
+        let accepted = if steer {
+            connection
+                .steer_gear_task(&self.session_id, prompt, cx)?
+                .is_accepted()
         } else {
-            connection.send_follow_up_gear_task(&self.session_id, prompt, cx)?
+            connection
+                .send_follow_up_gear_task(&self.session_id, prompt, cx)?
+                .is_accepted()
         };
-        if !dispatched {
+        if !accepted {
             return Ok(false);
         }
 
@@ -2124,12 +2128,12 @@ impl ThreadView {
         if self.is_gear_thread() {
             if let Some(connection) = self.as_native_connection(cx) {
                 match connection.interrupt_gear_task(&self.session_id, cx) {
-                    Ok(true) => {
+                    Ok(outcome) if outcome.is_interrupt_applied() => {
                         self.sync_generating_indicator(cx);
                         cx.notify();
                         return;
                     }
-                    Ok(false) => {}
+                    Ok(_) => {}
                     Err(error) => {
                         self.handle_thread_error(error, cx);
                         return;
@@ -4643,9 +4647,7 @@ impl ThreadView {
             .unwrap_or_else(|| worker_kind.to_string())
     }
 
-    fn gear_messageability_label(
-        messageability: Option<&agent::GearTaskMessageability>,
-    ) -> String {
+    fn gear_messageability_label(messageability: Option<&agent::GearTaskMessageability>) -> String {
         match messageability {
             Some(agent::GearTaskMessageability::Steer) => "Steerable".to_string(),
             Some(agent::GearTaskMessageability::Revive) => "Revivable".to_string(),

@@ -243,3 +243,20 @@ forget(taskId): void {
 | 失败安全 | `tryLoad()` catch 降级 | records.get_mut() 直接 | Gear 可能 panic |
 | 清理 | 显式 `forget()` | `records` 留在 HashMap 中 | Gear 有内存泄漏风险 |
 | `#released` 清理 | `forget()` 中迭代删除 | 无此概念 | Gear 无 |
+
+---
+
+## 2.8 已补完成项（P1-1）
+
+### P1-1：TaskManagerControl 状态控制语义收口 ✅
+
+此补丁将 Gear 的 TaskManager 返回值从 `Result<bool>` 升级为结构化枚举，缩小了与 OMO 返回类型的差距。
+
+| 项目 | 内容 |
+|------|------|
+| **问题** | `TaskManagerControl` 未与 `TaskManager` 共享统一控制路径；send/steer 返回 `bool`，无法区分 `NotContinuable`/`Noop`/`Steer` |
+| **改动** | `crates/gearbox_agent/src/task_manager.rs` — 新增 `SendOutcome`/`SteerOutcome`/`CancelOutcome`/`InterruptOutcome` 枚举；终态任务（Cancelled/Lost）返回 `NotContinuable` |
+| **改动** | `crates/agent/src/agent.rs` — 适配新返回类型，GUI 错误文案映射 |
+| **测试** | pending/queued/steer/revive 边界覆盖；Cancelled/Lost task 收到 `NotContinuable` |
+| **对比 OMO** | 仍缺 `scope_denied` 变体（Gear 无会话范围检查），但 `not_found`/`noop`/`steer`/`revive`/`queued` 已对齐 |
+| **commit** | `c99b6572dc` (部分) |

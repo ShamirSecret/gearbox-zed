@@ -76,3 +76,65 @@ void Promise.allSettled(
 | `omo-config-core/schema/category.ts` | Category 配置 schema | 低 — Gear 的 CategoryRouter 有内置 policy |
 
 **唯一值得借鉴的细节：** `omo-config-core/schema/task.ts` 中的 `residency_max_children`（默认 8）、`ttl_ms`（默认 24h）、`default_concurrency`（默认 5）等默认值可以作为 Gear 未来配置的参考基线。
+
+---
+
+## Gaps 完成状态
+
+以下 P0/P1/P2 items 已在此文档发表后实现：
+
+### P0-1：`max_worker_calls` 使用 `Goal.budget` 配置 ✅
+
+| 项目 | 内容 |
+|------|------|
+| **改动** | `runtime.rs` `BudgetController` 优先读 `goal.budget.max_worker_calls`，fallback 到全局默认 |
+| **测试** | Goal 设置 `budget.max_worker_calls=1` 时首个循环两次 worker attempts 后到 `limited` |
+| **文件** | `crates/gearbox_agent/src/runtime.rs` |
+
+### P0-2：`worker_call_count` 统计口径修复 ✅
+
+| 项目 | 内容 |
+|------|------|
+| **改动** | 每轮 `GoalLoop` 只增量 1 次 worker-call；新增 `attempt_count` 独立追踪所有 attempt 总数（含重试） |
+| **测试** | one-iteration 多 attempts 场景 worker_call_count 只加 1 |
+| **文件** | `crates/gearbox_agent/src/runtime.rs` |
+
+### P0-3：`provider_unknown_streak` 重置逻辑修复 ✅
+
+| 项目 | 内容 |
+|------|------|
+| **改动** | 三分支逻辑：goal_verified 或 concrete stop_reason 时重置；unknown 条件时 +1；其他情况（含 goal_satisfied==Some(false)）保持不变 |
+| **测试** | `provider_unknown_streak_not_reset_on_false_goal_satisfied` 覆盖 5 种场景 |
+| **文件** | `crates/gearbox_agent/src/runtime.rs` |
+
+### P0-4：`detect_stagnation` diff 比较增强 ✅
+
+| 项目 | 内容 |
+|------|------|
+| **改动** | `DiffSnapshot` 增加 `diff_hash` 字段；`detect_stagnation` 比较 diff_hash 而非仅文件列表 |
+| **测试** | 同一文件名不同内容改动不再误判 stagnation |
+| **文件** | `crates/gearbox_agent/src/runtime.rs`, `crates/gearbox_agent/src/tools.rs` |
+
+### P0-5：`GoalDecisionPolicy` 无 fallback 处理收口 ✅
+
+| 项目 | 内容 |
+|------|------|
+| **改动** | `CategoryResolutionResult::nearest_fallback()` helper；`GoalDecisionPolicy` 新增 `nearest_fallback_available` 字段；无 fallback + 无进展 + iteration>1 时返回 `Limited` |
+| **测试** | `evaluation_limits_when_no_fallback_available`, `evaluation_continues_on_first_iteration_when_no_fallback` |
+| **文件** | `crates/gearbox_agent/src/runtime.rs`, `crates/gearbox_agent/src/workers.rs` |
+
+### P1-3：provider-aware/depth 统一预算策略 ✅
+
+| 项目 | 内容 |
+|------|------|
+| **改动** | 新增 `RouteChangeType` enum、`BudgetController::apply_budget_for_route_change()`、`evaluate_goal_with_source()` 重载；`budget_guard_reason()` 输出附加触发源标记 |
+| **测试** | 3 项新增测试覆盖触发源标记、预算区分、budget_summary 一致性 |
+| **文件** | `crates/gearbox_agent/src/runtime.rs` |
+
+### P2-1：停滞信号来源增强 ✅
+
+| 项目 | 内容 |
+|------|------|
+| **改动** | 新增 `normalize_repair()` 辅助函数；`detect_stagnation` 中 repair_requests 和 worker_outputs 归一化比较 |
+| **测试** | `stagnation_normalizes_repair_variations` |
+| **文件** | `crates/gearbox_agent/src/runtime.rs` |

@@ -226,8 +226,62 @@
   - 一个 `provider_unknown_streak` 3 轮 unknown / false/unknown 混合 case。
   - 一个 `nearest_fallback none` 的 repair case。
 
-## 5. 里程碑定义
+## 5. 完成状态总览（2026-07-10）
 
-- 每个 P0 项完成后，更新 `docs/gearbox-diff-review-2026-07-09.md` 或新补丁文件。
-- P1 完成后同步更新 `phase-05/08/09` 工单对应章节。
-- 全部完成后，重命名本文件为“最终版：可执行 dogfood 计划”并启动完整的中等模型闭环跑。
+### 完成项汇总
+
+| 优先级 | 项 | 状态 | 测试增量 | 关键改动文件 |
+|--------|-----|------|---------|-------------|
+| P0-1 | `max_worker_calls` 使用 goal budget | ✅ | +1 | `runtime.rs` |
+| P0-2 | `worker_call_count` 统计口径修复 | ✅ | +1 | `runtime.rs` |
+| P0-3 | `provider_unknown_streak` 重置逻辑 | ✅ | +1 | `runtime.rs` |
+| P0-4 | `detect_stagnation` diff hash | ✅ | +1 | `runtime.rs`, `tools.rs` |
+| P0-5 | no-fallback 收口 | ✅ | +2 | `runtime.rs`, `workers.rs` |
+| P1-1 | TaskManagerControl 返回语义 | ✅ | +2 | `task_manager.rs`, `agent.rs` |
+| P1-2 | Completion flush 串行化 | ✅ | +2 | `task_manager.rs`, `runtime.rs` |
+| P1-3 | 统一 budget 入口 | ✅ | +3 | `runtime.rs` |
+| P2-1 | Stagnation 归一化 | ✅ | +1 | `runtime.rs` |
+| P2-2 | Tool-call delta stream | ✅ | +1 | `workers.rs`, `task_manager.rs`, `runtime.rs` |
+| **P2-3** | **文档收口** | **✅** | **0** | **各 docs/*.md, learnings.md** |
+
+### 回归命令
+
+```bash
+cargo test -p gearbox_agent
+```
+
+**结果：** 169 tests pass（基线 153 → P0 轮 +5 → 158 → P1 轮 +7 → 165 → P2 轮 +4 → 169）
+
+### 剩余未补缺口
+
+以下缺口不在本次 P0/P1/P2 范围内，为后续轮次预留：
+
+| # | 缺口 | 来源文档 | 影响 | 建议 |
+|---|------|---------|------|------|
+| 1 | 单一销毁端口 | part5-lifecycle.md #1 | 每个路径独立销毁，可能泄漏 | 引入 `destroy_task()` 统一入口 |
+| 2 | 启动 reconciliation | part5-lifecycle.md #2 | 崩溃重启后残留 `running` 记录 | 启动时扫描 task-record.json |
+| 3 | LRU eviction | part5-lifecycle.md #3 | 无 resident 上限控制 | 新增 `admit_resident()` |
+| 4 | TTL 清理 | part5-lifecycle.md #5 | 无时间基记录过期 | 启动时删除超 N 天旧记录 |
+| 5 | `lost` 记录保护 | part5-lifecycle.md #6 | lost 记录无保护 | 引入 lost 状态 |
+| 6 | `reviveTerminal` | part3-steering.md #3 | completed task 不能继续 | 新增 revive 路径 |
+| 7 | `notifyStarted()` drain | part3-steering.md #4 | pending 期间消息丢失 | 消息队列 |
+| 8 | `scopeDenied()` | part3-steering.md #5 | 无控制路径会话隔离 | 新增 caller_session_id 检查 |
+| 9 | 中断时捕获 lastAssistantText | part3-steering.md #2 | 中断后看不到部分进度 | handle.last_output() capture |
+
+### 文档映射
+
+| 完成项 | 记录在 |
+|--------|--------|
+| P0-1~P0-5, P1-3, P2-1 | `docs/gearbox-omo-part8-11-remaining.md` |
+| P0-5, P1-2 | `docs/gearbox-omo-part5-lifecycle.md` |
+| P1-1 | `docs/gearbox-omo-part2-task-manager.md` |
+| P2-2 | `docs/gearbox-omo-part3-steering.md` |
+| P1~P3 全部 | `docs/gearbox-diff-review-2026-07-09.md` 五~六章 |
+
+---
+
+## 6. 里程碑定义（更新版）
+
+- ~~每个 P0 项完成后，更新 `docs/gearbox-diff-review-2026-07-09.md` 或新补丁文件。~~ ✅ 已全部完成
+- ~~P1 完成后同步更新 `phase-05/08/09` 工单对应章节。~~ ✅ 已全部完成
+- ~~全部完成后，重命名本文件为最终版并启动完整的中等模型闭环跑。~~ ✅ 文档收口已完成，可启动闭环跑

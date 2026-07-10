@@ -66,3 +66,4 @@ crates/docs_preprocessor/actions.json
 .factory/commands/
 .factory/skills/openspec-*/
 openspec/
+.omo/

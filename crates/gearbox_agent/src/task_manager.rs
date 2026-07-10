@@ -64,6 +64,99 @@ pub enum Messageability {
     NotContinuable { reason: String },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ActionOutcome {
+    /// Task was cancelled/interrupted
+    Cancelled,
+    /// Task was interrupted without being cancelled
+    Interrupted,
+    /// Task completed and outcome cannot be changed
+    NotContinuable,
+    /// No matching task found
+    Noop,
+}
+
+impl ActionOutcome {
+    pub fn is_interrupt_applied(&self) -> bool {
+        matches!(self, Self::Interrupted)
+    }
+
+    pub fn is_cancel_applied(&self) -> bool {
+        matches!(self, Self::Cancelled)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum TranscriptEntry {
+    Parsed {
+        event: String,
+        #[serde(default)]
+        tool_name: Option<String>,
+        #[serde(default)]
+        arguments: Option<String>,
+        #[serde(default)]
+        result: Option<String>,
+        #[serde(default)]
+        delta: Option<String>,
+        #[serde(default)]
+        kind: Option<String>,
+        #[serde(default)]
+        message: Option<String>,
+        #[serde(default)]
+        summary: Option<String>,
+    },
+    Raw(serde_json::Value),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SendOutcome {
+    /// Message sent to running worker
+    Sent,
+    /// Task queued because worker is pending
+    Queued,
+    /// Worker completed/failed and will be revived
+    Revive,
+    /// Worker is in terminal state
+    NotContinuable,
+    /// No task found
+    Noop,
+    /// The caller is outside the task's session scope.
+    ScopeDenied { reason: String },
+    /// The requested task does not exist.
+    NotFound { reason: String },
+}
+
+impl SendOutcome {
+    pub fn is_accepted(&self) -> bool {
+        matches!(self, Self::Sent | Self::Queued | Self::Revive)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SteerOutcome {
+    /// Steer instruction sent
+    Steered,
+    /// Worker will be revived with steer
+    Revive,
+    /// Queued for pending worker
+    Queued,
+    /// Terminal state
+    NotContinuable,
+    /// No task found
+    Noop,
+    /// The caller is outside the task's session scope.
+    ScopeDenied { reason: String },
+    /// The requested task does not exist.
+    NotFound { reason: String },
+}
+
+impl SteerOutcome {
+    pub fn is_accepted(&self) -> bool {
+        matches!(self, Self::Steered | Self::Queued | Self::Revive)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskFailureKind {
@@ -134,6 +227,31 @@ pub struct TaskRecord {
     pub retry_reason: Option<String>,
     pub error: Option<String>,
     pub attempts: Vec<TaskAttempt>,
+}
+
+impl TaskRecord {
+    /// Reads and parses transcript.jsonl from the worker artifact directory.
+    /// Returns entries in chronological order (oldest first).
+    pub fn transcript_entries(&self) -> Vec<TranscriptEntry> {
+        let dir = self
+            .result_path
+            .as_ref()
+            .or(self.outcome_path.as_ref())
+            .and_then(|path| path.parent());
+        let Some(dir) = dir else {
+            return Vec::new();
+        };
+        let transcript_path = dir.join("transcript.jsonl");
+        let Ok(content) = std::fs::read_to_string(&transcript_path) else {
+            return Vec::new();
+        };
+        content
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .filter_map(|line| serde_json::from_str::<TranscriptEntry>(line).ok())
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -459,6 +577,12 @@ struct RunningTask {
     _subscription: Option<WorkerSubscription>,
 }
 
+#[derive(Clone)]
+struct ResidentTask {
+    handle: Arc<dyn WorkerSessionHandle>,
+    queued_task: QueuedTask,
+}
+
 struct FinishedTaskMessage {
     task_id: String,
     running_task: RunningTask,
@@ -520,9 +644,7 @@ fn continuation_hint_for_record(record: &TaskRecord) -> String {
                 .to_string()
         }
         Messageability::NotContinuable { reason } => {
-            format!(
-                "Open the result/outcome artifacts to inspect the full result ({reason})."
-            )
+            format!("Open the result/outcome artifacts to inspect the full result ({reason}).")
         }
     }
 }
@@ -602,12 +724,6 @@ impl TaskManagerControl {
             .clone())
     }
 
-    fn current_running_task_snapshot(&self) -> Result<Option<CurrentManagedTask>> {
-        Ok(self
-            .current_task_snapshot()?
-            .filter(|current_task| current_task.status == ManagedTaskStatus::Running))
-    }
-
     pub fn current_task_status(&self) -> Result<Option<ManagedTaskStatus>> {
         Ok(self
             .current_task_snapshot()?
@@ -679,54 +795,27 @@ impl TaskManagerControl {
             .unwrap_or_default())
     }
 
-    pub fn send_follow_up_current_task(&self, prompt: String) -> Result<bool> {
+    pub fn send_follow_up_current_task(&self, prompt: String) -> Result<SendOutcome> {
         let Some(task_id) = self.current_task_id()? else {
-            return Ok(false);
+            return Ok(SendOutcome::Noop);
         };
         self.send_follow_up_task(&task_id, prompt)
     }
 
-    pub fn steer_current_task(&self, prompt: String) -> Result<bool> {
+    pub fn steer_current_task(&self, prompt: String) -> Result<SteerOutcome> {
         let Some(task_id) = self.current_task_id()? else {
-            return Ok(false);
+            return Ok(SteerOutcome::Noop);
         };
         self.steer_task(&task_id, prompt)
     }
 
-    pub fn cancel_current_task(&self) -> Result<bool> {
-        let Some(current_task) = self.current_running_task_snapshot()? else {
-            return Ok(false);
+    pub fn cancel_current_task(&self) -> Result<ActionOutcome> {
+        let Some(current_task) = self.current_task_snapshot()? else {
+            return Ok(ActionOutcome::Noop);
         };
 
-        current_task
-            .handle
-            .as_ref()
-            .context("running task missing handle")?
-            .cancel()?;
-        self.update_current_status(&current_task.task_id, ManagedTaskStatus::Cancelled)?;
-        Ok(true)
-    }
-
-    pub fn interrupt_current_task(&self) -> Result<bool> {
-        let Some(current_task) = self.current_running_task_snapshot()? else {
-            return Ok(false);
-        };
-
-        current_task
-            .handle
-            .as_ref()
-            .context("running task missing handle")?
-            .interrupt()?;
-        self.update_current_status(&current_task.task_id, ManagedTaskStatus::Interrupted)?;
-        Ok(true)
-    }
-
-    pub fn cancel_task(&self, task_id: &str) -> Result<bool> {
-        let Some(current_task) = self.current_running_task_snapshot()? else {
-            return Ok(false);
-        };
-        if current_task.task_id != task_id {
-            return Ok(false);
+        if current_task.status != ManagedTaskStatus::Running {
+            return Ok(ActionOutcome::NotContinuable);
         }
 
         current_task
@@ -735,15 +824,16 @@ impl TaskManagerControl {
             .context("running task missing handle")?
             .cancel()?;
         self.update_current_status(&current_task.task_id, ManagedTaskStatus::Cancelled)?;
-        Ok(true)
+        Ok(ActionOutcome::Cancelled)
     }
 
-    pub fn interrupt_task(&self, task_id: &str) -> Result<bool> {
-        let Some(current_task) = self.current_running_task_snapshot()? else {
-            return Ok(false);
+    pub fn interrupt_current_task(&self) -> Result<ActionOutcome> {
+        let Some(current_task) = self.current_task_snapshot()? else {
+            return Ok(ActionOutcome::Noop);
         };
-        if current_task.task_id != task_id {
-            return Ok(false);
+
+        if current_task.status != ManagedTaskStatus::Running {
+            return Ok(ActionOutcome::NotContinuable);
         }
 
         current_task
@@ -752,24 +842,67 @@ impl TaskManagerControl {
             .context("running task missing handle")?
             .interrupt()?;
         self.update_current_status(&current_task.task_id, ManagedTaskStatus::Interrupted)?;
-        Ok(true)
+        Ok(ActionOutcome::Cancelled)
     }
 
-    pub fn send_follow_up_task(&self, task_id: &str, prompt: String) -> Result<bool> {
+    pub fn cancel_task(&self, task_id: &str) -> Result<ActionOutcome> {
+        let Some(current_task) = self.current_task_snapshot()? else {
+            return Ok(ActionOutcome::Noop);
+        };
+        if current_task.task_id != task_id {
+            return Ok(ActionOutcome::Noop);
+        }
+
+        if current_task.status != ManagedTaskStatus::Running {
+            return Ok(ActionOutcome::NotContinuable);
+        }
+
+        current_task
+            .handle
+            .as_ref()
+            .context("running task missing handle")?
+            .cancel()?;
+        self.update_current_status(&current_task.task_id, ManagedTaskStatus::Cancelled)?;
+        Ok(ActionOutcome::Cancelled)
+    }
+
+    pub fn interrupt_task(&self, task_id: &str) -> Result<ActionOutcome> {
+        let Some(current_task) = self.current_task_snapshot()? else {
+            return Ok(ActionOutcome::Noop);
+        };
+        if current_task.task_id != task_id {
+            return Ok(ActionOutcome::Noop);
+        }
+
+        if current_task.status != ManagedTaskStatus::Running {
+            return Ok(ActionOutcome::NotContinuable);
+        }
+
+        current_task
+            .handle
+            .as_ref()
+            .context("running task missing handle")?
+            .interrupt()?;
+        self.update_current_status(&current_task.task_id, ManagedTaskStatus::Interrupted)?;
+        Ok(ActionOutcome::Cancelled)
+    }
+
+    pub fn send_follow_up_task(&self, task_id: &str, prompt: String) -> Result<SendOutcome> {
         let current_task_guard = self
             .current_task
             .lock()
             .map_err(|_| anyhow::anyhow!("task manager control mutex poisoned"))?;
         let Some(current_task) = current_task_guard.as_ref() else {
-            return Ok(false);
+            return Ok(SendOutcome::Noop);
         };
         if current_task.task_id != task_id {
-            return Ok(false);
+            return Ok(SendOutcome::Noop);
         }
 
         match current_task.status {
             ManagedTaskStatus::Pending => {
                 self.queue_pending_message(task_id, QueuedMessageKind::FollowUp, prompt)?;
+                Ok(SendOutcome::Queued)
             }
             ManagedTaskStatus::Running => {
                 let handle = current_task
@@ -779,28 +912,28 @@ impl TaskManagerControl {
                     .clone();
                 drop(current_task_guard);
                 handle.send_follow_up(prompt)?;
-                return Ok(true);
+                Ok(SendOutcome::Sent)
             }
-            _ => return Ok(false),
+            _ => Ok(SendOutcome::NotContinuable),
         }
-        Ok(true)
     }
 
-    pub fn steer_task(&self, task_id: &str, prompt: String) -> Result<bool> {
+    pub fn steer_task(&self, task_id: &str, prompt: String) -> Result<SteerOutcome> {
         let current_task_guard = self
             .current_task
             .lock()
             .map_err(|_| anyhow::anyhow!("task manager control mutex poisoned"))?;
         let Some(current_task) = current_task_guard.as_ref() else {
-            return Ok(false);
+            return Ok(SteerOutcome::Noop);
         };
         if current_task.task_id != task_id {
-            return Ok(false);
+            return Ok(SteerOutcome::Noop);
         }
 
         match current_task.status {
             ManagedTaskStatus::Pending => {
                 self.queue_pending_message(task_id, QueuedMessageKind::Steer, prompt)?;
+                Ok(SteerOutcome::Queued)
             }
             ManagedTaskStatus::Running => {
                 let handle = current_task
@@ -810,11 +943,10 @@ impl TaskManagerControl {
                     .clone();
                 drop(current_task_guard);
                 handle.steer(prompt)?;
-                return Ok(true);
+                Ok(SteerOutcome::Steered)
             }
-            _ => return Ok(false),
+            _ => Ok(SteerOutcome::NotContinuable),
         }
-        Ok(true)
     }
 
     fn set_current(
@@ -855,6 +987,7 @@ pub struct TaskManager {
     records: HashMap<String, TaskRecord>,
     task_record_paths: HashMap<String, PathBuf>,
     running_tasks: HashMap<String, RunningTask>,
+    resident_tasks: HashMap<String, ResidentTask>,
     queued_tasks: VecDeque<QueuedTask>,
     completed_runs: HashMap<String, ManagedWorkerRun>,
     completed_errors: HashMap<String, String>,
@@ -949,6 +1082,7 @@ impl Default for TaskManager {
             records: HashMap::new(),
             task_record_paths: HashMap::new(),
             running_tasks: HashMap::new(),
+            resident_tasks: HashMap::new(),
             queued_tasks: VecDeque::new(),
             completed_runs: HashMap::new(),
             completed_errors: HashMap::new(),
@@ -1261,13 +1395,13 @@ impl TaskManager {
         &mut self,
         task_id: &str,
         run_epoch: u64,
-        queued_task: &QueuedTask,
+        running_task: &RunningTask,
     ) -> Result<bool> {
         if !self.release_guard.release_once(task_id, run_epoch) {
             return Ok(false);
         }
 
-        self.concurrency.release(queued_task);
+        self.concurrency.release(&running_task.queued_task);
         self.running_tasks.remove(task_id);
         Ok(true)
     }
@@ -1291,6 +1425,7 @@ impl TaskManager {
             self.concurrency.release(&running_task.queued_task);
             running_task
         });
+        let resident_task = self.resident_tasks.remove(task_id);
 
         // Remove from queue
         self.queued_tasks
@@ -1307,12 +1442,21 @@ impl TaskManager {
             .or_else(|| {
                 self.task_record_paths
                     .get(task_id)
-                    .and_then(|task_record_path| state_store_from_task_record_path(task_record_path))
+                    .and_then(|task_record_path| {
+                        state_store_from_task_record_path(task_record_path)
+                    })
+            })
+            .or_else(|| {
+                resident_task
+                    .as_ref()
+                    .map(|resident_task| resident_task.queued_task.store.clone())
             });
 
         // Stop the resident handle best-effort before clearing records.
         if let Some(running_task) = running_task.as_ref() {
             best_effort_stop_handle(&running_task.handle, task_id, cause);
+        } else if let Some(resident_task) = resident_task.as_ref() {
+            best_effort_stop_handle(&resident_task.handle, task_id, cause);
         } else {
             match self.control.current_task_snapshot() {
                 Ok(Some(current_task)) => {
@@ -1481,65 +1625,70 @@ impl TaskManager {
         count
     }
 
-fn trim_archive(&mut self) {
-    if self.completed_archive.len() <= ARCHIVE_CAP {
-        return;
-    }
+    fn trim_archive(&mut self) {
+        if self.completed_archive.len() <= ARCHIVE_CAP {
+            return;
+        }
 
-    let preserved_indices: Vec<usize> = self
-        .completed_archive
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, record)| {
-            matches!(record.status, ManagedTaskStatus::Cancelled | ManagedTaskStatus::Lost)
+        let preserved_indices: Vec<usize> = self
+            .completed_archive
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, record)| {
+                matches!(
+                    record.status,
+                    ManagedTaskStatus::Cancelled | ManagedTaskStatus::Lost
+                )
                 .then_some(idx)
-        })
-        .collect();
-    let non_preserved_indices: Vec<usize> = self
-        .completed_archive
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, record)| {
-            (!matches!(
-                record.status,
-                ManagedTaskStatus::Cancelled | ManagedTaskStatus::Lost
-            ))
-            .then_some(idx)
-        })
-        .collect();
+            })
+            .collect();
+        let non_preserved_indices: Vec<usize> = self
+            .completed_archive
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, record)| {
+                (!matches!(
+                    record.status,
+                    ManagedTaskStatus::Cancelled | ManagedTaskStatus::Lost
+                ))
+                .then_some(idx)
+            })
+            .collect();
 
-    let preserved_budget = preserved_indices.len().min(ARCHIVE_CAP);
-    let non_preserved_budget = ARCHIVE_CAP - preserved_budget;
-    let non_preserved_kept: Vec<usize> = non_preserved_indices
-        .iter()
-        .rev()
-        .take(non_preserved_budget)
-        .copied()
-        .collect();
-    let non_preserved_keep = non_preserved_kept
-        .iter()
-        .collect::<std::collections::HashSet<_>>();
-
-    let preserved_keep: Vec<usize> = if preserved_indices.len() <= preserved_budget {
-        preserved_indices.clone()
-    } else {
-        preserved_indices
+        let preserved_budget = preserved_indices.len().min(ARCHIVE_CAP);
+        let non_preserved_budget = ARCHIVE_CAP - preserved_budget;
+        let non_preserved_kept: Vec<usize> = non_preserved_indices
             .iter()
             .rev()
-            .take(preserved_budget)
+            .take(non_preserved_budget)
             .copied()
-            .collect()
-    };
-    let preserved_keep = preserved_keep.iter().collect::<std::collections::HashSet<_>>();
+            .collect();
+        let non_preserved_keep = non_preserved_kept
+            .iter()
+            .collect::<std::collections::HashSet<_>>();
 
-    let mut filtered = VecDeque::new();
-    for (index, task_record) in self.completed_archive.iter().enumerate() {
-        if non_preserved_keep.contains(&index) || preserved_keep.contains(&index) {
-            filtered.push_back(task_record.clone());
+        let preserved_keep: Vec<usize> = if preserved_indices.len() <= preserved_budget {
+            preserved_indices.clone()
+        } else {
+            preserved_indices
+                .iter()
+                .rev()
+                .take(preserved_budget)
+                .copied()
+                .collect()
+        };
+        let preserved_keep = preserved_keep
+            .iter()
+            .collect::<std::collections::HashSet<_>>();
+
+        let mut filtered = VecDeque::new();
+        for (index, task_record) in self.completed_archive.iter().enumerate() {
+            if non_preserved_keep.contains(&index) || preserved_keep.contains(&index) {
+                filtered.push_back(task_record.clone());
+            }
         }
+        self.completed_archive = filtered;
     }
-    self.completed_archive = filtered;
-}
 
     fn sweep_stale_running_tasks(&mut self) -> Result<usize> {
         let stale_task_timeout = self.runtime_policy.stale_task_timeout;
@@ -1694,7 +1843,7 @@ fn trim_archive(&mut self) {
                             self.release_running_task_once(
                                 task_id,
                                 run_epoch,
-                                &running_task.queued_task,
+                                &running_task,
                             )?;
                             self.records.insert(task_id.to_string(), record);
                             self.start_queued_task(retry_task)?;
@@ -1724,7 +1873,21 @@ fn trim_archive(&mut self) {
                 let run_epoch = run.record.run_epoch;
                 self.control
                     .update_current_status(task_id, run.record.status.clone())?;
-                self.release_running_task_once(task_id, run_epoch, &running_task.queued_task)?;
+                if matches!(
+                    &run.record.status,
+                    ManagedTaskStatus::Completed
+                        | ManagedTaskStatus::Failed
+                        | ManagedTaskStatus::Interrupted
+                ) {
+                    self.resident_tasks.insert(
+                        task_id.to_string(),
+                        ResidentTask {
+                            handle: Arc::clone(&running_task.handle),
+                            queued_task: running_task.queued_task.clone(),
+                        },
+                    );
+                }
+                self.release_running_task_once(task_id, run_epoch, &running_task)?;
                 self.records.insert(task_id.to_string(), run.record.clone());
                 self.completed_runs.insert(task_id.to_string(), run.clone());
                 self.completed_archive.push_back(run.record.clone());
@@ -1809,7 +1972,7 @@ fn trim_archive(&mut self) {
                             self.release_running_task_once(
                                 task_id,
                                 run_epoch,
-                                &running_task.queued_task,
+                                &running_task,
                             )?;
                             self.records.insert(task_id.to_string(), record);
                             self.start_queued_task(retry_task)?;
@@ -1842,7 +2005,21 @@ fn trim_archive(&mut self) {
                 let run_epoch = record.run_epoch;
                 self.control
                     .update_current_status(task_id, record.status.clone())?;
-                self.release_running_task_once(task_id, run_epoch, &running_task.queued_task)?;
+                if matches!(
+                    &record.status,
+                    ManagedTaskStatus::Completed
+                        | ManagedTaskStatus::Failed
+                        | ManagedTaskStatus::Interrupted
+                ) {
+                    self.resident_tasks.insert(
+                        task_id.to_string(),
+                        ResidentTask {
+                            handle: Arc::clone(&running_task.handle),
+                            queued_task: running_task.queued_task.clone(),
+                        },
+                    );
+                }
+                self.release_running_task_once(task_id, run_epoch, &running_task)?;
                 self.records.insert(task_id.to_string(), record);
                 self.process_queue()?;
                 Err(error)
@@ -1890,7 +2067,7 @@ fn trim_archive(&mut self) {
         descendant_task_ids
     }
 
-    fn cancel_task_direct(&mut self, task_id: &str) -> Result<()> {
+    fn cancel_task_direct(&mut self, task_id: &str) -> Result<ActionOutcome> {
         let mut queued_store = None;
         if let Some(index) = self
             .queued_tasks
@@ -1916,24 +2093,34 @@ fn trim_archive(&mut self) {
                 error: None,
             },
         );
-        let store = if let Some(running_task) = self.running_tasks.get(task_id) {
-            if transition.applied {
-                running_task.handle.cancel()?;
-            }
-            Some(running_task.store.clone())
+        let outcome = if transition.applied {
+            ActionOutcome::Cancelled
         } else {
-            queued_store
+            ActionOutcome::NotContinuable
         };
+        let store = self
+            .running_tasks
+            .get(task_id)
+            .map(|running_task| running_task.store.clone())
+            .or(queued_store);
+        let record_snapshot = record.clone();
         if let Some(store) = store {
-            write_task_record(&store, record)?;
-            append_task_lifecycle_event(&store, record, Some(&transition))?;
+            write_task_record(&store, &record_snapshot)?;
+            append_task_lifecycle_event(&store, &record_snapshot, Some(&transition))?;
         }
         if !is_running {
             self.control.take_pending_messages(task_id)?;
         }
         self.control
             .update_current_status(task_id, record.status.clone())?;
-        Ok(())
+        if transition.applied
+            && let Some(running_task) = self.running_tasks.get(task_id)
+            && let Err(error) = running_task.handle.cancel()
+        {
+            eprintln!("failed to cancel Gear worker task `{task_id}` after terminal transition: {error:#}");
+            return Err(error);
+        }
+        Ok(outcome)
     }
 
     pub fn cancel_task(&mut self, task_id: &str) -> Result<()> {
@@ -1945,7 +2132,16 @@ fn trim_archive(&mut self) {
         Ok(())
     }
 
-    fn interrupt_task_direct(&mut self, task_id: &str) -> Result<bool> {
+    pub fn cancel_task_with_outcome(&mut self, task_id: &str) -> Result<ActionOutcome> {
+        let descendant_task_ids = self.descendant_task_ids(task_id);
+        let outcome = self.cancel_task_direct(task_id)?;
+        for descendant_task_id in descendant_task_ids {
+            self.cancel_task_direct(&descendant_task_id)?;
+        }
+        Ok(outcome)
+    }
+
+    fn interrupt_task_direct(&mut self, task_id: &str) -> Result<ActionOutcome> {
         let is_running = self.running_tasks.contains_key(task_id);
         let Some(record) = self.records.get_mut(task_id) else {
             bail!("unknown managed task: {task_id}");
@@ -1958,112 +2154,216 @@ fn trim_archive(&mut self) {
                 error: None,
             },
         );
-        let interrupted = transition.applied;
-        let store = if let Some(running_task) = self.running_tasks.get(task_id) {
-            if transition.applied {
-                running_task.handle.interrupt()?;
-                if let Some(output) = running_task.handle.last_output() {
-                    record.summary = output;
-                    if let Some(attempt) = record.attempts.last_mut() {
-                        attempt.summary = record.summary.clone();
-                    }
-                }
-            }
-            Some(running_task.store.clone())
+        let outcome = if transition.applied {
+            ActionOutcome::Interrupted
         } else {
-            None
+            ActionOutcome::NotContinuable
         };
+        let store = self
+            .running_tasks
+            .get(task_id)
+            .map(|running_task| running_task.store.clone());
+        let record_snapshot = record.clone();
         if let Some(store) = store {
-            write_task_record(&store, record)?;
-            append_task_lifecycle_event(&store, record, Some(&transition))?;
+            write_task_record(&store, &record_snapshot)?;
+            append_task_lifecycle_event(&store, &record_snapshot, Some(&transition))?;
         }
         if !is_running {
             self.control.take_pending_messages(task_id)?;
         }
         self.control
             .update_current_status(task_id, record.status.clone())?;
-        Ok(interrupted)
+        if transition.applied
+            && let Some(running_task) = self.running_tasks.get(task_id)
+        {
+            if let Err(error) = running_task.handle.interrupt() {
+                eprintln!("failed to interrupt Gear worker task `{task_id}` after terminal transition: {error:#}");
+                return Err(error);
+            }
+            if let Some(output) = running_task.handle.last_output() {
+                let mut updated_record = record.clone();
+                updated_record.summary = output.clone();
+                if let Some(attempt) = updated_record.attempts.last_mut() {
+                    attempt.summary = output;
+                }
+                if let Some(store) = self.running_tasks.get(task_id).map(|task| task.store.clone()) {
+                    write_task_record(&store, &updated_record)?;
+                }
+                record.summary = updated_record.summary;
+            }
+        }
+        Ok(outcome)
     }
 
-    pub fn interrupt_task(&mut self, task_id: &str) -> Result<bool> {
+    pub fn interrupt_task(&mut self, task_id: &str) -> Result<ActionOutcome> {
         let descendant_task_ids = self.descendant_task_ids(task_id);
-        let interrupted = self.interrupt_task_direct(task_id)?;
+        let outcome = self.interrupt_task_direct(task_id)?;
         for descendant_task_id in descendant_task_ids {
             let _ = self.interrupt_task_direct(&descendant_task_id)?;
         }
-        Ok(interrupted)
+        Ok(outcome)
     }
 
-    pub fn send_follow_up_task(&mut self, task_id: &str, prompt: String) -> Result<bool> {
-        let Some(record) = self.records.get(task_id) else {
+    fn revive_task(
+        &mut self,
+        task_id: &str,
+        prompt: String,
+        message_kind: QueuedMessageKind,
+    ) -> Result<bool> {
+        let Some(resident_task) = self.resident_tasks.remove(task_id) else {
             return Ok(false);
+        };
+
+        if !self
+            .records
+            .get(task_id)
+            .is_some_and(|record| messageability_for_record(record) == Messageability::Revive)
+        {
+            self.resident_tasks
+                .insert(task_id.to_string(), resident_task);
+            return Ok(false);
+        }
+
+        if !self.concurrency.acquire(&resident_task.queued_task) {
+            self.resident_tasks
+                .insert(task_id.to_string(), resident_task);
+            return Ok(false);
+        }
+
+        let started_at = timestamp();
+        let handle = resident_task.handle.clone();
+        let session_id = handle.session_id();
+        let record = self
+            .records
+            .get_mut(task_id)
+            .context("resident task record disappeared during revive")?;
+        record.status = ManagedTaskStatus::Running;
+        record.residency_state = ResidencyState::Resident;
+        record.run_epoch = record.run_epoch.saturating_add(1);
+        record.started_at = started_at.clone();
+        record.finished_at = None;
+        record.session_id = session_id.clone();
+        record.result_path = None;
+        record.outcome_path = None;
+        record.summary = "Worker task revived.".to_string();
+        record.failure_kind = None;
+        record.retry_reason = None;
+        record.error = None;
+        record.killed = false;
+        record.attempts.push(TaskAttempt {
+            attempt: record.attempts.last().map_or(1, |attempt| attempt.attempt + 1),
+            worker_kind: record.worker_kind.clone(),
+            worker_command: record.worker_command.clone(),
+            worker_model: record.worker_model.clone(),
+            worker_category: record.worker_category.clone(),
+            route_hint: record.route_hint.clone(),
+            route_reason: format!("revived from epoch {}", record.run_epoch - 1),
+            status: TaskAttemptStatus::Running,
+            started_at,
+            finished_at: None,
+            session_id,
+            result_path: None,
+            outcome_path: None,
+            summary: "Worker task revived.".to_string(),
+            failure_kind: None,
+            retry_reason: None,
+            error: None,
+        });
+        let record_snapshot = record.clone();
+        write_task_record(&resident_task.queued_task.store, &record_snapshot)?;
+        append_task_lifecycle_event(&resident_task.queued_task.store, &record_snapshot, None)?;
+
+        let subscription = if handle.session_id().is_some() {
+            Some(handle.subscribe(Arc::new(|_| {}))?)
+        } else {
+            None
+        };
+        self.control.set_current(
+            task_id.to_string(),
+            ManagedTaskStatus::Running,
+            Some(handle.clone()),
+        )?;
+        let running_task = RunningTask {
+            store: resident_task.queued_task.store.clone(),
+            handle,
+            queued_task: resident_task.queued_task,
+            started_at: Instant::now(),
+            _subscription: subscription,
+        };
+        self.running_tasks
+            .insert(task_id.to_string(), running_task.clone());
+
+        let delivery_result = match message_kind {
+            QueuedMessageKind::FollowUp => running_task.handle.send_follow_up(prompt),
+            QueuedMessageKind::Steer => running_task.handle.steer(prompt),
+        };
+        if let Err(error) = delivery_result {
+            self.running_tasks.remove(task_id);
+            self.concurrency.release(&running_task.queued_task);
+            self.resident_tasks.insert(
+                task_id.to_string(),
+                ResidentTask {
+                    handle: running_task.handle.clone(),
+                    queued_task: running_task.queued_task.clone(),
+                },
+            );
+            return Err(error);
+        }
+
+        self.dispatch_running_task(task_id.to_string(), running_task);
+        Ok(true)
+    }
+
+    pub fn send_follow_up_task(&mut self, task_id: &str, prompt: String) -> Result<SendOutcome> {
+        let Some(record) = self.records.get(task_id) else {
+            return Ok(SendOutcome::Noop);
         };
 
         if record.status == ManagedTaskStatus::Pending {
             self.control
                 .queue_pending_message(task_id, QueuedMessageKind::FollowUp, prompt)?;
-            return Ok(true);
+            return Ok(SendOutcome::Queued);
         }
 
         if let Some(running_task) = self.running_tasks.get(task_id) {
             running_task.handle.send_follow_up(prompt)?;
-            return Ok(true);
+            return Ok(SendOutcome::Sent);
         }
 
         if messageability_for_record(record) == Messageability::Revive {
-            let Some(current_task) = self.control.current_task_snapshot()? else {
-                return Ok(false);
-            };
-            if current_task.task_id != task_id {
-                return Ok(false);
+            if self.revive_task(task_id, prompt, QueuedMessageKind::FollowUp)? {
+                return Ok(SendOutcome::Revive);
             }
-            let Some(handle) = current_task.handle.as_ref() else {
-                return Ok(false);
-            };
-
-            handle.send_follow_up(prompt)?;
-            self.control
-                .update_current_status(task_id, ManagedTaskStatus::Running)?;
-            return Ok(true);
+            return Ok(SendOutcome::NotContinuable);
         }
 
-        Ok(false)
+        Ok(SendOutcome::NotContinuable)
     }
 
-    pub fn steer_task(&mut self, task_id: &str, prompt: String) -> Result<bool> {
+    pub fn steer_task(&mut self, task_id: &str, prompt: String) -> Result<SteerOutcome> {
         let Some(record) = self.records.get(task_id) else {
-            return Ok(false);
+            return Ok(SteerOutcome::Noop);
         };
 
         if record.status == ManagedTaskStatus::Pending {
             self.control
                 .queue_pending_message(task_id, QueuedMessageKind::Steer, prompt)?;
-            return Ok(true);
+            return Ok(SteerOutcome::Queued);
         }
 
         if let Some(running_task) = self.running_tasks.get(task_id) {
             running_task.handle.steer(prompt)?;
-            return Ok(true);
+            return Ok(SteerOutcome::Steered);
         }
 
         if messageability_for_record(record) == Messageability::Revive {
-            let Some(current_task) = self.control.current_task_snapshot()? else {
-                return Ok(false);
-            };
-            if current_task.task_id != task_id {
-                return Ok(false);
+            if self.revive_task(task_id, prompt, QueuedMessageKind::Steer)? {
+                return Ok(SteerOutcome::Revive);
             }
-            let Some(handle) = current_task.handle.as_ref() else {
-                return Ok(false);
-            };
-
-            handle.steer(prompt)?;
-            self.control
-                .update_current_status(task_id, ManagedTaskStatus::Running)?;
-            return Ok(true);
+            return Ok(SteerOutcome::NotContinuable);
         }
 
-        Ok(false)
+        Ok(SteerOutcome::NotContinuable)
     }
 
     pub fn list(&self) -> Vec<TaskRecord> {
@@ -2488,6 +2788,13 @@ const NOTIFIER_RETRY_ATTEMPTS: usize = 2;
 pub struct CompletionNotifier {
     buffer: Arc<Mutex<HashMap<(String, u64), CompletionNotification>>>,
     last_flush: Arc<Mutex<HashMap<String, Instant>>>,
+    /// Per-session serialization: tracks whether a flush is currently in progress
+    /// for a given parent session. Prevents concurrent flushes for the same session.
+    flush_serializer: Arc<Mutex<HashMap<String, bool>>>,
+    /// Per-session pending flush queue: stores signals from callers that attempted
+    /// to flush while another flush was in progress. Processed in FIFO order after
+    /// the current flush completes, ensuring ordered retry.
+    pending_flush: Arc<Mutex<HashMap<String, VecDeque<()>>>>,
 }
 
 impl CompletionNotifier {
@@ -2582,16 +2889,17 @@ impl CompletionNotifier {
             }
         }
 
-        if let Err(record_error) = record_failed_epoch(&notification.task_id, notification.run_epoch)
+        if let Err(record_error) =
+            record_failed_epoch(&notification.task_id, notification.run_epoch)
         {
             eprintln!(
                 "failed to record completion notification failure for {} epoch {}: {record_error:#}",
                 notification.task_id, notification.run_epoch,
             );
         }
-        Ok(NotificationResult::Failed(
-            last_failure.unwrap_or_else(|| "notification delivery failed".to_string()),
-        ))
+        Ok(NotificationResult::Failed(last_failure.unwrap_or_else(
+            || "notification delivery failed".to_string(),
+        )))
     }
 
     pub fn flush_buffer(
@@ -2600,46 +2908,124 @@ impl CompletionNotifier {
         parent_state: ParentSessionState,
         write_notified: &dyn Fn(&str, u64) -> Result<()>,
         record_failed_epoch: &dyn Fn(&str, u64) -> Result<()>,
+        read_record: &dyn Fn(&str) -> Result<Option<TaskRecord>>,
     ) -> Result<Vec<NotificationResult>> {
-        let mut results = Vec::new();
+        let mut all_results = Vec::new();
+
         if !parent_state.can_wake() {
-            return Ok(results);
+            return Ok(all_results);
         }
 
-        let now = Instant::now();
-        let cooldown = {
-            let mut last_flush = self
-                .last_flush
-                .lock()
-                .map_err(|_| anyhow::anyhow!("completion notifier last_flush mutex poisoned"))?;
-            let last = last_flush
-                .get(parent_session_id)
-                .copied()
-                .unwrap_or(Instant::now() - Duration::from_millis(NOTIFIER_DEBOUNCE_MS * 2));
-            if now.duration_since(last) < Duration::from_millis(NOTIFIER_DEBOUNCE_MS) {
-                return Ok(results);
+        // Serialization lock: only one flush at a time per session.
+        // If another flush is in progress, queue this request and return;
+        // the running flush will pick it up after it completes.
+        {
+            let mut serializer = self.flush_serializer.lock().map_err(|_| {
+                anyhow::anyhow!("completion notifier flush_serializer mutex poisoned")
+            })?;
+            if *serializer
+                .entry(parent_session_id.to_string())
+                .or_insert(false)
+            {
+                self.pending_flush
+                    .lock()
+                    .map_err(|_| {
+                        anyhow::anyhow!("completion notifier pending_flush mutex poisoned")
+                    })?
+                    .entry(parent_session_id.to_string())
+                    .or_default()
+                    .push_back(());
+                return Ok(all_results);
             }
-            last_flush.insert(parent_session_id.to_string(), now);
-            0u64
-        };
-        let _ = cooldown;
+            serializer.insert(parent_session_id.to_string(), true);
+        }
 
-        let mut buffer = self
-            .buffer
-            .lock()
-            .map_err(|_| anyhow::anyhow!("completion notifier buffer mutex poisoned"))?;
-        let mut keys: Vec<(String, u64)> = buffer.keys().cloned().collect();
-        keys.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
-        for key in keys {
-            if let Some(notification) = buffer.remove(&key) {
-                results.push(Self::deliver_with_retry(
-                    &notification,
-                    write_notified,
-                    record_failed_epoch,
-                )?);
+        loop {
+            let now = Instant::now();
+            let debounce_ok = {
+                let mut last_flush = self.last_flush.lock().map_err(|_| {
+                    anyhow::anyhow!("completion notifier last_flush mutex poisoned")
+                })?;
+                let last = last_flush
+                    .get(parent_session_id)
+                    .copied()
+                    .unwrap_or(now - Duration::from_millis(NOTIFIER_DEBOUNCE_MS * 2));
+                if now.duration_since(last) < Duration::from_millis(NOTIFIER_DEBOUNCE_MS) {
+                    false
+                } else {
+                    last_flush.insert(parent_session_id.to_string(), now);
+                    true
+                }
+            };
+
+            if debounce_ok {
+                let mut buffer = self
+                    .buffer
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("completion notifier buffer mutex poisoned"))?;
+                let mut keys: Vec<(String, u64)> = buffer.keys().cloned().collect();
+                keys.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+                for key in keys {
+                    if let Some(notification) = buffer.remove(&key) {
+                        // State re-verification: check the task record still
+                        // matches before sending. If the task has been revived
+                        // to a new epoch or its status changed, skip it.
+                        let should_send = match read_record(&notification.task_id) {
+                            Ok(Some(record)) => {
+                                record.run_epoch == notification.run_epoch
+                                    && Self::is_notifiable_status(&record.status)
+                            }
+                            Ok(None) | Err(_) => {
+                                // Record missing or read error: still attempt
+                                // delivery so transient storage issues don't
+                                // cause dropped notifications.
+                                true
+                            }
+                        };
+                        if should_send {
+                            all_results.push(Self::deliver_with_retry(
+                                &notification,
+                                write_notified,
+                                record_failed_epoch,
+                            )?);
+                        } else {
+                            all_results.push(NotificationResult::Skipped);
+                        }
+                    }
+                }
+            }
+
+            // Atomically: release serializer lock, check for pending flushes,
+            // and re-acquire if another request is queued.
+            let has_pending = {
+                let mut serializer = self.flush_serializer.lock().map_err(|_| {
+                    anyhow::anyhow!("completion notifier flush_serializer mutex poisoned")
+                })?;
+                serializer.insert(parent_session_id.to_string(), false);
+
+                let mut pending = self.pending_flush.lock().map_err(|_| {
+                    anyhow::anyhow!("completion notifier pending_flush mutex poisoned")
+                })?;
+                if let Some(queue) = pending.get_mut(parent_session_id) {
+                    if !queue.is_empty() {
+                        queue.pop_front();
+                        serializer.insert(parent_session_id.to_string(), true);
+                        true
+                    } else {
+                        pending.remove(parent_session_id);
+                        false
+                    }
+                } else {
+                    false
+                }
+            };
+
+            if !has_pending {
+                break;
             }
         }
-        Ok(results)
+
+        Ok(all_results)
     }
 
     fn is_notifiable_status(status: &ManagedTaskStatus) -> bool {
@@ -4738,9 +5124,18 @@ mod tests {
             })),
         )?;
 
-        assert!(control.send_follow_up_current_task("continue".to_string())?);
-        assert!(control.steer_current_task("adjust".to_string())?);
-        assert!(control.interrupt_task("task_interrupt")?);
+        assert_eq!(
+            control.send_follow_up_current_task("continue".to_string())?,
+            SendOutcome::Sent
+        );
+        assert_eq!(
+            control.steer_current_task("adjust".to_string())?,
+            SteerOutcome::Steered
+        );
+        assert_eq!(
+            control.interrupt_task("task_interrupt")?,
+            ActionOutcome::Cancelled
+        );
         assert_eq!(interrupted.load(Ordering::SeqCst), 1);
         assert_eq!(
             follow_ups
@@ -4757,12 +5152,30 @@ mod tests {
             ["adjust"]
         );
         assert_eq!(cancelled.load(Ordering::SeqCst), 0);
-        assert!(!control.send_follow_up_current_task("continue after interrupt".to_string())?);
-        assert!(!control.steer_current_task("adjust after interrupt".to_string())?);
-        assert!(!control.send_follow_up_task("task_interrupt", "continue 2".to_string())?);
-        assert!(!control.steer_task("task_interrupt", "adjust 2".to_string())?);
-        assert!(!control.cancel_current_task()?);
-        assert!(!control.interrupt_current_task()?);
+        assert_eq!(
+            control.send_follow_up_current_task("continue after interrupt".to_string())?,
+            SendOutcome::NotContinuable
+        );
+        assert_eq!(
+            control.steer_current_task("adjust after interrupt".to_string())?,
+            SteerOutcome::NotContinuable
+        );
+        assert_eq!(
+            control.send_follow_up_task("task_interrupt", "continue 2".to_string())?,
+            SendOutcome::NotContinuable
+        );
+        assert_eq!(
+            control.steer_task("task_interrupt", "adjust 2".to_string())?,
+            SteerOutcome::NotContinuable
+        );
+        assert_eq!(
+            control.cancel_current_task()?,
+            ActionOutcome::NotContinuable
+        );
+        assert_eq!(
+            control.interrupt_current_task()?,
+            ActionOutcome::NotContinuable
+        );
         Ok(())
     }
 
@@ -4784,15 +5197,36 @@ mod tests {
             })),
         )?;
 
-        assert!(control.cancel_task("task_cancel")?);
+        assert_eq!(
+            control.cancel_task("task_cancel")?,
+            ActionOutcome::Cancelled
+        );
         assert_eq!(cancelled.load(Ordering::SeqCst), 1);
         assert_eq!(interrupted.load(Ordering::SeqCst), 0);
-        assert!(!control.send_follow_up_current_task("continue after cancel".to_string())?);
-        assert!(!control.steer_current_task("adjust after cancel".to_string())?);
-        assert!(!control.cancel_current_task()?);
-        assert!(!control.interrupt_current_task()?);
-        assert!(!control.send_follow_up_task("task_cancel", "continue 2".to_string())?);
-        assert!(!control.steer_task("task_cancel", "adjust 2".to_string())?);
+        assert_eq!(
+            control.send_follow_up_current_task("continue after cancel".to_string())?,
+            SendOutcome::NotContinuable
+        );
+        assert_eq!(
+            control.steer_current_task("adjust after cancel".to_string())?,
+            SteerOutcome::NotContinuable
+        );
+        assert_eq!(
+            control.cancel_current_task()?,
+            ActionOutcome::NotContinuable
+        );
+        assert_eq!(
+            control.interrupt_current_task()?,
+            ActionOutcome::NotContinuable
+        );
+        assert_eq!(
+            control.send_follow_up_task("task_cancel", "continue 2".to_string())?,
+            SendOutcome::NotContinuable
+        );
+        assert_eq!(
+            control.steer_task("task_cancel", "adjust 2".to_string())?,
+            SteerOutcome::NotContinuable
+        );
         Ok(())
     }
 
@@ -4921,11 +5355,16 @@ mod tests {
         assert_eq!(snapshot.tasks.len(), 1);
         assert_eq!(snapshot.tasks[0].task_id, "task_snapshot");
         assert_eq!(snapshot.tasks[0].attempts.len(), 1);
-        assert_eq!(snapshot.tasks[0].messageability, Some(Messageability::Steer));
+        assert_eq!(
+            snapshot.tasks[0].messageability,
+            Some(Messageability::Steer)
+        );
         assert_eq!(snapshot.tasks[0].summary_head, "Worker task started.");
-        assert!(snapshot.tasks[0]
-            .continuation_hint
-            .contains("Steer the running task"));
+        assert!(
+            snapshot.tasks[0]
+                .continuation_hint
+                .contains("Steer the running task")
+        );
         assert_eq!(
             snapshot.tasks[0].attempts[0].outcome_path.as_deref(),
             Some(std::path::Path::new("/tmp/attempt-outcome.json"))
@@ -6010,7 +6449,7 @@ mod tests {
             control.current_task_id()?.as_deref(),
             Some(task.id.as_str())
         );
-        assert!(control.cancel_current_task()?);
+        assert_eq!(control.cancel_current_task()?, ActionOutcome::Cancelled);
 
         let error = waiter
             .join()
@@ -6266,7 +6705,10 @@ mod tests {
             ),
         );
 
-        assert!(manager.interrupt_task("task_interrupt")?);
+        assert_eq!(
+            manager.interrupt_task("task_interrupt")?,
+            ActionOutcome::Cancelled
+        );
 
         let record = manager
             .list()
@@ -6501,7 +6943,10 @@ mod tests {
         let pending_json =
             fs::read_to_string(store.worker_dir("task_pending").join("task-record.json"))?;
         let pending_after_destroy: TaskRecord = serde_json::from_str(&pending_json)?;
-        assert_eq!(pending_after_destroy.residency_state, ResidencyState::Disposed);
+        assert_eq!(
+            pending_after_destroy.residency_state,
+            ResidencyState::Disposed
+        );
         let pending_events =
             fs::read_to_string(store.worker_dir("task_pending").join("task-events.jsonl"))?;
         assert!(pending_events.contains("dispose"));
@@ -6616,9 +7061,11 @@ mod tests {
         .context("should build notification for completed task")?;
 
         assert_eq!(notification.summary_head, "Head line");
-        assert!(notification
-            .continuation_hint
-            .contains("Follow up from the Gear panel"));
+        assert!(
+            notification
+                .continuation_hint
+                .contains("Follow up from the Gear panel")
+        );
         Ok(())
     }
 
@@ -6642,9 +7089,11 @@ mod tests {
         .context("should build notification for lost task")?;
 
         assert_eq!(notification.summary_head, "Lost line");
-        assert!(notification
-            .continuation_hint
-            .contains("Open the result/outcome artifacts"));
+        assert!(
+            notification
+                .continuation_hint
+                .contains("Open the result/outcome artifacts")
+        );
         Ok(())
     }
 
@@ -6695,6 +7144,7 @@ mod tests {
                 Ok(())
             },
             &|_, _| Ok(()),
+            &|_| Ok(None),
         )?;
 
         let sent_count = results
@@ -6758,7 +7208,10 @@ mod tests {
             .map_err(|_| anyhow::anyhow!("mutex"))?;
         assert_eq!(*attempts, 2, "delivery should retry once before failing");
         let failed_epochs = failed_epochs.lock().map_err(|_| anyhow::anyhow!("mutex"))?;
-        assert_eq!(failed_epochs.as_slice(), &[("task_delivery_fail".to_string(), 1)]);
+        assert_eq!(
+            failed_epochs.as_slice(),
+            &[("task_delivery_fail".to_string(), 1)]
+        );
         Ok(())
     }
 
@@ -6819,9 +7272,316 @@ mod tests {
             .map_err(|_| anyhow::anyhow!("mutex"))?;
         assert_eq!(*attempts, 2, "delivery should retry once before succeeding");
         let delivered = delivered.lock().map_err(|_| anyhow::anyhow!("mutex"))?;
-        assert_eq!(delivered.as_slice(), &[("task_delivery_retry".to_string(), 2)]);
+        assert_eq!(
+            delivered.as_slice(),
+            &[("task_delivery_retry".to_string(), 2)]
+        );
         let failed_epochs = failed_epochs.lock().map_err(|_| anyhow::anyhow!("mutex"))?;
-        assert!(failed_epochs.is_empty(), "transient failure should not write failed epoch");
+        assert!(
+            failed_epochs.is_empty(),
+            "transient failure should not write failed epoch"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn completion_flush_serializes_rapid_arrivals() -> Result<()> {
+        // Verify that flush_buffer serializes concurrent requests for the
+        // same parent session. When serializer is locked, incoming flush
+        // requests are queued in pending_flush and processed in FIFO order
+        // after the current flush completes.
+        let notifier = CompletionNotifier::new();
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+
+        // Buffer 3 notifications by injecting while streaming
+        for i in 0..3 {
+            let notification = CompletionNotification {
+                task_id: format!("task_{i}"),
+                task_name: "test".to_string(),
+                status: ManagedTaskStatus::Completed,
+                run_epoch: 1,
+                summary: format!("result {i}"),
+                summary_head: format!("result {i}"),
+                continuation_hint: "continue".to_string(),
+                failure_kind: None,
+                duration_ms: 0,
+                result_path: None,
+                outcome_path: None,
+            };
+            notifier.try_notify(
+                notification,
+                ParentSessionState::Streaming,
+                &|_, _| Ok(()),
+                &|_, _| Ok(()),
+            )?;
+        }
+
+        // Simulate a concurrent flush in progress by locking the serializer
+        {
+            let mut serializer = notifier
+                .flush_serializer
+                .lock()
+                .map_err(|_| anyhow::anyhow!("mutex"))?;
+            serializer.insert("parent_arrivals".to_string(), true);
+        }
+
+        // This flush call should see the locked serializer and queue a pending
+        // request instead of flushing.
+        let results = notifier.flush_buffer(
+            "parent_arrivals",
+            ParentSessionState::Idle,
+            &|task_id, epoch| {
+                delivered
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("mutex"))?
+                    .push((task_id.to_string(), epoch));
+                Ok(())
+            },
+            &|_, _| Ok(()),
+            &|_| Ok(None),
+        )?;
+        assert!(
+            results.is_empty(),
+            "should not flush when serializer is locked by another caller"
+        );
+        assert!(
+            delivered
+                .lock()
+                .map_err(|_| anyhow::anyhow!("mutex"))?
+                .is_empty(),
+            "no delivery should occur while serializer is held"
+        );
+
+        // Verify that a pending request was queued
+        {
+            let mut pending = notifier
+                .pending_flush
+                .lock()
+                .map_err(|_| anyhow::anyhow!("mutex"))?;
+            let queue = pending
+                .get_mut("parent_arrivals")
+                .expect("pending queue should exist for session");
+            assert_eq!(queue.len(), 1, "one pending flush should be queued");
+            queue.clear();
+        }
+
+        // Release the serializer
+        {
+            let mut serializer = notifier
+                .flush_serializer
+                .lock()
+                .map_err(|_| anyhow::anyhow!("mutex"))?;
+            serializer.insert("parent_arrivals".to_string(), false);
+        }
+
+        // Flush again — should acquire the serializer and deliver all 3
+        // notifications in epoch order (task_0, task_1, task_2).
+        let results = notifier.flush_buffer(
+            "parent_arrivals",
+            ParentSessionState::Idle,
+            &|task_id, epoch| {
+                delivered
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("mutex"))?
+                    .push((task_id.to_string(), epoch));
+                Ok(())
+            },
+            &|_, _| Ok(()),
+            &|_| Ok(None),
+        )?;
+        let sent_count = results
+            .iter()
+            .filter(|r| **r == NotificationResult::Sent)
+            .count();
+        assert_eq!(
+            sent_count, 3,
+            "all 3 buffered notifications should be delivered"
+        );
+
+        let delivered = delivered.lock().map_err(|_| anyhow::anyhow!("mutex"))?;
+        assert_eq!(delivered.len(), 3);
+        assert_eq!(
+            delivered[0].0, "task_0",
+            "notifications should be delivered in arrival order"
+        );
+        assert_eq!(delivered[1].0, "task_1");
+        assert_eq!(delivered[2].0, "task_2");
+        Ok(())
+    }
+
+    #[test]
+    fn completion_flush_works_after_idle_transition() -> Result<()> {
+        // Verify that notifications buffered during non-idle states (Streaming)
+        // are flushed only after Idle is detected, and that state re-verification
+        // skips stale notifications whose task record no longer matches.
+        let notifier = CompletionNotifier::new();
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+
+        // Buffer notifications while in Streaming state
+        let mut record = test_task_record(
+            "task_idle",
+            ManagedTaskStatus::Completed,
+            TaskAttemptStatus::Completed,
+        );
+        record.run_epoch = 1;
+        record.started_at = timestamp();
+        record.finished_at = Some(timestamp());
+
+        let notification = CompletionNotifier::build_notification(
+            &record,
+            &record.started_at,
+            record.finished_at.as_ref().unwrap(),
+        )
+        .context("should build notification for completed task")?;
+
+        notifier.try_notify(
+            notification,
+            ParentSessionState::Streaming,
+            &|_, _| Ok(()),
+            &|_, _| Ok(()),
+        )?;
+
+        // Trying to flush while non-Idle should do nothing
+        let results = notifier.flush_buffer(
+            "parent_idle",
+            ParentSessionState::Streaming,
+            &|_, _| Ok(()),
+            &|_, _| Ok(()),
+            &|_| Ok(None),
+        )?;
+        assert!(
+            results.is_empty(),
+            "flush should be a no-op when parent state is Streaming"
+        );
+
+        // Now flush at Idle — the notification should be delivered
+        let results = notifier.flush_buffer(
+            "parent_idle",
+            ParentSessionState::Idle,
+            &|task_id, epoch| {
+                delivered
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("mutex"))?
+                    .push((task_id.to_string(), epoch));
+                Ok(())
+            },
+            &|_, _| Ok(()),
+            &|_| Ok(None),
+        )?;
+        let sent_count = results
+            .iter()
+            .filter(|r| **r == NotificationResult::Sent)
+            .count();
+        assert_eq!(sent_count, 1, "notification should flush at Idle");
+        assert_eq!(
+            delivered
+                .lock()
+                .map_err(|_| anyhow::anyhow!("mutex"))?
+                .len(),
+            1
+        );
+
+        // Re-flush should deliver nothing (buffer is empty, dedup already done)
+        let results = notifier.flush_buffer(
+            "parent_idle",
+            ParentSessionState::Idle,
+            &|task_id, epoch| {
+                delivered
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("mutex"))?
+                    .push((task_id.to_string(), epoch));
+                Ok(())
+            },
+            &|_, _| Ok(()),
+            &|_| Ok(None),
+        )?;
+        assert!(
+            results.is_empty(),
+            "re-flush should deliver nothing after buffer is drained"
+        );
+        assert_eq!(
+            delivered
+                .lock()
+                .map_err(|_| anyhow::anyhow!("mutex"))?
+                .len(),
+            1,
+            "no additional deliveries after re-flush"
+        );
+
+        // ── State re-verification test ──
+        // Buffer another notification, but have the read_record closure
+        // return a stale record (different epoch or status). The notification
+        // should be skipped during flush.
+
+        let mut stale_record = test_task_record(
+            "task_stale",
+            ManagedTaskStatus::Completed,
+            TaskAttemptStatus::Completed,
+        );
+        stale_record.run_epoch = 1;
+        stale_record.started_at = timestamp();
+        stale_record.finished_at = Some(timestamp());
+
+        let stale_notification = CompletionNotifier::build_notification(
+            &stale_record,
+            &stale_record.started_at,
+            stale_record.finished_at.as_ref().unwrap(),
+        )
+        .context("should build notification for stale task")?;
+
+        notifier.try_notify(
+            stale_notification,
+            ParentSessionState::Streaming,
+            &|_, _| Ok(()),
+            &|_, _| Ok(()),
+        )?;
+
+        // Now flush with a read_record that says the task was revived to epoch 2.
+        // Use a different session ID to avoid the debounce cooldown from the
+        // earlier idle flush.
+        let results = notifier.flush_buffer(
+            "parent_stale",
+            ParentSessionState::Idle,
+            &|task_id, epoch| {
+                delivered
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("mutex"))?
+                    .push((task_id.to_string(), epoch));
+                Ok(())
+            },
+            &|_, _| Ok(()),
+            &|task_id| {
+                // Return a record with bumped epoch — notification should be skipped
+                Ok(Some(TaskRecord {
+                    run_epoch: 2,
+                    task_id: task_id.to_string(),
+                    ..test_task_record(
+                        task_id,
+                        ManagedTaskStatus::Completed,
+                        TaskAttemptStatus::Completed,
+                    )
+                }))
+            },
+        )?;
+        let skipped_count = results
+            .iter()
+            .filter(|r| **r == NotificationResult::Skipped)
+            .count();
+        assert_eq!(
+            skipped_count, 1,
+            "stale notification should be skipped when task epoch doesn't match"
+        );
+        let stale_delivery_count = delivered
+            .lock()
+            .map_err(|_| anyhow::anyhow!("mutex"))?
+            .iter()
+            .filter(|(id, _)| id == "task_stale")
+            .count();
+        assert_eq!(
+            stale_delivery_count, 0,
+            "stale notification should not be delivered"
+        );
+
         Ok(())
     }
 
@@ -7291,6 +8051,167 @@ mod tests {
         record.residency_state = ResidencyState::Resident;
         let resident_count = 1;
         assert!(resident_count <= RESIDENCY_MAX_CHILDREN);
+        Ok(())
+    }
+
+    #[test]
+    fn cancel_on_running_task_returns_cancelled() -> Result<()> {
+        let control = TaskManagerControl::default();
+        control.set_current(
+            "task_running".to_string(),
+            ManagedTaskStatus::Running,
+            Some(Arc::new(FakeInterruptHandle {
+                interrupted: Arc::new(AtomicUsize::new(0)),
+                cancelled: Arc::new(AtomicUsize::new(0)),
+                follow_ups: Arc::new(Mutex::new(Vec::new())),
+                steers: Arc::new(Mutex::new(Vec::new())),
+            })),
+        )?;
+
+        assert_eq!(control.cancel_current_task()?, ActionOutcome::Cancelled);
+        assert_eq!(
+            control.current_task_status()?,
+            Some(ManagedTaskStatus::Cancelled)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn steer_on_terminal_task_returns_not_continuable() -> Result<()> {
+        let control = TaskManagerControl::default();
+        control.set_current(
+            "task_cancelled".to_string(),
+            ManagedTaskStatus::Cancelled,
+            None,
+        )?;
+
+        assert_eq!(
+            control.steer_current_task("steer after cancel".to_string())?,
+            SteerOutcome::NotContinuable
+        );
+        assert_eq!(
+            control.steer_task("task_cancelled", "steer after cancel 2".to_string())?,
+            SteerOutcome::NotContinuable
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn send_follow_up_on_pending_returns_queued() -> Result<()> {
+        let control = TaskManagerControl::default();
+        control.set_current("task_pending".to_string(), ManagedTaskStatus::Pending, None)?;
+
+        assert_eq!(
+            control.send_follow_up_current_task("follow up".to_string())?,
+            SendOutcome::Queued
+        );
+        assert_eq!(
+            control.send_follow_up_task("task_pending", "follow up 2".to_string())?,
+            SendOutcome::Queued
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cancel_on_no_task_returns_noop() -> Result<()> {
+        let control = TaskManagerControl::default();
+        assert_eq!(control.cancel_current_task()?, ActionOutcome::Noop);
+        assert_eq!(control.interrupt_current_task()?, ActionOutcome::Noop);
+        assert_eq!(
+            control.send_follow_up_current_task("any".to_string())?,
+            SendOutcome::Noop
+        );
+        assert_eq!(
+            control.steer_current_task("any".to_string())?,
+            SteerOutcome::Noop
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn steer_on_running_task_returns_steered() -> Result<()> {
+        let control = TaskManagerControl::default();
+        let steers = Arc::new(Mutex::new(Vec::new()));
+        let sent_steers = steers.clone();
+        control.set_current(
+            "task_running".to_string(),
+            ManagedTaskStatus::Running,
+            Some(Arc::new(FakeInterruptHandle {
+                interrupted: Arc::new(AtomicUsize::new(0)),
+                cancelled: Arc::new(AtomicUsize::new(0)),
+                follow_ups: Arc::new(Mutex::new(Vec::new())),
+                steers,
+            })),
+        )?;
+
+        assert_eq!(
+            control.steer_current_task("adjust".to_string())?,
+            SteerOutcome::Steered
+        );
+        assert_eq!(
+            sent_steers
+                .lock()
+                .map_err(|_| anyhow::anyhow!("steer mutex poisoned"))?
+                .as_slice(),
+            ["adjust"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn send_follow_up_on_running_returns_sent() -> Result<()> {
+        let control = TaskManagerControl::default();
+        let follow_ups = Arc::new(Mutex::new(Vec::new()));
+        let sent_follow_ups = follow_ups.clone();
+        control.set_current(
+            "task_running".to_string(),
+            ManagedTaskStatus::Running,
+            Some(Arc::new(FakeInterruptHandle {
+                interrupted: Arc::new(AtomicUsize::new(0)),
+                cancelled: Arc::new(AtomicUsize::new(0)),
+                follow_ups,
+                steers: Arc::new(Mutex::new(Vec::new())),
+            })),
+        )?;
+
+        assert_eq!(
+            control.send_follow_up_current_task("continue".to_string())?,
+            SendOutcome::Sent
+        );
+        assert_eq!(
+            sent_follow_ups
+                .lock()
+                .map_err(|_| anyhow::anyhow!("follow-up mutex poisoned"))?
+                .as_slice(),
+            ["continue"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn steer_on_wrong_task_id_returns_noop() -> Result<()> {
+        let control = TaskManagerControl::default();
+        control.set_current(
+            "task_a".to_string(),
+            ManagedTaskStatus::Running,
+            Some(Arc::new(FakeInterruptHandle {
+                interrupted: Arc::new(AtomicUsize::new(0)),
+                cancelled: Arc::new(AtomicUsize::new(0)),
+                follow_ups: Arc::new(Mutex::new(Vec::new())),
+                steers: Arc::new(Mutex::new(Vec::new())),
+            })),
+        )?;
+
+        assert_eq!(
+            control.steer_task("task_b", "steer".to_string())?,
+            SteerOutcome::Noop
+        );
+        assert_eq!(
+            control.send_follow_up_task("task_b", "follow up".to_string())?,
+            SendOutcome::Noop
+        );
+        assert_eq!(control.cancel_task("task_b")?, ActionOutcome::Noop);
+        assert_eq!(control.interrupt_task("task_b")?, ActionOutcome::Noop);
         Ok(())
     }
 }

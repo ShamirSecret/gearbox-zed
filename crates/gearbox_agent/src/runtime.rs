@@ -141,6 +141,15 @@ impl Drop for CompletionNotificationFlushGuard<'_> {
             &|task_id, run_epoch| {
                 record_completion_notification_failed_epoch(self.store, task_id, run_epoch)
             },
+            &|task_id| {
+                let path = self.store.worker_dir(task_id).join("task-record.json");
+                if path.exists() {
+                    let content = std_fs::read_to_string(&path)?;
+                    Ok(Some(serde_json::from_str(&content)?))
+                } else {
+                    Ok(None)
+                }
+            },
         );
         if let Err(error) = result {
             eprintln!("failed to flush Gear completion notifications: {error:#}");
@@ -369,6 +378,13 @@ impl Orchestrator {
                 worker_route_hint,
                 &selected_route,
             );
+            let current_route_change_type = if worker_route_hint == Some("review") {
+                RouteChangeType::ReviewTrigger
+            } else if selected_route.route_reason.contains("fell back to") {
+                RouteChangeType::Fallback
+            } else {
+                RouteChangeType::RouteChange
+            };
             let worker_task_id = if iteration == 1 {
                 "task_003".to_string()
             } else {
@@ -499,6 +515,16 @@ impl Orchestrator {
             let iteration_worker_outcome = managed_worker_run.outcome;
             let iteration_worker_result = managed_worker_run.result;
             let iteration_worker_result_for_risk = iteration_worker_result.clone();
+            let _budget_check = budget_controller.apply_budget_for_route_change(
+                &BudgetSnapshot {
+                    worker_call_count,
+                    premium_worker_call_count,
+                    attempt_count,
+                    runtime_elapsed_minutes: run_started_at.elapsed().as_secs() as usize / 60,
+                    context_risk_signals: Vec::new(),
+                },
+                current_route_change_type.clone(),
+            );
             worker_call_count += 1;
             attempt_count += worker_task_record.attempts.len();
             premium_worker_call_count += worker_task_record
@@ -769,7 +795,8 @@ impl Orchestrator {
                 verification_passed,
                 coordinator_review,
             );
-            let evaluation = evaluate_goal(
+            let has_fallback = category_resolution_result.nearest_fallback().is_some();
+            let evaluation = evaluate_goal_with_source(
                 verification_passed,
                 &worker_result
                     .as_ref()
@@ -787,6 +814,8 @@ impl Orchestrator {
                 &budget_controller,
                 &budget_snapshot,
                 &no_progress_signals,
+                has_fallback,
+                Some(current_route_change_type),
             );
             next_route_hint_override = evaluation.route_hint_override.clone();
             let review_path = store.write_artifact(
@@ -1482,7 +1511,9 @@ fn record_completion_notification_failed_epoch(
         .with_context(|| format!("failed to read {}", task_record_path.display()))?;
     let mut task_record: TaskRecord = serde_json::from_str(&task_record_contents)
         .context("failed to deserialize Gear task record")?;
-    if task_record.notification_failed_epoch.is_some_and(|failed_epoch| failed_epoch >= run_epoch)
+    if task_record
+        .notification_failed_epoch
+        .is_some_and(|failed_epoch| failed_epoch >= run_epoch)
     {
         return Ok(());
     }
@@ -1582,6 +1613,23 @@ struct GoalEvaluation {
     route_hint_override: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RouteChangeType {
+    RouteChange,
+    Fallback,
+    ReviewTrigger,
+}
+
+impl RouteChangeType {
+    fn label(&self) -> &'static str {
+        match self {
+            RouteChangeType::RouteChange => "route change",
+            RouteChangeType::Fallback => "fallback",
+            RouteChangeType::ReviewTrigger => "review",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct GoalDecisionPolicy<'a> {
     verification_passed: bool,
@@ -1598,6 +1646,8 @@ struct GoalDecisionPolicy<'a> {
     budget: &'a BudgetController,
     budget_snapshot: &'a BudgetSnapshot,
     no_progress_signals: &'a [String],
+    nearest_fallback_available: bool,
+    trigger_source: Option<RouteChangeType>,
 }
 
 #[derive(Clone, Debug)]
@@ -1627,6 +1677,40 @@ impl Default for BudgetController {
     }
 }
 
+impl BudgetController {
+    fn apply_budget_for_route_change(
+        &self,
+        snapshot: &BudgetSnapshot,
+        route_change_type: RouteChangeType,
+    ) -> Result<(), String> {
+        if snapshot.worker_call_count >= self.max_worker_calls {
+            return Err(format!(
+                "worker_calls={}/{} ({})",
+                snapshot.worker_call_count,
+                budget_limit_label(self.max_worker_calls),
+                route_change_type.label()
+            ));
+        }
+        if snapshot.premium_worker_call_count >= self.max_premium_worker_calls {
+            return Err(format!(
+                "premium_worker_calls={}/{} ({})",
+                snapshot.premium_worker_call_count,
+                budget_limit_label(self.max_premium_worker_calls),
+                route_change_type.label()
+            ));
+        }
+        if snapshot.runtime_elapsed_minutes >= self.max_runtime_minutes {
+            return Err(format!(
+                "runtime_minutes={}/{} ({})",
+                snapshot.runtime_elapsed_minutes,
+                budget_limit_label(self.max_runtime_minutes),
+                route_change_type.label()
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct BudgetSnapshot {
     worker_call_count: usize,
@@ -1644,10 +1728,7 @@ fn budget_limit_label(limit: usize) -> String {
     }
 }
 
-fn within_scope_limits(
-    changed_files: usize,
-    max_files_changed: usize,
-) -> bool {
+fn within_scope_limits(changed_files: usize, max_files_changed: usize) -> bool {
     changed_files <= max_files_changed
 }
 
@@ -1694,20 +1775,27 @@ impl<'a> GoalDecisionPolicy<'a> {
         let same_failure_retries = self.repeated_failure_streak.saturating_sub(1);
         let child_depth = self.iteration.saturating_sub(1);
         let mut reasons = Vec::new();
+        let trigger_label = self
+            .trigger_source
+            .as_ref()
+            .map(|t| format!(" ({})", t.label()))
+            .unwrap_or_default();
 
         if self.budget_snapshot.worker_call_count >= self.budget.max_worker_calls {
             reasons.push(format!(
-                "worker_calls={}/{}",
+                "worker_calls={}/{}{}",
                 self.budget_snapshot.worker_call_count,
-                budget_limit_label(self.budget.max_worker_calls)
+                budget_limit_label(self.budget.max_worker_calls),
+                trigger_label,
             ));
         }
 
         if self.budget_snapshot.premium_worker_call_count >= self.budget.max_premium_worker_calls {
             reasons.push(format!(
-                "premium_worker_calls={}/{}",
+                "premium_worker_calls={}/{}{}",
                 self.budget_snapshot.premium_worker_call_count,
-                budget_limit_label(self.budget.max_premium_worker_calls)
+                budget_limit_label(self.budget.max_premium_worker_calls),
+                trigger_label,
             ));
         }
 
@@ -2073,6 +2161,20 @@ impl<'a> GoalDecisionPolicy<'a> {
                 route_hint_override: None,
             };
         }
+        if !self.verification_passed
+            && !self.nearest_fallback_available
+            && self.no_progress_signals.is_empty()
+            && self.iteration > 1
+        {
+            return GoalEvaluation {
+                status: GoalStatus::Limited,
+                should_continue: false,
+                summary:
+                    "Goal reached the last feasible worker route with no alternative fallback."
+                        .to_string(),
+                route_hint_override: None,
+            };
+        }
         if self.iteration < self.budget.max_iterations {
             if let Some(evaluation) = self.continuation_guard("another repair iteration") {
                 return evaluation;
@@ -2146,6 +2248,13 @@ fn parse_coordinator_review(raw: &str) -> (CoordinatorReview, Vec<String>) {
     (review, warnings)
 }
 
+fn normalize_repair(text: &str) -> String {
+    text.to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn detect_stagnation(
     diff_history: &[DiffSnapshot],
     verification_history: &[Vec<ShellCommandResult>],
@@ -2180,7 +2289,9 @@ fn detect_stagnation(
 
     if repair_requests.len() >= 2
         && let Some(first) = repair_requests.first()
-        && repair_requests.iter().all(|request| request == first)
+        && repair_requests
+            .iter()
+            .all(|request| normalize_repair(request) == normalize_repair(first))
     {
         signals.push(format!(
             "Repair request `{first}` repeated for {} iterations.",
@@ -2190,7 +2301,9 @@ fn detect_stagnation(
 
     if worker_outputs.len() >= 2
         && let Some(first) = worker_outputs.first()
-        && worker_outputs.iter().all(|output| output == first)
+        && worker_outputs
+            .iter()
+            .all(|output| normalize_repair(output) == normalize_repair(first))
     {
         signals.push(format!(
             "Worker output repeated for {} iterations.",
@@ -2262,6 +2375,14 @@ fn collect_context_risk_texts(
         {
             texts.push(content);
         }
+    }
+
+    let event_names = worker_stream_event_names(worker_result, "tool-events.jsonl");
+    if !event_names.is_empty() {
+        texts.push(format!(
+            "tool-events event sequence: {}",
+            event_names.join(" -> ")
+        ));
     }
 
     texts.extend(worker_artifact_truncation_signals(worker_result));
@@ -2455,6 +2576,7 @@ where
         .collect()
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn evaluate_goal(
     verification_passed: bool,
     worker_status: &WorkerStatus,
@@ -2470,6 +2592,45 @@ fn evaluate_goal(
     budget: &BudgetController,
     budget_snapshot: &BudgetSnapshot,
     no_progress_signals: &[String],
+    nearest_fallback_available: bool,
+) -> GoalEvaluation {
+    evaluate_goal_with_source(
+        verification_passed,
+        worker_status,
+        worker_category,
+        require_worker,
+        worker_failure_kind,
+        worker_retry_reason,
+        scope_check,
+        coordinator_review,
+        provider_unknown_streak,
+        repeated_failure_streak,
+        iteration,
+        budget,
+        budget_snapshot,
+        no_progress_signals,
+        nearest_fallback_available,
+        None,
+    )
+}
+
+fn evaluate_goal_with_source(
+    verification_passed: bool,
+    worker_status: &WorkerStatus,
+    worker_category: WorkerCategory,
+    require_worker: bool,
+    worker_failure_kind: Option<&TaskFailureKind>,
+    worker_retry_reason: Option<&str>,
+    scope_check: &crate::tools::ScopeCheck,
+    coordinator_review: Option<&CoordinatorReview>,
+    provider_unknown_streak: usize,
+    repeated_failure_streak: usize,
+    iteration: usize,
+    budget: &BudgetController,
+    budget_snapshot: &BudgetSnapshot,
+    no_progress_signals: &[String],
+    nearest_fallback_available: bool,
+    trigger_source: Option<RouteChangeType>,
 ) -> GoalEvaluation {
     GoalDecisionPolicy {
         verification_passed,
@@ -2486,6 +2647,8 @@ fn evaluate_goal(
         budget,
         budget_snapshot,
         no_progress_signals,
+        nearest_fallback_available,
+        trigger_source,
     }
     .evaluate()
 }
@@ -3006,6 +3169,7 @@ mod tests {
             &test_budget(DEFAULT_MAX_ITERATIONS),
             &BudgetSnapshot::default(),
             &[],
+            false,
         );
 
         assert_eq!(evaluation.status, GoalStatus::Complete);
@@ -3041,6 +3205,7 @@ mod tests {
             &test_budget(DEFAULT_MAX_ITERATIONS),
             &BudgetSnapshot::default(),
             &[],
+            true,
         );
 
         assert_eq!(evaluation.status, GoalStatus::NeedsUser);
@@ -3074,6 +3239,7 @@ mod tests {
             &test_budget(DEFAULT_MAX_ITERATIONS),
             &BudgetSnapshot::default(),
             &[],
+            false,
         );
 
         assert_eq!(evaluation.status, GoalStatus::Running);
@@ -3109,6 +3275,7 @@ mod tests {
             &test_budget(DEFAULT_MAX_ITERATIONS),
             &BudgetSnapshot::default(),
             &[],
+            false,
         );
 
         assert_eq!(evaluation.status, GoalStatus::Running);
@@ -3143,6 +3310,7 @@ mod tests {
             &test_budget(3),
             &BudgetSnapshot::default(),
             &[],
+            false,
         );
 
         assert_eq!(evaluation.status, GoalStatus::Running);
@@ -3178,6 +3346,7 @@ mod tests {
             &test_budget(4),
             &BudgetSnapshot::default(),
             &[],
+            false,
         );
 
         assert_eq!(evaluation.status, GoalStatus::Running);
@@ -3216,6 +3385,7 @@ mod tests {
             &budget,
             &BudgetSnapshot::default(),
             &[],
+            false,
         );
 
         assert_eq!(evaluation.status, GoalStatus::Running);
@@ -3242,6 +3412,7 @@ mod tests {
             &test_budget(DEFAULT_MAX_ITERATIONS),
             &BudgetSnapshot::default(),
             &[],
+            true,
         );
 
         assert_eq!(evaluation.status, GoalStatus::Limited);
@@ -3267,6 +3438,7 @@ mod tests {
             &test_budget(DEFAULT_MAX_ITERATIONS),
             &BudgetSnapshot::default(),
             &[],
+            false,
         );
 
         assert_eq!(evaluation.status, GoalStatus::Limited);
@@ -3301,11 +3473,63 @@ mod tests {
             &budget,
             &snapshot,
             &[],
+            true,
         );
 
         assert_eq!(evaluation.status, GoalStatus::Limited);
         assert!(!evaluation.should_continue);
         assert!(evaluation.summary.contains("worker_calls"));
+    }
+
+    #[test]
+    fn evaluation_limits_when_no_fallback_available() {
+        let scope_check = crate::tools::ScopeCheck::default();
+        let evaluation = evaluate_goal(
+            false,
+            &WorkerStatus::Failed,
+            WorkerCategory::Quick,
+            false,
+            None,
+            None,
+            &scope_check,
+            None,
+            0,
+            0,
+            2,
+            &test_budget(DEFAULT_MAX_ITERATIONS),
+            &BudgetSnapshot::default(),
+            &[],
+            false,
+        );
+
+        assert_eq!(evaluation.status, GoalStatus::Limited);
+        assert!(!evaluation.should_continue);
+        assert!(evaluation.summary.contains("no alternative fallback"));
+    }
+
+    #[test]
+    fn evaluation_continues_on_first_iteration_when_no_fallback() {
+        let scope_check = crate::tools::ScopeCheck::default();
+        let evaluation = evaluate_goal(
+            false,
+            &WorkerStatus::Failed,
+            WorkerCategory::Quick,
+            false,
+            None,
+            None,
+            &scope_check,
+            None,
+            0,
+            0,
+            1,
+            &test_budget(DEFAULT_MAX_ITERATIONS),
+            &BudgetSnapshot::default(),
+            &[],
+            false,
+        );
+
+        assert_eq!(evaluation.status, GoalStatus::Running);
+        assert!(evaluation.should_continue);
     }
 
     #[test]
@@ -3343,6 +3567,8 @@ mod tests {
             budget: &budget,
             budget_snapshot: &snapshot,
             no_progress_signals: &[],
+            nearest_fallback_available: false,
+            trigger_source: None,
         };
         assert!(
             policy.budget_guard_reason().is_none(),
@@ -3367,13 +3593,18 @@ mod tests {
             budget: &limited_budget,
             budget_snapshot: &snapshot,
             no_progress_signals: &[],
+            nearest_fallback_available: false,
+            trigger_source: None,
         };
         assert!(
             limited_policy.budget_guard_reason().is_some(),
             "worker_call_count=1 should trigger guard when max_worker_calls=1"
         );
         assert!(
-            limited_policy.budget_guard_reason().unwrap().contains("worker_calls"),
+            limited_policy
+                .budget_guard_reason()
+                .unwrap()
+                .contains("worker_calls"),
             "guard reason should mention worker_calls"
         );
     }
@@ -3434,6 +3665,7 @@ mod tests {
             &budget_controller,
             &first_snapshot,
             &[],
+            true,
         );
         assert!(first_evaluation.should_continue);
 
@@ -3456,9 +3688,224 @@ mod tests {
             &budget_controller,
             &second_snapshot,
             &[],
+            true,
         );
         assert_eq!(second_evaluation.status, GoalStatus::Limited);
         assert!(!second_evaluation.should_continue);
+    }
+
+    #[test]
+    fn budget_guard_reason_includes_trigger_source_label() {
+        let scope_check = crate::tools::ScopeCheck::default();
+        let budget = BudgetController {
+            max_worker_calls: 1,
+            max_premium_worker_calls: 1,
+            max_provider_unknown_streak: 2,
+            ..BudgetController::default()
+        };
+        let route_snapshot = BudgetSnapshot {
+            worker_call_count: 1,
+            ..BudgetSnapshot::default()
+        };
+        let policy = GoalDecisionPolicy {
+            verification_passed: false,
+            worker_status: &WorkerStatus::Failed,
+            worker_category: WorkerCategory::Quick,
+            require_worker: false,
+            worker_failure_kind: None,
+            worker_retry_reason: None,
+            scope_check: &scope_check,
+            coordinator_review: None,
+            provider_unknown_streak: 0,
+            repeated_failure_streak: 1,
+            iteration: 1,
+            budget: &budget,
+            budget_snapshot: &route_snapshot,
+            no_progress_signals: &[],
+            nearest_fallback_available: false,
+            trigger_source: Some(RouteChangeType::RouteChange),
+        };
+        let reason = policy
+            .budget_guard_reason()
+            .expect("budget guard should fire");
+        assert!(
+            reason.contains("(route change)"),
+            "RouteChange reason should contain '(route change)': {reason}"
+        );
+
+        let fallback_policy = GoalDecisionPolicy {
+            trigger_source: Some(RouteChangeType::Fallback),
+            ..policy
+        };
+        let reason = fallback_policy
+            .budget_guard_reason()
+            .expect("budget guard should fire");
+        assert!(
+            reason.contains("(fallback)"),
+            "Fallback reason should contain '(fallback)': {reason}"
+        );
+
+        let premium_snapshot = BudgetSnapshot {
+            premium_worker_call_count: 1,
+            ..BudgetSnapshot::default()
+        };
+        let review_policy = GoalDecisionPolicy {
+            worker_category: WorkerCategory::Review,
+            budget_snapshot: &premium_snapshot,
+            trigger_source: Some(RouteChangeType::ReviewTrigger),
+            ..policy
+        };
+        let reason = review_policy
+            .budget_guard_reason()
+            .expect("budget guard should fire");
+        assert!(
+            reason.contains("(review)"),
+            "ReviewTrigger reason should contain '(review)': {reason}"
+        );
+    }
+
+    #[test]
+    fn apply_budget_for_route_change_distinguishes_triggers() {
+        let budget = BudgetController {
+            max_worker_calls: 2,
+            max_premium_worker_calls: 1,
+            ..BudgetController::default()
+        };
+        let snapshot = BudgetSnapshot {
+            worker_call_count: 1,
+            premium_worker_call_count: 0,
+            ..BudgetSnapshot::default()
+        };
+        assert!(
+            budget
+                .apply_budget_for_route_change(&snapshot, RouteChangeType::RouteChange)
+                .is_ok(),
+            "under budget should be Ok"
+        );
+
+        let full_snapshot = BudgetSnapshot {
+            worker_call_count: 2,
+            ..BudgetSnapshot::default()
+        };
+        let result =
+            budget.apply_budget_for_route_change(&full_snapshot, RouteChangeType::RouteChange);
+        assert!(result.is_err());
+        assert!(
+            result.as_ref().unwrap_err().contains("route change"),
+            "Err should mention route change: {:?}",
+            result
+        );
+
+        let fallback_result =
+            budget.apply_budget_for_route_change(&full_snapshot, RouteChangeType::Fallback);
+        assert!(fallback_result.is_err());
+        assert!(
+            fallback_result.as_ref().unwrap_err().contains("fallback"),
+            "Err should mention fallback: {:?}",
+            fallback_result
+        );
+
+        let premium_snapshot = BudgetSnapshot {
+            premium_worker_call_count: 1,
+            ..BudgetSnapshot::default()
+        };
+        let review_result =
+            budget.apply_budget_for_route_change(&premium_snapshot, RouteChangeType::ReviewTrigger);
+        assert!(review_result.is_err());
+        assert!(
+            review_result.as_ref().unwrap_err().contains("review"),
+            "Err should mention review: {:?}",
+            review_result
+        );
+    }
+
+    #[test]
+    fn budget_summary_matches_across_coordinator_review_and_goal_review() {
+        let budget = BudgetController::default();
+        let snapshot = BudgetSnapshot {
+            worker_call_count: 3,
+            premium_worker_call_count: 1,
+            attempt_count: 5,
+            context_risk_signals: vec!["token limit".to_string()],
+            ..BudgetSnapshot::default()
+        };
+        let summary = budget_summary(&budget, &snapshot, 2, 1, 3, 4);
+
+        assert!(summary.contains("worker_calls=3/5"));
+        assert!(summary.contains("attempts=5"));
+        assert!(summary.contains("same_failure_retries=1/2"));
+        assert!(summary.contains("token limit"));
+        assert!(summary.contains("iterations=3/5"));
+        assert!(summary.contains("provider_unknown_streak=1/2"));
+
+        let evaluation = GoalEvaluation {
+            status: GoalStatus::Running,
+            should_continue: true,
+            summary: "keep going".to_string(),
+            route_hint_override: None,
+        };
+        let worker_result = WorkerResult {
+            status: WorkerStatus::Succeeded,
+            command: None,
+            exit_code: None,
+            summary: "done".to_string(),
+            packet_path: PathBuf::from("/tmp/packet.json"),
+            prompt_path: PathBuf::from("/tmp/prompt.md"),
+            stdout_path: None,
+            stderr_path: None,
+            last_message_path: None,
+            result_path: PathBuf::from("/tmp/result.json"),
+            outcome_path: PathBuf::from("/tmp/outcome.json"),
+        };
+        let worker_outcome = WorkerOutcome {
+            status: WorkerStatus::Succeeded,
+            session_id: None,
+            session_capability: None,
+            summary: "outcome".to_string(),
+            changed_files: Vec::new(),
+            commands_run: Vec::new(),
+            known_failures: Vec::new(),
+            raw_output_path: None,
+            command: None,
+            exit_code: None,
+        };
+        let scope_check = ScopeCheck {
+            forbidden_touches: Vec::new(),
+            outside_allowed_paths: Vec::new(),
+            max_files_exceeded: false,
+            changed_file_count: 4,
+        };
+        let category_resolution = CategoryResolution::default();
+        let category_resolution_result = CategoryResolutionResult::Resolved {
+            requested_category: "quick".to_string(),
+            available_categories: vec!["quick".to_string()],
+            attempted_provider_model: None,
+            nearest_fallback: None,
+        };
+        let artifact = goal_review_artifact(
+            3,
+            5,
+            &evaluation,
+            &worker_result,
+            WorkerCategory::Quick,
+            None,
+            "route reason",
+            &category_resolution,
+            &category_resolution_result,
+            &[],
+            None,
+            None,
+            "none",
+            &summary,
+            &worker_outcome,
+            &scope_check,
+            &[],
+            None,
+        );
+        assert!(
+            artifact.contains(&summary),
+            "goal review artifact should embed the exact same budget_summary string"
+        );
     }
 
     #[test]
@@ -3484,6 +3931,7 @@ mod tests {
             &budget,
             &BudgetSnapshot::default(),
             &[],
+            false,
         );
 
         assert_eq!(evaluation.status, GoalStatus::Limited);
@@ -3518,6 +3966,7 @@ mod tests {
             &budget,
             &snapshot,
             &[],
+            false,
         );
 
         assert_eq!(evaluation.status, GoalStatus::Limited);
@@ -3630,10 +4079,16 @@ mod tests {
             "context compaction reported".to_string(),
         ]);
 
-        assert!(signals.iter().any(|signal| signal.contains("token limit reported")));
-        assert!(signals
-            .iter()
-            .any(|signal| signal.contains("context compaction reported")));
+        assert!(
+            signals
+                .iter()
+                .any(|signal| signal.contains("token limit reported"))
+        );
+        assert!(
+            signals
+                .iter()
+                .any(|signal| signal.contains("context compaction reported"))
+        );
     }
 
     #[test]
@@ -3679,7 +4134,9 @@ mod tests {
 
         record_completion_notification_failed_epoch(&store, "task_delivery_fail", 7)?;
 
-        let stored_task_record_path = store.worker_dir("task_delivery_fail").join("task-record.json");
+        let stored_task_record_path = store
+            .worker_dir("task_delivery_fail")
+            .join("task-record.json");
         let stored_task_record = fs::read_to_string(&stored_task_record_path)?;
         let stored_task_record: TaskRecord = serde_json::from_str(&stored_task_record)?;
         assert_eq!(stored_task_record.notification_failed_epoch, Some(7));
@@ -3710,6 +4167,7 @@ mod tests {
             &budget,
             &snapshot,
             &[],
+            false,
         );
 
         assert_eq!(evaluation.status, GoalStatus::NeedsUser);
@@ -3743,6 +4201,7 @@ mod tests {
             &budget,
             &snapshot,
             &[],
+            false,
         );
 
         assert_eq!(evaluation.status, GoalStatus::NeedsUser);
@@ -3770,6 +4229,7 @@ mod tests {
             &test_budget(DEFAULT_MAX_ITERATIONS),
             &BudgetSnapshot::default(),
             &[],
+            false,
         );
 
         assert_eq!(evaluation.status, GoalStatus::NeedsUser);
@@ -3808,6 +4268,7 @@ mod tests {
             &test_budget(DEFAULT_MAX_ITERATIONS),
             &BudgetSnapshot::default(),
             &[],
+            false,
         );
 
         assert_eq!(evaluation.status, GoalStatus::Running);
@@ -3832,6 +4293,7 @@ mod tests {
             &test_budget(4),
             &BudgetSnapshot::default(),
             &[],
+            false,
         );
 
         assert_eq!(evaluation.status, GoalStatus::Running);
@@ -4591,6 +5053,42 @@ mod tests {
     }
 
     #[test]
+    fn stagnation_normalizes_repair_variations() {
+        let signals = detect_stagnation(
+            &[],
+            &[],
+            &[
+                "Fix the bug".to_string(),
+                "  fix THE BUG  ".to_string(),
+                "FIX the  bug".to_string(),
+            ],
+            &[],
+        );
+        assert!(!signals.is_empty());
+        assert!(signals[0].contains("Repair request `Fix the bug` repeated"));
+
+        let signals = detect_stagnation(
+            &[],
+            &[],
+            &[],
+            &[
+                "still wiring the fix".to_string(),
+                "  still WIRING the  fix  ".to_string(),
+            ],
+        );
+        assert!(!signals.is_empty());
+        assert!(signals[0].contains("Worker output repeated"));
+
+        let signals = detect_stagnation(
+            &[],
+            &[],
+            &["Fix the bug".to_string(), "Rewrite the module".to_string()],
+            &[],
+        );
+        assert!(signals.is_empty());
+    }
+
+    #[test]
     fn within_scope_limits_when_budget_exceeded() {
         assert!(!within_scope_limits(11, 10));
         assert!(within_scope_limits(8, 10));
@@ -4623,6 +5121,7 @@ mod tests {
             &budget,
             &BudgetSnapshot::default(),
             &[],
+            false,
         );
         assert_eq!(evaluation.status, GoalStatus::Limited);
         assert!(evaluation.summary.contains("file change limit"));
@@ -4652,6 +5151,7 @@ mod tests {
             &budget,
             &BudgetSnapshot::default(),
             &signals,
+            false,
         );
         assert_eq!(evaluation.status, GoalStatus::Running);
         assert!(evaluation.should_continue);

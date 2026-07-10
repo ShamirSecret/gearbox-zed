@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "active_work_id": "gear-omo-alignment-9a5a719b",
+  "active_work_id": "gear-omo-alignment-26e55031",
   "works": {
     "gear-omo-alignment-9a5a719b": {
       "work_id": "gear-omo-alignment-9a5a719b",
@@ -8,26 +8,83 @@
       "plan_name": "gear-omo-alignment",
       "status": "active",
       "started_at": "2026-07-09T16:01:24.566Z",
-      "updated_at": "2026-07-09T16:01:24.566Z",
+      "updated_at": "2026-07-09T16:32:42.070Z",
       "session_ids": [
-        "opencode:ses_0b86339ceffeA1NNdS89kgib0H"
+        "opencode:ses_0b86339ceffeA1NNdS89kgib0H",
+        "opencode:ses_0b84ea84fffenOlWiPMh67sppk",
+        "opencode:ses_0b84a2e12ffeN07cgH6D3MzlzN",
+        "opencode:ses_0b846e032ffeeBE6GDcq5GpEW0",
+        "opencode:ses_0b846b4c1ffeghP65JpxPPYP2E",
+        "opencode:ses_0b846943dffekwQ9lJDdzdYpdA"
       ],
       "session_origins": {
-        "opencode:ses_0b86339ceffeA1NNdS89kgib0H": "direct"
+        "opencode:ses_0b86339ceffeA1NNdS89kgib0H": "direct",
+        "opencode:ses_0b84ea84fffenOlWiPMh67sppk": "direct",
+        "opencode:ses_0b84a2e12ffeN07cgH6D3MzlzN": "direct",
+        "opencode:ses_0b846e032ffeeBE6GDcq5GpEW0": "appended",
+        "opencode:ses_0b846b4c1ffeghP65JpxPPYP2E": "appended",
+        "opencode:ses_0b846943dffekwQ9lJDdzdYpdA": "appended"
+      },
+      "agent": "atlas",
+      "task_sessions": {}
+    },
+    "gear-omo-alignment-169d9fa3": {
+      "work_id": "gear-omo-alignment-169d9fa3",
+      "active_plan": "/home/donald/文档/github/zed/.omo/plans/gear-omo-alignment.md",
+      "plan_name": "gear-omo-alignment",
+"status": "completed",
+      "started_at": "2026-07-10T00:34:01.918Z",
+      "updated_at": "2026-07-10T00:34:01.918Z",
+      "session_ids": [
+        "opencode:ses_0b84a2e12ffeN07cgH6D3MzlzN"
+      ],
+      "session_origins": {
+        "opencode:ses_0b84a2e12ffeN07cgH6D3MzlzN": "direct"
       },
       "agent": "atlas",
       "task_sessions": {}
     }
   },
   "active_plan": "/home/donald/文档/github/zed/.omo/plans/gear-omo-alignment.md",
-  "started_at": "2026-07-09T16:01:24.566Z",
+  "started_at": "2026-07-10T00:34:01.918Z",
+  "status": "completed",
+      "started_at": "2026-07-10T00:34:01.918Z",
+      "updated_at": "2026-07-10T01:04:52.358Z",
+      "session_ids": [
+        "opencode:ses_0b84a2e12ffeN07cgH6D3MzlzN",
+        "opencode:ses_0b68c92f8ffe3zp1kewD07uqui",
+        "opencode:ses_0b67dbf36ffe5u1rMB5GWJvZD4",
+        "opencode:ses_0b67da915ffeDAiDIQveUGBuuN",
+        "opencode:ses_0b671ac18ffeE30vl3lpxWl1Mk"
+      ],
+      "session_origins": {
+        "opencode:ses_0b84a2e12ffeN07cgH6D3MzlzN": "direct",
+        "opencode:ses_0b68c92f8ffe3zp1kewD07uqui": "appended",
+        "opencode:ses_0b67dbf36ffe5u1rMB5GWJvZD4": "appended",
+        "opencode:ses_0b67da915ffeDAiDIQveUGBuuN": "appended",
+        "opencode:ses_0b671ac18ffeE30vl3lpxWl1Mk": "appended"
+      },
+      "agent": "atlas",
+      "task_sessions": {}
+    }
+  },
+  "active_plan": "/home/donald/文档/github/zed/.omo/plans/gear-omo-alignment.md",
+  "started_at": "2026-07-10T00:34:01.918Z",
   "status": "active",
-  "updated_at": "2026-07-09T16:01:24.566Z",
+  "updated_at": "2026-07-10T01:04:52.358Z",
   "session_ids": [
-    "opencode:ses_0b86339ceffeA1NNdS89kgib0H"
+    "opencode:ses_0b84a2e12ffeN07cgH6D3MzlzN",
+    "opencode:ses_0b68c92f8ffe3zp1kewD07uqui",
+    "opencode:ses_0b67dbf36ffe5u1rMB5GWJvZD4",
+    "opencode:ses_0b67da915ffeDAiDIQveUGBuuN",
+    "opencode:ses_0b671ac18ffeE30vl3lpxWl1Mk"
   ],
   "session_origins": {
-    "opencode:ses_0b86339ceffeA1NNdS89kgib0H": "direct"
+    "opencode:ses_0b84a2e12ffeN07cgH6D3MzlzN": "direct",
+    "opencode:ses_0b68c92f8ffe3zp1kewD07uqui": "appended",
+    "opencode:ses_0b67dbf36ffe5u1rMB5GWJvZD4": "appended",
+    "opencode:ses_0b67da915ffeDAiDIQveUGBuuN": "appended",
+    "opencode:ses_0b671ac18ffeE30vl3lpxWl1Mk": "appended"
   },
   "plan_name": "gear-omo-alignment",
   "task_sessions": {},
