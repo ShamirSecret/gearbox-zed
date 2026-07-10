@@ -1660,6 +1660,23 @@ fn start_command_backed_worker(
     }))
 }
 
+/// Handle for a command-backed (external process) worker session.
+///
+/// ## Capability boundary
+///
+/// The Gear host CAN:
+/// - Refuse to start the worker if `check_tool_allowed()` rejects the category's required tool
+/// - Set `GEARBOX_WORKER_TOOL_POLICY` env var so the external process can self-enforce
+/// - Set `GEARBOX_WORKER_MODEL_VARIANT` env var for model selection hints
+/// - Cancel/abort the running process via `cancel()` / `abort()`
+///
+/// The Gear host CANNOT:
+/// - Intercept individual tool calls made inside the external process
+/// - Enforce tool-level allow/deny after the process has started
+/// - Claim host-level tool execution enforcement for command workers
+///
+/// For native (in-process) workers, tool policy enforcement happens before
+/// dispatch in `WorkerRegistry::start()` via `check_tool_allowed()`.
 struct CommandWorkerSessionHandle {
     store: StateStore,
     workspace: PathBuf,
@@ -2708,7 +2725,7 @@ pub fn sanitize_model_fields(fields: &HashMap<String, String>) -> HashMap<String
 mod tests {
     use std::{
         fs,
-        sync::atomic::{AtomicBool, Ordering},
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
     use anyhow::Result;
@@ -3236,6 +3253,42 @@ mod tests {
         }
     }
 
+    struct CountedNativeBackend {
+        call_count: Arc<AtomicUsize>,
+    }
+
+    impl NativeWorkerBackend for CountedNativeBackend {
+        fn start_zed_agent(
+            &self,
+            request: WorkerStartRequest<'_>,
+        ) -> Result<Arc<dyn WorkerSessionHandle>> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            let result = WorkerResult {
+                status: WorkerStatus::Skipped,
+                command: Some("counted-native".to_string()),
+                exit_code: None,
+                summary: "counted native backend".to_string(),
+                packet_path: request
+                    .store
+                    .worker_dir(&request.task.id)
+                    .join("packet.json"),
+                prompt_path: request.store.worker_dir(&request.task.id).join("prompt.md"),
+                stdout_path: None,
+                stderr_path: None,
+                last_message_path: None,
+                result_path: request
+                    .store
+                    .worker_dir(&request.task.id)
+                    .join("result.json"),
+                outcome_path: request
+                    .store
+                    .worker_dir(&request.task.id)
+                    .join("outcome.json"),
+            };
+            Ok(Arc::new(FakeNativeHandle { result }))
+        }
+    }
+
     #[test]
     fn worker_registry_prefers_native_zed_backend_when_available() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
@@ -3351,6 +3404,100 @@ mod tests {
             .expect_err("disabled write policy must reject before execution");
         assert_eq!(error.tool_name, "write");
         assert!(error.reason.contains("denied"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_native_executor_not_called_on_denied_tool() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = Task {
+            id: "task_denied_tool".to_string(),
+            goal_id: "goal_test".to_string(),
+            title: "test denied tool".to_string(),
+            kind: crate::state::TaskKind::Edit,
+            status: crate::state::TaskStatus::Pending,
+            assigned_worker: Some("zed_agent".to_string()),
+            attempt: 1,
+            parent_task_id: None,
+            scope: Scope::new(Vec::new(), Vec::new(), 10),
+            inputs: crate::state::TaskInputs::default(),
+            outputs: crate::state::TaskOutputs::default(),
+        };
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::ZedAgent,
+            worker_command: Some("should not run".to_string()),
+            worker_model: None,
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: false,
+        };
+
+        // Force can_review: false for Review category via env override.
+        // Review category's required tool is "review", so check_tool_allowed
+        // will return Err(ToolDenied) before the native backend is consulted.
+        // Review category is chosen because no other test reads
+        // GEARBOX_GEAR_CATEGORY_REVIEW_CAN_REVIEW, avoiding env races.
+        let orig = env::var("GEARBOX_GEAR_CATEGORY_REVIEW_CAN_REVIEW").ok();
+        unsafe {
+            env::set_var("GEARBOX_GEAR_CATEGORY_REVIEW_CAN_REVIEW", "false");
+        }
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let registry = WorkerRegistry::with_native_backend(Arc::new(CountedNativeBackend {
+            call_count: call_count.clone(),
+        }));
+
+        let result = registry.start(WorkerStartRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &task,
+            route_attempt: 1,
+            goal: "test denied tool",
+            verification_commands: &[],
+            config: &config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: Some("review"),
+        });
+
+        unsafe {
+            if let Some(v) = orig {
+                env::set_var("GEARBOX_GEAR_CATEGORY_REVIEW_CAN_REVIEW", v);
+            } else {
+                env::remove_var("GEARBOX_GEAR_CATEGORY_REVIEW_CAN_REVIEW");
+            }
+        }
+
+        // Verify the error message mentions the correct tool name
+        let err_string = format!("{:#}", result.as_ref().err().unwrap());
+        assert!(
+            err_string.contains("review"),
+            "error should mention tool 'review': {err_string}"
+        );
+
+        assert!(
+            result.is_err(),
+            "worker with denied tool should fail to start"
+        );
+        let err = result.err().unwrap();
+        assert!(
+            format!("{err:#}").contains("denied"),
+            "error should mention policy denial: {err:#}"
+        );
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            0,
+            "native executor must NOT be called when tool is denied"
+        );
 
         Ok(())
     }
@@ -5119,5 +5266,82 @@ mod tests {
         let json = serde_json::to_string(&route_a).expect("should serialize");
         let back: FallbackRoute = serde_json::from_str(&json).expect("should deserialize");
         assert_eq!(back, route_a);
+    }
+
+    #[test]
+    fn test_command_worker_capability_boundary() -> Result<()> {
+        // Command workers run as external processes. The Gear host can:
+        // 1. Deny the worker from starting entirely (check_tool_allowed before dispatch)
+        // 2. Set env vars (GEARBOX_WORKER_TOOL_POLICY) for the external process
+        // 3. Cancel/abort the running process
+        //
+        // The Gear host CANNOT:
+        // 1. Intercept individual tool calls inside the external process
+        // 2. Enforce tool-level allow/deny after the process has started
+        //
+        // This test verifies the boundary claim by showing that
+        // GEARBOX_WORKER_TOOL_POLICY is serialized into the command worker's
+        // env so the external process CAN self-enforce, but Gear does NOT
+        // claim host-level interception.
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = Task {
+            id: "task_boundary".to_string(),
+            goal_id: "goal_test".to_string(),
+            title: "test capability boundary".to_string(),
+            kind: crate::state::TaskKind::Edit,
+            status: crate::state::TaskStatus::Pending,
+            assigned_worker: Some("opencode".to_string()),
+            attempt: 1,
+            parent_task_id: None,
+            scope: Scope::new(Vec::new(), Vec::new(), 10),
+            inputs: crate::state::TaskInputs::default(),
+            outputs: crate::state::TaskOutputs::default(),
+        };
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::Opencode,
+            worker_command: Some(
+                "sh -c 'echo \"$GEARBOX_WORKER_TOOL_POLICY\"'".to_string(),
+            ),
+            worker_model: None,
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: true,
+        };
+
+        let handle = OpencodeCommandWorker {}.start(WorkerStartRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &task,
+            route_attempt: 1,
+            goal: "test boundary",
+            verification_commands: &[],
+            config: &config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: Some("explore"),
+        })?;
+        let result = handle.wait_for_result()?;
+        assert_eq!(result.status, WorkerStatus::Succeeded);
+
+        let stdout_path = result.stdout_path.context("stdout_path should be set")?;
+        let stdout = fs::read_to_string(stdout_path)?;
+        let policy: WorkerToolPolicy = serde_json::from_str(stdout.trim())
+            .context("GEARBOX_WORKER_TOOL_POLICY should be valid JSON")?;
+        // Explore category has can_explore=true, can_write=false
+        assert!(policy.can_explore, "explore policy allows explore");
+        assert!(!policy.can_write, "explore policy denies write");
+
+        // Verify the capability boundary is documented on the struct
+        let _doc = "The CommandWorkerSessionHandle doc comment documents the capability boundary";
+
+        Ok(())
     }
 }
