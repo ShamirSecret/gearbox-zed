@@ -10,17 +10,21 @@
 //! collaborators. The real ACP/GPUI lifecycle coverage lives in `agent.rs`.
 
 use super::*;
+use gearbox_agent::plan_graph::deterministic_fallback_draft;
 use gearbox_agent::runtime::{
     ReviewDimension, ReviewDimensionResult, ReviewGate, ReviewerEvidence,
 };
-use gearbox_agent::state::{StateStore, WorkLineage};
+use gearbox_agent::state::{Scope, StateStore, WorkLineage};
 use gearbox_agent::workers::{
     NativeWorkerBackend, WorkerCapabilities, WorkerCategory, WorkerConfig, WorkerKind,
     WorkerOutcome, WorkerRegistry, WorkerResult, WorkerSessionHandle, WorkerStartRequest,
 };
+use language_model::LanguageModelRegistry;
 use pretty_assertions::assert_eq;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Instant;
 
 // ─── Test helpers ───────────────────────────────────────────────────────────
 
@@ -477,5 +481,249 @@ async fn test_gearbox_component_complete_after_review(_cx: &mut TestAppContext) 
         artifact_content.trim(),
         "All checks passed.",
         "Artifact content should match what was written"
+    );
+}
+
+// ─── Test 6: Production broker e2e — fails now, passes after GBX-007-003/004 ─
+
+async fn broker_e2e_wait_for_completion(
+    model: &FakeLanguageModel,
+    cx: &mut TestAppContext,
+) {
+    for _ in 0..100 {
+        cx.run_until_parked();
+        if model.completion_count() > 0 {
+            return;
+        }
+        cx.background_executor
+            .timer(Duration::from_millis(10))
+            .await;
+    }
+    panic!("timed out waiting for fake model completion request");
+}
+
+fn broker_e2e_respond_to_completions(
+    model: Arc<dyn LanguageModel>,
+    finished: Arc<AtomicBool>,
+) -> thread::JoinHandle<usize> {
+    thread::spawn(move || {
+        let model = model.as_fake();
+        let mut completion_count = 0;
+        loop {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while model.completion_count() == 0 {
+                if finished.load(Ordering::SeqCst) {
+                    return completion_count;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for native Gear worker model request"
+                );
+                thread::yield_now();
+            }
+            let request = model.pending_completions().last().cloned().unwrap();
+            let request_text = request
+                .messages
+                .iter()
+                .map(|m| m.string_contents())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let response = if request_text.contains("Gear's high-reasoning planner") {
+                let objective = request
+                    .messages
+                    .last()
+                    .map(|m| m.string_contents())
+                    .unwrap_or_else(|| "Build the requested feature".to_string());
+                serde_json::to_string(&deterministic_fallback_draft(
+                    &objective,
+                    &Scope::new(Vec::new(), vec![".git".to_string()], 10),
+                    &["npm run build".to_string()],
+                ))
+                .unwrap()
+            } else if request_text.contains("Gear's read-only PlanCritic") {
+                let evidence = request
+                    .messages
+                    .last()
+                    .map(|m| m.string_contents())
+                    .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
+                    .unwrap();
+                let plan_hash = evidence["plan"]["plan_hash"].as_str().unwrap();
+                let goal_id = evidence["plan"]["goal_id"].as_str().unwrap();
+                let plan_id = evidence["plan"]["plan_id"].as_str().unwrap();
+                let plan_revision = evidence["plan"]["revision"].as_u64().unwrap();
+                let planner_execution_id =
+                    evidence["planner_receipt"]["identity"]["execution_id"]
+                        .as_str()
+                        .unwrap();
+                json!({
+                    "schema_version": 1,
+                    "reviewed_goal_id": goal_id,
+                    "reviewed_plan_id": plan_id,
+                    "reviewed_plan_revision": plan_revision,
+                    "reviewed_plan_hash": plan_hash,
+                    "reviewed_planner_execution_id": planner_execution_id,
+                    "decision": "approve",
+                    "checks": [
+                        {"dimension":"references","verdict":"pass","summary":"ok","evidence_refs":["verifier:reference_paths"]},
+                        {"dimension":"executability","verdict":"pass","summary":"ok","evidence_refs":["plan:tasks"]},
+                        {"dimension":"contradictions","verdict":"pass","summary":"ok","evidence_refs":["plan:must_have"]},
+                        {"dimension":"scope","verdict":"pass","summary":"ok","evidence_refs":["verifier:scope"]},
+                        {"dimension":"tdd","verdict":"pass","summary":"ok","evidence_refs":["verifier:test_contract"]},
+                        {"dimension":"qa","verdict":"pass","summary":"ok","evidence_refs":["verifier:qa_contract"]},
+                        {"dimension":"acceptance","verdict":"pass","summary":"ok","evidence_refs":["verifier:acceptance_contract"]}
+                    ],
+                    "findings": [],
+                    "revision_instructions": null,
+                    "needs_user_reason": null,
+                    "summary": "sealed plan and deterministic evidence are decision complete"
+                })
+                .to_string()
+            } else if request_text.contains("Gear's coordinator review hook") {
+                "GOAL_SATISFIED: yes\nSUMMARY: deterministic verification and worker evidence are ready for the required independent review\nREPAIR_REQUEST: none\nROUTE_HINT: none\nSTOP_REASON: complete"
+                    .to_string()
+            } else if request_text.contains("read-only final-review phase") {
+                let reviewed_execution_id = request_text
+                    .split("reviewed_execution_id `")
+                    .nth(1)
+                    .and_then(|value| value.split('`').next())
+                    .unwrap_or("missing-executor-id");
+                json!({
+                    "schema_version": 1,
+                    "reviewed_execution_id": reviewed_execution_id,
+                    "dimensions": [
+                        {"dimension": "goal_verification", "verdict": "pass", "findings": ["goal and verification artifacts inspected"]},
+                        {"dimension": "code_quality", "verdict": "pass", "findings": ["bounded implementation evidence inspected"]},
+                        {"dimension": "security", "verdict": "pass", "findings": ["forbidden path evidence inspected"]},
+                        {"dimension": "qa_execution", "verdict": "pass", "findings": ["build verification evidence inspected"]}
+                    ]
+                })
+                .to_string()
+            } else {
+                "## Summary\nImplemented the bounded worker task.\n\n## Changed Files\n- none\n\n## Commands Run\n- npm run build\n\n## Known Failures\n- none"
+                    .to_string()
+            };
+            model.send_completion_stream_text_chunk(&request, response);
+            model.end_last_completion_stream();
+            completion_count += 1;
+        }
+    })
+}
+
+#[gpui::test]
+async fn gearbox_production_phase_broker_e2e(cx: &mut TestAppContext) {
+    init_test(cx);
+    cx.update(|cx| {
+        LanguageModelRegistry::test(cx);
+    });
+
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("README.md"), "# Gear test\n").unwrap();
+    std::fs::write(
+        workspace.path().join("package.json"),
+        r#"{"scripts":{"build":"echo build-ok"}}"#,
+    )
+    .unwrap();
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/", json!({ "a": {} })).await;
+    let project = Project::test(fs.clone(), [Path::new("/a")], cx).await;
+    let thread_store = cx.new(|cx| ThreadStore::new(cx));
+    let agent = cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs, cx));
+    agent.update(cx, |agent, _cx| {
+        agent.gear_worker_config_override = Some(WorkerConfig {
+            worker_kind: WorkerKind::ZedAgent,
+            worker_command: None,
+            worker_model: None,
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
+        });
+    });
+    let connection = Rc::new(NativeAgentConnection::gear(agent.clone()));
+
+    let acp_thread = cx
+        .update(|cx| {
+            connection.clone().new_session(
+                project.clone(),
+                PathList::new(&[workspace.path()]),
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    let model = cx.update(|cx| {
+        LanguageModelRegistry::read_global(cx)
+            .default_model()
+            .map(|default_model| default_model.model)
+            .expect("default test model should be available")
+    });
+    let fake_model = model.as_fake();
+    let prompt_task = cx.update(|cx| {
+        acp_thread.update(cx, |thread, cx| {
+            thread.send(vec!["Build a tiny notes app MVP".into()], cx)
+        })
+    });
+    let prompt_task = cx.foreground_executor().spawn(prompt_task);
+    broker_e2e_wait_for_completion(fake_model, cx).await;
+    let planner_draft = deterministic_fallback_draft(
+        "Build a tiny notes app MVP",
+        &Scope::new(Vec::new(), vec![".git".to_string()], 10),
+        &["npm run build".to_string()],
+    );
+    fake_model
+        .send_last_completion_stream_text_chunk(serde_json::to_string(&planner_draft).unwrap());
+    fake_model.end_last_completion_stream();
+    let gear_finished = Arc::new(AtomicBool::new(false));
+    let worker_responder = broker_e2e_respond_to_completions(model, gear_finished.clone());
+    cx.executor().allow_parking();
+    prompt_task.await.unwrap();
+    gear_finished.store(true, Ordering::SeqCst);
+    assert_eq!(
+        worker_responder.join().unwrap(),
+        3,
+        "Gear should approve the plan, execute one native implementation worker, and run one independent final reviewer"
+    );
+    cx.run_until_parked();
+
+    let gearbox_root = workspace.path().join(".gearbox-agent");
+    assert!(
+        gearbox_root.join("artifacts").is_dir(),
+        "Orchestrator must have run and created artifacts directory"
+    );
+    assert!(
+        gearbox_root.join("goals").is_dir(),
+        "Orchestrator must have persisted goals"
+    );
+
+    let goal_dirs: Vec<_> = std::fs::read_dir(gearbox_root.join("artifacts"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .collect();
+    assert!(
+        !goal_dirs.is_empty(),
+        "At least one goal-id directory must exist under artifacts/"
+    );
+
+    let broker_sessions_exists = goal_dirs
+        .iter()
+        .any(|e| e.path().join("broker-sessions").is_dir());
+
+    assert!(
+        broker_sessions_exists,
+        "FAILS NOW — broker-sessions/ does not exist in any goal directory under artifacts/. \
+         This proves PhaseRuntime.broker is None in send_gear_prompt. \
+         \
+         After GBX-007-003/004 wiring (broker factory + ACP production registration), \
+         broker-sessions/ WILL be created and this assertion PASSES. \
+         \
+         Current code path: send_gear_prompt → PhaseRuntime {{ broker: None, ... }} → \
+         run_phase_via_broker(None, ...) → immediate `else` return → no broker artifacts."
     );
 }
