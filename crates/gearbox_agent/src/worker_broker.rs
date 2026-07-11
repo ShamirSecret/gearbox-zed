@@ -14,7 +14,9 @@ use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::phase_routing::{ModelBindingStatus, ModelSelectorId};
+use crate::phase_routing::{ModelBindingStatus, ModelSelectorId, PhaseRouteDecision};
+use crate::plan_graph::PhaseProfile;
+use crate::plan_review::PhaseExecutionIdentity;
 use crate::state::{timestamp, write_json};
 use crate::workers::{WorkerKind, WorkerRegistry, WorkerSessionHandle};
 
@@ -1875,6 +1877,188 @@ fn read_json_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
         .with_context(|| format!("failed to parse {}", path.display()))
 }
 
+// ---------------------------------------------------------------------------
+// PhaseBrokerFactory — per-phase goal-scoped broker session factory
+// ---------------------------------------------------------------------------
+
+/// Track a single active broker session in the factory.
+#[derive(Clone, Debug)]
+struct ActiveSessionEntry {
+    /// Unique session key: `{execution_id}:{goal_id}:{task_id}:{plan_revision}`.
+    session_key: String,
+    /// The execution identity's execution_id.
+    execution_id: String,
+    /// Goal this session belongs to.
+    goal_id: String,
+    /// Task within the goal.
+    task_id: String,
+    /// Plan revision number.
+    plan_revision: usize,
+    /// Independence group (e.g. "planning", "execution").
+    phase_group: String,
+}
+
+/// Return the independence group for a phase profile.
+fn independence_group_for_phase(phase: &PhaseProfile) -> &'static str {
+    match phase {
+        PhaseProfile::Planner => "planning",
+        PhaseProfile::PlanCritic => "plan_review",
+        PhaseProfile::Orchestrator => "orchestrator",
+        PhaseProfile::ExecutorQuick => "execution",
+        PhaseProfile::ExecutorDeep => "execution",
+        PhaseProfile::ReviewerTask => "task_review",
+        PhaseProfile::ReviewerFinal => "final_review",
+        PhaseProfile::StrategistNextGoal => "strategy",
+        PhaseProfile::Summarizer => "summarization",
+    }
+}
+
+/// Return a filesystem-safe snake_case name for a phase profile.
+fn phase_profile_to_path(phase: &PhaseProfile) -> &'static str {
+    match phase {
+        PhaseProfile::Planner => "planner",
+        PhaseProfile::PlanCritic => "plan_critic",
+        PhaseProfile::Orchestrator => "orchestrator",
+        PhaseProfile::ExecutorQuick => "executor_quick",
+        PhaseProfile::ExecutorDeep => "executor_deep",
+        PhaseProfile::ReviewerTask => "reviewer_task",
+        PhaseProfile::ReviewerFinal => "reviewer_final",
+        PhaseProfile::StrategistNextGoal => "strategist_next_goal",
+        PhaseProfile::Summarizer => "summarizer",
+    }
+}
+
+/// Send-safe factory that creates per-phase broker sessions with
+/// independent goal-scoped lifecycle and ledger isolation.
+///
+/// Each call to [`create_broker`] returns a new `Arc<WorkerBroker>` whose
+/// ledger artifacts are written to an isolated path under
+/// `{artifacts_root}/broker-sessions/{phase}/{goal_id}/{task_id}/{revision}/`.
+///
+/// The factory enforces:
+/// - No duplicate session keys (same execution_id + goal + task + revision).
+/// - No cross-role session reuse within the same independence group.
+/// - No replay of terminal sessions (on-disk ledger detection).
+pub struct PhaseBrokerFactory {
+    registry: Arc<WorkerRegistry>,
+    artifacts_root: PathBuf,
+    /// Track active session entries to prevent reuse/cross-role sharing.
+    active_sessions: Arc<Mutex<Vec<ActiveSessionEntry>>>,
+}
+
+impl PhaseBrokerFactory {
+    /// Create a new phase broker factory.
+    pub fn new(registry: Arc<WorkerRegistry>, artifacts_root: PathBuf) -> Self {
+        Self {
+            registry,
+            artifacts_root,
+            active_sessions: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Create a new broker session for the given phase invocation.
+    ///
+    /// Returns an `Arc<WorkerBroker>` whose ledger is isolated to:
+    /// `{artifacts_root}/broker-sessions/{phase}/{goal_id}/{task_id}/{revision}/`
+    ///
+    /// # Guards
+    ///
+    /// 1. **Duplicate session key**: If the exact session key
+    ///    (`{execution_id}:{goal_id}:{task_id}:{plan_revision}`) already
+    ///    exists in `active_sessions`, the call bails with
+    ///    "broker session already exists".
+    ///
+    /// 2. **Cross-role sharing**: If any active session shares the same
+    ///    `goal_id` + `task_id` + `plan_revision` but a different
+    ///    `execution_id` within the same independence group, the call
+    ///    bails with "cross-role session reuse detected".
+    ///
+    /// 3. **Terminal replay**: If the target ledger path already contains
+    ///    session data (from a previous terminal run), the call bails
+    ///    with "session replay detected".
+    pub fn create_broker(
+        &self,
+        phase_decision: &PhaseRouteDecision,
+        goal_id: &str,
+        _plan_id: &str,
+        plan_revision: usize,
+        task_id: &str,
+        execution_identity: &PhaseExecutionIdentity,
+    ) -> Result<Arc<WorkerBroker>> {
+        let session_key = format!(
+            "{}:{}:{}:{}",
+            execution_identity.execution_id,
+            goal_id,
+            task_id,
+            plan_revision,
+        );
+
+        let phase_group = independence_group_for_phase(&phase_decision.phase);
+
+        let mut sessions = self.active_sessions.lock().map_err(|e| {
+            anyhow::anyhow!("PhaseBrokerFactory active_sessions lock poisoned: {e}")
+        })?;
+
+        if sessions.iter().any(|s: &ActiveSessionEntry| s.session_key == session_key) {
+            bail!(
+                "broker session already exists for execution identity {}",
+                execution_identity.execution_id
+            );
+        }
+
+        if sessions.iter().any(|s| {
+            s.goal_id == goal_id
+                && s.task_id == task_id
+                && s.plan_revision == plan_revision
+                && s.execution_id != execution_identity.execution_id
+                && s.phase_group == phase_group
+        }) {
+            bail!(
+                "cross-role session reuse detected: goal={}, task={}, revision={}, group={}",
+                goal_id,
+                task_id,
+                plan_revision,
+                phase_group,
+            );
+        }
+
+        let session_root = self
+            .artifacts_root
+            .join("broker-sessions")
+            .join(phase_profile_to_path(&phase_decision.phase))
+            .join(sanitize_for_path(goal_id))
+            .join(sanitize_for_path(task_id))
+            .join(format!("{}", plan_revision));
+
+        let replay_check_path = session_root
+            .join(sanitize_for_path(goal_id))
+            .join("broker-sessions");
+        if replay_check_path.exists() {
+            if let Ok(mut entries) = fs::read_dir(&replay_check_path) {
+                if entries.next().is_some() {
+                    bail!(
+                        "session replay detected: broker session data already exists at {}",
+                        replay_check_path.display()
+                    );
+                }
+            }
+        }
+
+        let broker = Arc::new(WorkerBroker::new(self.registry.clone(), session_root));
+
+        sessions.push(ActiveSessionEntry {
+            session_key,
+            execution_id: execution_identity.execution_id.clone(),
+            goal_id: goal_id.to_string(),
+            task_id: task_id.to_string(),
+            plan_revision,
+            phase_group: phase_group.to_string(),
+        });
+
+        Ok(broker)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3073,6 +3257,376 @@ mod tests {
     // -----------------------------------------------------------------------
     // Unavailable reason propagation — BackendUnavailable
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // PhaseBrokerFactory tests
+    // -----------------------------------------------------------------------
+
+    use crate::phase_routing::{PhaseBackend, PhaseModelBinding, PhaseRouteCandidate, PhaseRouteSource};
+    use crate::plan_graph::PhaseProfile;
+    use crate::plan_review::{PhaseExecutionBackend, PhaseExecutionIdentity};
+    use crate::workers::WorkerCategory;
+
+    /// Build a minimal PhaseRouteDecision for the given phase.
+    fn test_phase_decision(phase: PhaseProfile) -> PhaseRouteDecision {
+        PhaseRouteDecision {
+            phase,
+            category: WorkerCategory::Deep,
+            selected_candidate: 0,
+            candidate: PhaseRouteCandidate {
+                backend: PhaseBackend::DirectModel,
+                model: PhaseModelBinding::CurrentSession,
+                command: None,
+            },
+            rejected_candidates: Vec::new(),
+            requested_model: None,
+            worker_kind: None,
+            profile_hash: "a".repeat(64),
+            source: PhaseRouteSource::LegacyDefault,
+        }
+    }
+
+    /// Build a minimal PhaseExecutionIdentity.
+    fn test_exec_identity(
+        execution_id: &str,
+        phase_session_id: &str,
+        actual_session_id: &str,
+    ) -> PhaseExecutionIdentity {
+        PhaseExecutionIdentity {
+            execution_id: execution_id.to_string(),
+            phase_session_id: phase_session_id.to_string(),
+            backend: PhaseExecutionBackend::NativeAgent,
+            agent_id: Some("test-agent".to_string()),
+            provider_id: Some("test-provider".to_string()),
+            model_id: Some("test-model".to_string()),
+            actual_session_id: Some(actual_session_id.to_string()),
+        }
+    }
+
+    #[test]
+    fn phase_broker_factory_creates_four_independent_sessions() -> Result<()> {
+        use crate::test_support::test_support::worker_registry_for_test;
+        use std::sync::Arc;
+        use tempfile::tempdir;
+
+        let tmp = tempdir()?;
+        let registry = Arc::new(worker_registry_for_test());
+        let factory = PhaseBrokerFactory::new(registry, tmp.path().to_path_buf());
+
+        // Create brokers for four different phases with distinct identities.
+        let planner = factory.create_broker(
+            &test_phase_decision(PhaseProfile::Planner),
+            "goal-1",
+            "plan-1",
+            1,
+            "task-1",
+            &test_exec_identity("exec-planner", "ses-planner", "act-planner"),
+        )?;
+
+        let critic = factory.create_broker(
+            &test_phase_decision(PhaseProfile::PlanCritic),
+            "goal-1",
+            "plan-1",
+            1,
+            "task-1",
+            &test_exec_identity("exec-critic", "ses-critic", "act-critic"),
+        )?;
+
+        let executor = factory.create_broker(
+            &test_phase_decision(PhaseProfile::ExecutorQuick),
+            "goal-1",
+            "plan-1",
+            1,
+            "task-1",
+            &test_exec_identity("exec-executor", "ses-executor", "act-executor"),
+        )?;
+
+        let reviewer = factory.create_broker(
+            &test_phase_decision(PhaseProfile::ReviewerTask),
+            "goal-1",
+            "plan-1",
+            1,
+            "task-1",
+            &test_exec_identity("exec-reviewer", "ses-reviewer", "act-reviewer"),
+        )?;
+
+        // All four should be distinct Arc pointers.
+        assert!(!Arc::ptr_eq(&planner, &critic));
+        assert!(!Arc::ptr_eq(&planner, &executor));
+        assert!(!Arc::ptr_eq(&planner, &reviewer));
+        assert!(!Arc::ptr_eq(&critic, &executor));
+        assert!(!Arc::ptr_eq(&critic, &reviewer));
+        assert!(!Arc::ptr_eq(&executor, &reviewer));
+
+        // All four should be in Discovered state.
+        for broker in [&planner, &critic, &executor, &reviewer] {
+            let state = broker.current_state()?;
+            assert_eq!(state.lifecycle.name(), LifecycleStateName::Discovered);
+        }
+
+        // All four should have different artifacts_root paths.
+        let paths: Vec<_> = [planner, critic, executor, reviewer]
+            .iter()
+            .map(|b| b.artifacts_root().to_path_buf())
+            .collect();
+        for i in 0..paths.len() {
+            for j in (i + 1)..paths.len() {
+                assert_ne!(paths[i], paths[j], "broker {} and {} share the same path", i, j);
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn phase_broker_factory_rejects_same_identity_reuse() -> Result<()> {
+        use crate::test_support::test_support::worker_registry_for_test;
+        use std::sync::Arc;
+        use tempfile::tempdir;
+
+        let tmp = tempdir()?;
+        let registry = Arc::new(worker_registry_for_test());
+        let factory = PhaseBrokerFactory::new(registry, tmp.path().to_path_buf());
+
+        let identity = test_exec_identity("exec-planner", "ses-planner", "act-planner");
+
+        // First creation should succeed.
+        factory.create_broker(
+            &test_phase_decision(PhaseProfile::Planner),
+            "goal-1",
+            "plan-1",
+            1,
+            "task-1",
+            &identity,
+        )?;
+
+        // Second creation with same identity should fail.
+        let err = match factory.create_broker(
+            &test_phase_decision(PhaseProfile::Planner),
+            "goal-1",
+            "plan-1",
+            1,
+            "task-1",
+            &identity,
+        ) {
+            Err(e) => e.to_string(),
+            Ok(_) => bail!("reusing the same execution identity must have failed"),
+        };
+        assert!(
+            err.contains("broker session already exists"),
+            "error should mention existing session: {err}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn phase_broker_factory_rejects_cross_role_sharing() -> Result<()> {
+        use crate::test_support::test_support::worker_registry_for_test;
+        use std::sync::Arc;
+        use tempfile::tempdir;
+
+        let tmp = tempdir()?;
+        let registry = Arc::new(worker_registry_for_test());
+        let factory = PhaseBrokerFactory::new(registry, tmp.path().to_path_buf());
+
+        // Planner (group "planning") — first broker in this group.
+        factory.create_broker(
+            &test_phase_decision(PhaseProfile::Planner),
+            "goal-1",
+            "plan-1",
+            1,
+            "task-1",
+            &test_exec_identity("exec-planner", "ses-planner", "act-planner"),
+        )?;
+
+        // PlanCritic (group "plan_review") — different group, same goal/task/revision → OK.
+        let critic_result = factory.create_broker(
+            &test_phase_decision(PhaseProfile::PlanCritic),
+            "goal-1",
+            "plan-1",
+            1,
+            "task-1",
+            &test_exec_identity("exec-critic", "ses-critic", "act-critic"),
+        );
+        assert!(
+            critic_result.is_ok(),
+            "PlanCritic in different group should succeed"
+        );
+
+        // ExecutorQuick (group "execution") — different group, same goal/task/revision → OK.
+        let executor_result = factory.create_broker(
+            &test_phase_decision(PhaseProfile::ExecutorQuick),
+            "goal-1",
+            "plan-1",
+            1,
+            "task-1",
+            &test_exec_identity("exec-executor", "ses-executor", "act-executor"),
+        );
+        assert!(
+            executor_result.is_ok(),
+            "ExecutorQuick in different group should succeed"
+        );
+
+        // Try a second ExecutorDeep (same independence group "execution") with different
+        // execution_id but same goal/task/revision → should FAIL.
+        let err = match factory.create_broker(
+            &test_phase_decision(PhaseProfile::ExecutorDeep),
+            "goal-1",
+            "plan-1",
+            1,
+            "task-1",
+            &test_exec_identity("exec-executor-2", "ses-executor-2", "act-executor-2"),
+        ) {
+            Err(e) => e.to_string(),
+            Ok(_) => bail!("second executor in same group must have failed"),
+        };
+        assert!(
+            err.contains("cross-role session reuse detected"),
+            "error should mention cross-role reuse: {err}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn phase_broker_factory_ledger_paths_are_distinct() -> Result<()> {
+        use crate::test_support::test_support::worker_registry_for_test;
+        use std::sync::Arc;
+        use tempfile::tempdir;
+
+        let tmp = tempdir()?;
+        let registry = Arc::new(worker_registry_for_test());
+        let factory = PhaseBrokerFactory::new(registry, tmp.path().to_path_buf());
+
+        let broker1 = factory.create_broker(
+            &test_phase_decision(PhaseProfile::Planner),
+            "goal-1",
+            "plan-1",
+            1,
+            "task-1",
+            &test_exec_identity("exec-1", "ses-1", "act-1"),
+        )?;
+
+        let broker2 = factory.create_broker(
+            &test_phase_decision(PhaseProfile::ExecutorQuick),
+            "goal-1",
+            "plan-1",
+            1,
+            "task-2",
+            &test_exec_identity("exec-2", "ses-2", "act-2"),
+        )?;
+
+        let broker3 = factory.create_broker(
+            &test_phase_decision(PhaseProfile::ReviewerTask),
+            "goal-2",
+            "plan-1",
+            2,
+            "task-3",
+            &test_exec_identity("exec-3", "ses-3", "act-3"),
+        )?;
+
+        let broker4 = factory.create_broker(
+            &test_phase_decision(PhaseProfile::Summarizer),
+            "goal-1",
+            "plan-2",
+            1,
+            "task-1",
+            &test_exec_identity("exec-4", "ses-4", "act-4"),
+        )?;
+
+        // All four paths must be distinct.
+        let paths = [
+            broker1.artifacts_root().to_path_buf(),
+            broker2.artifacts_root().to_path_buf(),
+            broker3.artifacts_root().to_path_buf(),
+            broker4.artifacts_root().to_path_buf(),
+        ];
+        for i in 0..paths.len() {
+            for j in (i + 1)..paths.len() {
+                assert_ne!(paths[i], paths[j], "path {} and {} must be distinct", i, j);
+            }
+        }
+
+        // Verify path structure: each contains "broker-sessions"
+        for (i, path) in paths.iter().enumerate() {
+            let path_str = path.to_string_lossy();
+            assert!(
+                path_str.contains("broker-sessions"),
+                "path {} missing broker-sessions: {path_str}",
+                i,
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn phase_broker_factory_rejects_terminal_revive() -> Result<()> {
+        use crate::test_support::test_support::{
+            FakeWorkerSessionHandle, FakeWorkerState, worker_registry_for_test,
+        };
+        use std::sync::Arc;
+        use tempfile::tempdir;
+
+        let tmp = tempdir()?;
+        let registry = Arc::new(worker_registry_for_test());
+        let factory = PhaseBrokerFactory::new(registry, tmp.path().to_path_buf());
+
+        let identity = test_exec_identity("exec-planner", "ses-planner", "act-planner");
+        let phase_decision = test_phase_decision(PhaseProfile::Planner);
+
+        // Create broker, go through full lifecycle to terminal.
+        let broker = factory.create_broker(
+            &phase_decision,
+            "goal-1",
+            "plan-1",
+            1,
+            "task-1",
+            &identity,
+        )?;
+
+        // Resolve and start the broker (to create on-disk ledger data).
+        let model = test_model("provider/model");
+        let request = basic_request(ModelAvailability::Available(model));
+        broker.resolve(request)?;
+
+        let fake_state = Arc::new(Mutex::new(FakeWorkerState::new("ses-planner")));
+        let handle = Arc::new(FakeWorkerSessionHandle::new(fake_state));
+        let session_identity = session_for_kind(WorkerKind::OpencodeSession);
+        broker.start(handle, session_identity)?;
+
+        // Cancel to reach terminal state.
+        broker.cancel()?;
+        assert!(broker.current_state()?.lifecycle.is_terminal());
+
+        // Drop the factory's active_sessions lock entry (simulate restart).
+        // We access the factory's active_sessions directly to clear it.
+        {
+            let mut sessions = factory.active_sessions.lock().unwrap();
+            sessions.clear();
+        }
+
+        // Try to create a new broker with the same identity → should fail
+        // because disk already contains ledger data.
+        let err = match factory.create_broker(
+            &phase_decision,
+            "goal-1",
+            "plan-1",
+            1,
+            "task-1",
+            &identity,
+        ) {
+            Err(e) => e.to_string(),
+            Ok(_) => bail!("terminal revive must have been rejected"),
+        };
+        assert!(
+            err.contains("session replay detected"),
+            "error should mention session replay: {err}"
+        );
+
+        Ok(())
+    }
 
     #[test]
     fn unavailable_reason_propagation() {
