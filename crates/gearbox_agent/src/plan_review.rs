@@ -164,6 +164,167 @@ impl PhaseExecutionIdentity {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntentFoldDecision {
+    Ready,
+    NeedsUser,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntentRiskSeverity {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntentRisk {
+    pub code: String,
+    pub severity: IntentRiskSeverity,
+    pub description: String,
+    pub mitigation: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntentFoldVerdict {
+    pub schema_version: u32,
+    pub goal_id: String,
+    pub normalized_objective: String,
+    #[serde(default)]
+    pub assumptions: Vec<String>,
+    #[serde(default)]
+    pub constraints: Vec<String>,
+    #[serde(default)]
+    pub ambiguities: Vec<String>,
+    #[serde(default)]
+    pub required_questions: Vec<String>,
+    #[serde(default)]
+    pub risks: Vec<IntentRisk>,
+    #[serde(default)]
+    pub acceptance_signals: Vec<String>,
+    pub decision: IntentFoldDecision,
+    pub summary: String,
+}
+
+impl IntentFoldVerdict {
+    pub fn parse(raw_output: &str) -> Result<Self> {
+        serde_json::from_str(raw_output.trim())
+            .context("intent fold did not return one strict IntentFoldVerdict JSON object")
+    }
+
+    pub fn validate(&self, goal_id: &str) -> Result<()> {
+        if self.schema_version != PLAN_REVIEW_SCHEMA_VERSION {
+            bail!(
+                "unsupported intent fold schema version {}",
+                self.schema_version
+            );
+        }
+        if self.goal_id != goal_id {
+            bail!("intent fold verdict is bound to a different goal");
+        }
+        require_non_empty(
+            "intent fold normalized objective",
+            &self.normalized_objective,
+        )?;
+        require_non_empty("intent fold summary", &self.summary)?;
+        for (label, values) in [
+            ("assumption", &self.assumptions),
+            ("constraint", &self.constraints),
+            ("ambiguity", &self.ambiguities),
+            ("required question", &self.required_questions),
+            ("acceptance signal", &self.acceptance_signals),
+        ] {
+            validate_non_empty_unique_values(label, values)?;
+        }
+        for risk in &self.risks {
+            require_non_empty("intent risk code", &risk.code)?;
+            require_non_empty("intent risk description", &risk.description)?;
+            require_non_empty("intent risk mitigation", &risk.mitigation)?;
+        }
+        match self.decision {
+            IntentFoldDecision::Ready if !self.required_questions.is_empty() => {
+                bail!("ready intent fold cannot contain required questions")
+            }
+            IntentFoldDecision::NeedsUser if self.required_questions.is_empty() => {
+                bail!("needs-user intent fold requires at least one question")
+            }
+            IntentFoldDecision::Ready | IntentFoldDecision::NeedsUser => {}
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntentFoldReceipt {
+    pub schema_version: u32,
+    pub goal_id: String,
+    pub verdict: IntentFoldVerdict,
+    pub analyst: PhaseExecutionIdentity,
+    pub raw_output_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_path: Option<String>,
+    pub created_at: String,
+    pub receipt_hash: String,
+}
+
+impl IntentFoldReceipt {
+    pub fn seal(
+        verdict: IntentFoldVerdict,
+        analyst: PhaseExecutionIdentity,
+        raw_output: &str,
+        artifact_path: Option<String>,
+        created_at: String,
+    ) -> Result<Self> {
+        let mut receipt = Self {
+            schema_version: PLAN_REVIEW_SCHEMA_VERSION,
+            goal_id: verdict.goal_id.clone(),
+            verdict,
+            analyst,
+            raw_output_sha256: sha256_bytes(raw_output.as_bytes()),
+            artifact_path,
+            created_at,
+            receipt_hash: String::new(),
+        };
+        receipt.validate_payload()?;
+        receipt.receipt_hash = receipt.expected_hash()?;
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.validate_payload()?;
+        validate_sha256("intent fold receipt hash", &self.receipt_hash)?;
+        if self.receipt_hash != self.expected_hash()? {
+            bail!("intent fold receipt integrity hash mismatch");
+        }
+        Ok(())
+    }
+
+    fn validate_payload(&self) -> Result<()> {
+        if self.schema_version != PLAN_REVIEW_SCHEMA_VERSION {
+            bail!("unsupported intent fold receipt schema version");
+        }
+        require_non_empty("intent fold receipt goal id", &self.goal_id)?;
+        self.verdict.validate(&self.goal_id)?;
+        self.analyst.validate()?;
+        validate_sha256("intent fold raw output hash", &self.raw_output_sha256)?;
+        validate_optional_non_empty("intent fold artifact path", self.artifact_path.as_deref())?;
+        require_non_empty("intent fold created_at", &self.created_at)?;
+        Ok(())
+    }
+
+    fn expected_hash(&self) -> Result<String> {
+        let mut payload = self.clone();
+        payload.receipt_hash.clear();
+        Ok(sha256_bytes(&serde_json::to_vec(&payload)?))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlannerExecutionReceipt {
@@ -1286,6 +1447,17 @@ fn validate_optional_non_empty(field: &str, value: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+fn validate_non_empty_unique_values(field: &str, values: &[String]) -> Result<()> {
+    let mut seen = HashSet::new();
+    for value in values {
+        require_non_empty(field, value)?;
+        if !seen.insert(value) {
+            bail!("intent fold contains duplicate {field} `{value}`");
+        }
+    }
+    Ok(())
+}
+
 fn validate_sha256(field: &str, hash: &str) -> Result<()> {
     if hash.len() != 64
         || !hash
@@ -1475,6 +1647,39 @@ mod tests {
             &fixture.verifier,
             &raw_output,
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn intent_fold_receipt_rejects_goal_rebinding() -> Result<()> {
+        let verdict = IntentFoldVerdict {
+            schema_version: PLAN_REVIEW_SCHEMA_VERSION,
+            goal_id: "goal-1".to_string(),
+            normalized_objective: "Implement the requested change".to_string(),
+            assumptions: Vec::new(),
+            constraints: vec!["Preserve existing behavior".to_string()],
+            ambiguities: Vec::new(),
+            required_questions: Vec::new(),
+            risks: vec![IntentRisk {
+                code: "regression".to_string(),
+                severity: IntentRiskSeverity::Medium,
+                description: "Existing behavior could regress".to_string(),
+                mitigation: "Run focused regression tests".to_string(),
+            }],
+            acceptance_signals: vec!["Focused tests pass".to_string()],
+            decision: IntentFoldDecision::Ready,
+            summary: "The request is ready for planning".to_string(),
+        };
+        let mut receipt = IntentFoldReceipt::seal(
+            verdict,
+            planner_identity(),
+            "intent-fold-output",
+            None,
+            "2026-07-12T00:00:00Z".to_string(),
+        )?;
+        receipt.goal_id = "goal-2".to_string();
+
+        assert!(receipt.validate().is_err());
         Ok(())
     }
 

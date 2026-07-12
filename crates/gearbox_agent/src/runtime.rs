@@ -20,9 +20,9 @@ use crate::plan_graph::{
     deterministic_fallback_draft, parse_planner_draft,
 };
 use crate::plan_review::{
-    PhaseExecutionBackend, PhaseExecutionIdentity, PlanApprovalState, PlanApprovalStatus,
-    PlanCriticDecision, PlanCriticReceipt, PlanCriticVerdict, PlanVerifierReport,
-    PlannerExecutionReceipt,
+    IntentFoldDecision, IntentFoldReceipt, IntentFoldVerdict, PhaseExecutionBackend,
+    PhaseExecutionIdentity, PlanApprovalState, PlanApprovalStatus, PlanCriticDecision,
+    PlanCriticReceipt, PlanCriticVerdict, PlanVerifierReport, PlannerExecutionReceipt,
 };
 use crate::product;
 use crate::state::{
@@ -53,6 +53,8 @@ pub type EventSink = Arc<dyn Fn(&Event) + Send + Sync + 'static>;
 pub type CoordinatorReviewHook = Arc<
     dyn Fn(CoordinatorReviewInput) -> Result<Option<CoordinatorReview>> + Send + Sync + 'static,
 >;
+pub type IntentFoldHook =
+    Arc<dyn Fn(IntentFoldInput) -> Result<IntentFoldSubmission> + Send + Sync + 'static>;
 pub type PlannerHook =
     Arc<dyn Fn(PlannerInput) -> Result<PlannerSubmission> + Send + Sync + 'static>;
 pub type PlanCriticHook =
@@ -117,12 +119,29 @@ impl PhaseActorTerminalState {
 }
 
 #[derive(Clone, Debug)]
+pub struct IntentFoldInput {
+    pub goal_id: String,
+    pub request: String,
+    pub scope: Scope,
+    pub route_decision: PhaseRouteDecision,
+}
+
+#[derive(Clone, Debug)]
+pub struct IntentFoldSubmission {
+    pub verdict: IntentFoldVerdict,
+    pub analyst: PhaseExecutionIdentity,
+    pub raw_output: String,
+    pub artifact_path: Option<String>,
+}
+
+#[derive(Clone, Debug)]
 pub struct PlannerInput {
     pub goal_id: String,
     pub request: String,
     pub scope: Scope,
     pub verification_commands: Vec<String>,
     pub route_decision: PhaseRouteDecision,
+    pub intent_fold: Option<IntentFoldReceipt>,
 }
 
 #[derive(Clone, Debug)]
@@ -173,6 +192,7 @@ pub struct PhaseRuntime {
     pub inventory: LiveModelInventory,
     pub current_model: Option<ModelSelectorId>,
     pub planner: Option<PhaseExecutionIdentity>,
+    pub intent_fold_hook: Option<IntentFoldHook>,
     pub planner_hook: Option<PlannerHook>,
     pub plan_critic_hook: Option<PlanCriticHook>,
     pub plan_revision_hook: Option<PlanRevisionHook>,
@@ -197,6 +217,7 @@ impl PhaseRuntime {
             inventory: LiveModelInventory::default(),
             current_model: None,
             planner: None,
+            intent_fold_hook: None,
             planner_hook: None,
             plan_critic_hook: None,
             plan_revision_hook: None,
@@ -1867,9 +1888,62 @@ fn build_approved_plan_graph(
     cancellation_token: Option<&CancellationToken>,
     phase_runtime: &PhaseRuntime,
 ) -> Result<PlanGraph> {
-    if !phase_runtime.require_plan_approval && phase_runtime.planner_hook.is_none() {
+    if !phase_runtime.require_plan_approval
+        && phase_runtime.planner_hook.is_none()
+        && phase_runtime.intent_fold_hook.is_none()
+    {
         return build_plan_graph(goal, scope, verification_commands);
     }
+    let intent_fold_receipt =
+        if let Some(intent_fold_hook) = phase_runtime.intent_fold_hook.as_ref() {
+            check_run_cancelled(cancellation_token)?;
+            let decision = phase_runtime.routes.resolve(
+                &PhaseProfile::Planner,
+                &phase_runtime.inventory,
+                phase_runtime.current_model.as_ref(),
+            )?;
+            check_phase_terminal_state(&decision)
+                .context("intent fold phase terminal state check failed")?;
+            let submission = intent_fold_hook(IntentFoldInput {
+                goal_id: goal.id.clone(),
+                request: goal.request.clone(),
+                scope: scope.clone(),
+                route_decision: decision.clone(),
+            })
+            .context("IntentFold hook failed before planning")?;
+            let parsed = IntentFoldVerdict::parse(&submission.raw_output)?;
+            if parsed != submission.verdict {
+                bail!("IntentFold raw output does not match its typed verdict");
+            }
+            submission.verdict.validate(&goal.id)?;
+            validate_phase_execution_identity(&decision, &submission.analyst)?;
+            let receipt = IntentFoldReceipt::seal(
+                submission.verdict,
+                submission.analyst,
+                &submission.raw_output,
+                submission.artifact_path,
+                timestamp(),
+            )?;
+            let receipt_json = serde_json::to_string_pretty(&receipt)?;
+            store.write_artifact(
+                &goal.id,
+                "intent-fold-receipt.json",
+                &format!("{receipt_json}\n"),
+            )?;
+            if receipt.verdict.decision == IntentFoldDecision::NeedsUser {
+                goal.status = GoalStatus::NeedsUser;
+                goal.summary = receipt.verdict.summary.clone();
+                goal.updated_at = timestamp();
+                store.write_goal(goal)?;
+                bail!(
+                    "IntentFold requires user input: {}",
+                    receipt.verdict.required_questions.join("; ")
+                );
+            }
+            Some(receipt)
+        } else {
+            None
+        };
     let (mut plan, mut planner_raw_output, mut planner_identity, mut planner_artifact_path) =
         if let Some(planner_hook) = phase_runtime.planner_hook.as_ref() {
             let planner_decision = phase_runtime.routes.resolve(
@@ -1885,6 +1959,7 @@ fn build_approved_plan_graph(
                 scope: scope.clone(),
                 verification_commands: verification_commands.to_vec(),
                 route_decision: planner_decision.clone(),
+                intent_fold: intent_fold_receipt.clone(),
             })
             .context("planner hook failed before plan construction")?;
             let parsed = parse_planner_draft(&submission.raw_output)
@@ -1893,6 +1968,11 @@ fn build_approved_plan_graph(
                 bail!("planner hook raw output does not match its typed draft");
             }
             validate_phase_execution_identity(&planner_decision, &submission.planner)?;
+            if let Some(intent_fold) = intent_fold_receipt.as_ref()
+                && !submission.planner.is_independent_from(&intent_fold.analyst)
+            {
+                bail!("planner must use a fresh session after IntentFold");
+            }
             let provider_id = submission
                 .planner
                 .provider_id
@@ -5715,6 +5795,7 @@ mod tests {
             },
             current_model: Some(current_model),
             planner: Some(phase_identity("planner")),
+            intent_fold_hook: None,
             planner_hook: None,
             plan_critic_hook: critic_hook,
             plan_revision_hook: None,
@@ -5864,6 +5945,7 @@ mod tests {
             inventory: LiveModelInventory::default(),
             current_model: None,
             planner: None,
+            intent_fold_hook: None,
             planner_hook: Some(planner_hook),
             plan_critic_hook: None,
             plan_revision_hook: None,
@@ -5894,6 +5976,102 @@ mod tests {
             Some("opencode_planner_session")
         );
         assert!(goal.coordinator_brief.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn intent_fold_stops_before_planning_when_user_input_is_required() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let scope = Scope::new(Vec::new(), vec![".git".to_string()], 10);
+        let draft = deterministic_fallback_draft("Choose a deployment target", &scope, &[]);
+        let mut goal = planning_goal(&draft)?;
+        goal.coordinator_brief = None;
+        goal.coordinator_model = None;
+        let planner_called = Arc::new(Mutex::new(false));
+        let planner_hook: PlannerHook = Arc::new({
+            let planner_called = planner_called.clone();
+            move |_input| {
+                *planner_called.lock().expect("planner flag poisoned") = true;
+                anyhow::bail!("planner must not run")
+            }
+        });
+        let intent_fold_hook: IntentFoldHook = Arc::new(|input| {
+            let verdict = IntentFoldVerdict {
+                schema_version: crate::plan_review::PLAN_REVIEW_SCHEMA_VERSION,
+                goal_id: input.goal_id,
+                normalized_objective: "Deploy the application".to_string(),
+                assumptions: Vec::new(),
+                constraints: vec!["Do not choose a provider without user input".to_string()],
+                ambiguities: vec!["Target provider is unknown".to_string()],
+                required_questions: vec!["Which deployment provider should be used?".to_string()],
+                risks: vec![crate::plan_review::IntentRisk {
+                    code: "provider_choice".to_string(),
+                    severity: crate::plan_review::IntentRiskSeverity::High,
+                    description: "Provider choice changes the implementation".to_string(),
+                    mitigation: "Ask the user before planning".to_string(),
+                }],
+                acceptance_signals: vec!["The selected provider is recorded".to_string()],
+                decision: IntentFoldDecision::NeedsUser,
+                summary: "Deployment provider requires a user decision".to_string(),
+            };
+            Ok(IntentFoldSubmission {
+                raw_output: serde_json::to_string(&verdict)?,
+                verdict,
+                analyst: PhaseExecutionIdentity {
+                    execution_id: "intent_fold_execution".to_string(),
+                    phase_session_id: "intent_fold_phase".to_string(),
+                    backend: PhaseExecutionBackend::WorkerSession,
+                    agent_id: Some(WorkerKind::OpencodeSession.as_str().to_string()),
+                    provider_id: Some("openai".to_string()),
+                    model_id: Some("gpt-planner".to_string()),
+                    actual_session_id: Some("intent_fold_session".to_string()),
+                },
+                artifact_path: None,
+            })
+        });
+        let phase_runtime = PhaseRuntime {
+            routes: PhaseRouteTable::opencode_only(crate::phase_routing::OpenCodeModelProfiles {
+                planner: "openai/gpt-planner".to_string(),
+                executor: "deepseek/flash".to_string(),
+                reviewer: "openai/gpt-reviewer".to_string(),
+            })?,
+            inventory: LiveModelInventory::default(),
+            current_model: None,
+            planner: None,
+            intent_fold_hook: Some(intent_fold_hook),
+            planner_hook: Some(planner_hook),
+            plan_critic_hook: None,
+            plan_revision_hook: None,
+            require_plan_approval: false,
+            max_plan_revisions: 2,
+            broker: None,
+            broker_factory: None,
+        };
+
+        let error = build_approved_plan_graph(
+            &mut goal,
+            &scope,
+            &[],
+            temp_dir.path(),
+            &store,
+            "session-intent-fold",
+            &None,
+            None,
+            &phase_runtime,
+        )
+        .expect_err("IntentFold must stop before planning");
+
+        assert!(error.to_string().contains("requires user input"));
+        assert_eq!(goal.status, GoalStatus::NeedsUser);
+        assert!(!*planner_called.lock().expect("planner flag poisoned"));
+        assert!(
+            store
+                .artifact_dir(&goal.id)
+                .join("intent-fold-receipt.json")
+                .is_file()
+        );
         Ok(())
     }
 
@@ -9428,6 +9606,7 @@ mod tests {
             },
             current_model: Some(current_model),
             planner: Some(planner_identity),
+            intent_fold_hook: None,
             planner_hook: None,
             plan_critic_hook: Some(critic_hook),
             plan_revision_hook: Some(revision_hook),

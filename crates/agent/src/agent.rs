@@ -65,14 +65,14 @@ use gearbox_agent::phase_routing::{
 };
 use gearbox_agent::plan_graph::PhaseProfile;
 use gearbox_agent::plan_review::{
-    PhaseExecutionBackend, PhaseExecutionIdentity, PlanCriticVerdict,
+    IntentFoldVerdict, PhaseExecutionBackend, PhaseExecutionIdentity, PlanCriticVerdict,
 };
 use gearbox_agent::runtime::{
     CoordinatorReview, CoordinatorReviewHook, CoordinatorReviewInput, DEFAULT_MAX_ITERATIONS,
     DEFAULT_MAX_PLAN_REVISIONS, DEFAULT_MAX_PROVIDER_UNKNOWN_STREAK, DEFAULT_MAX_RUNTIME_MINUTES,
-    Orchestrator, PhaseRuntime, PlanCriticHook, PlanCriticInput, PlanCriticSubmission,
-    PlanRevisionHook, PlanRevisionInput, PlanRevisionSubmission, PlannerHook, PlannerInput,
-    PlannerSubmission, RunOptions,
+    IntentFoldHook, IntentFoldInput, IntentFoldSubmission, Orchestrator, PhaseRuntime,
+    PlanCriticHook, PlanCriticInput, PlanCriticSubmission, PlanRevisionHook, PlanRevisionInput,
+    PlanRevisionSubmission, PlannerHook, PlannerInput, PlannerSubmission, RunOptions,
 };
 use gearbox_agent::state::{
     ContinuationStatus, CoordinatorModel, EventKind, Scope, StateStore, Task as GearTask,
@@ -2953,29 +2953,34 @@ impl NativeAgentConnection {
             drop(plan_critic_tx);
             drop(plan_revision_tx);
 
-            let (planner_identity, planner_hook, coordinator_brief) = if planner_uses_opencode {
-                let runner = opencode_phase_runner.clone();
-                (
-                    None,
-                    Some(Arc::new(move |input| runner.plan(input)) as PlannerHook),
-                    None,
-                )
-            } else {
-                (
-                    Some(phase_execution_identity_for_model(
-                        "planner",
-                        &cancellation_session_id.to_string(),
-                        &phase_models.planner_model,
-                    )),
-                    None,
-                    generate_gear_coordinator_brief(
-                        Some(phase_models.planner_model.clone()),
-                        &request,
-                        cx,
+            let (planner_identity, intent_fold_hook, planner_hook, coordinator_brief) =
+                if planner_uses_opencode {
+                    let intent_runner = opencode_phase_runner.clone();
+                    let planner_runner = opencode_phase_runner.clone();
+                    (
+                        None,
+                        Some(Arc::new(move |input| intent_runner.fold_intent(input))
+                            as IntentFoldHook),
+                        Some(Arc::new(move |input| planner_runner.plan(input)) as PlannerHook),
+                        None,
                     )
-                    .await,
-                )
-            };
+                } else {
+                    (
+                        Some(phase_execution_identity_for_model(
+                            "planner",
+                            &cancellation_session_id.to_string(),
+                            &phase_models.planner_model,
+                        )),
+                        None,
+                        None,
+                        generate_gear_coordinator_brief(
+                            Some(phase_models.planner_model.clone()),
+                            &request,
+                            cx,
+                        )
+                        .await,
+                    )
+                };
             let run_cancellation_token = cancellation_token.clone();
             let run_task_manager_control = task_manager_control.clone();
             let run_task_manager = task_manager.clone();
@@ -2985,6 +2990,7 @@ impl NativeAgentConnection {
                 inventory: phase_models.inventory.clone(),
                 current_model: phase_models.current_model.clone(),
                 planner: planner_identity,
+                intent_fold_hook,
                 planner_hook,
                 plan_critic_hook: Some(plan_critic_hook),
                 plan_revision_hook: Some(plan_revision_hook),
@@ -3591,6 +3597,28 @@ impl GearOpenCodePhaseRunner {
         })
     }
 
+    fn fold_intent(&self, input: IntentFoldInput) -> Result<IntentFoldSubmission> {
+        let prompt = gear_opencode_intent_fold_prompt(&input)?;
+        let task_id = format!("intent_fold_{}", input.goal_id);
+        let output = self.run(
+            &input.route_decision,
+            &input.goal_id,
+            &format!("pending_{}", input.goal_id),
+            0,
+            &task_id,
+            GearTaskKind::Spec,
+            input.scope,
+            prompt,
+        )?;
+        let verdict = IntentFoldVerdict::parse(&output.raw_output)?;
+        Ok(IntentFoldSubmission {
+            verdict,
+            analyst: output.execution_identity,
+            raw_output: output.raw_output,
+            artifact_path: Some(output.artifact_path),
+        })
+    }
+
     fn plan(&self, input: PlannerInput) -> Result<PlannerSubmission> {
         let prompt = gear_opencode_planner_prompt(&input)?;
         let task_id = format!("planner_{}", input.goal_id);
@@ -3662,11 +3690,27 @@ impl GearOpenCodePhaseRunner {
 }
 
 fn gear_opencode_planner_prompt(input: &PlannerInput) -> Result<String> {
+    let intent_fold = input
+        .intent_fold
+        .as_ref()
+        .map(serde_json::to_string_pretty)
+        .transpose()?
+        .unwrap_or_else(|| "none".to_string());
     Ok(format!(
-        "You are Gear's read-only planner. Return exactly one PlanGraphDraft JSON object with no markdown fence or prose. The draft must contain objective, must_have, must_not_have, topology_lock, tasks, and final_acceptance. Every task must define task_id, title, goal, deliverable, dependencies, parallel_wave, scope, required_capabilities, preferred_phase_profile, must_do, must_not_do, references, test, qa, artifacts, commit_boundary, and completion_predicates. Dependencies must point to earlier waves. TDD tasks must use the same RED and GREEN command. Include happy and failure QA evidence paths. Do not write code.\n\nGoal:\n{}\n\nScope:\n{}\n\nVerification commands:\n{}",
+        "You are Gear's read-only planner. Return exactly one PlanGraphDraft JSON object with no markdown fence or prose. The draft must contain objective, must_have, must_not_have, topology_lock, tasks, and final_acceptance. Every task must define task_id, title, goal, deliverable, dependencies, parallel_wave, scope, required_capabilities, preferred_phase_profile, must_do, must_not_do, references, test, qa, artifacts, commit_boundary, and completion_predicates. Dependencies must point to earlier waves. TDD tasks must use the same RED and GREEN command. Include happy and failure QA evidence paths. Treat the sealed IntentFold receipt as a binding interpretation of the goal: preserve its constraints, mitigate its risks, and turn its acceptance signals into executable checks. Do not write code.\n\nGoal:\n{}\n\nIntentFold receipt:\n{}\n\nScope:\n{}\n\nVerification commands:\n{}",
         input.request,
+        intent_fold,
         serde_json::to_string_pretty(&input.scope)?,
         serde_json::to_string_pretty(&input.verification_commands)?,
+    ))
+}
+
+fn gear_opencode_intent_fold_prompt(input: &IntentFoldInput) -> Result<String> {
+    Ok(format!(
+        "You are Gear's Metis-style read-only intent analyst. Do not plan tasks and do not write code. Return exactly one IntentFoldVerdict JSON object with no markdown fence or prose. Required shape: {{\"schema_version\":1,\"goal_id\":\"exact goal id\",\"normalized_objective\":\"clear outcome\",\"assumptions\":[\"explicit inference\"],\"constraints\":[\"binding boundary\"],\"ambiguities\":[\"remaining ambiguity\"],\"required_questions\":[\"only questions that change the solution\"],\"risks\":[{{\"code\":\"stable_code\",\"severity\":\"low|medium|high\",\"description\":\"specific risk\",\"mitigation\":\"specific mitigation\"}}],\"acceptance_signals\":[\"observable result\"],\"decision\":\"ready|needs_user\",\"summary\":\"concise conclusion\"}}. Use ready only when required_questions is empty. Ask no question that repository inspection can answer.\n\nGoal id: {}\nRequest:\n{}\n\nScope:\n{}",
+        input.goal_id,
+        input.request,
+        serde_json::to_string_pretty(&input.scope)?,
     ))
 }
 
@@ -7981,6 +8025,7 @@ mod internal_tests {
             scope,
             verification_commands: vec!["echo verify".to_string()],
             route_decision: decision,
+            intent_fold: None,
         })?;
 
         assert_eq!(submission.draft, draft);
