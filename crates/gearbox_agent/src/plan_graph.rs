@@ -306,6 +306,27 @@ impl PlanGraph {
         Ok(runnable)
     }
 
+    /// Select the earliest dependency-ready wave up to the caller's worker
+    /// capacity. The returned order is stable, so a resumed runtime can
+    /// persist the same dispatch order without consulting a model.
+    pub fn runnable_wave(
+        &self,
+        completed: &HashSet<String>,
+        active: &HashSet<String>,
+        capacity: usize,
+    ) -> Result<Vec<&PlanTaskContract>> {
+        let capacity = capacity.max(1);
+        let runnable = self.runnable_tasks(completed, active)?;
+        let Some(first_wave) = runnable.first().map(|task| task.parallel_wave) else {
+            return Ok(Vec::new());
+        };
+        Ok(runnable
+            .into_iter()
+            .filter(|task| task.parallel_wave == first_wave)
+            .take(capacity)
+            .collect())
+    }
+
     pub fn closed_world_contract(&self) -> PlanTaskContract {
         let first = &self.draft.tasks[0];
         let mut contract = first.clone();
@@ -917,6 +938,13 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["node_a", "node_c"]
         );
+        let wave = graph.runnable_wave(&HashSet::new(), &HashSet::new(), 2)?;
+        assert_eq!(
+            wave.iter()
+                .map(|task| task.task_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["node_a", "node_b"]
+        );
         Ok(())
     }
 
@@ -962,10 +990,12 @@ mod tests {
         )?;
         let mut ledger =
             crate::state::PlanNodeRunLedger::from_plan("goal", "epoch", &graph)?;
-        assert!(ledger.mark("task_003", crate::state::PlanNodeRunStatus::Completed).is_ok());
-        assert!(ledger.validate().is_err());
+        assert!(ledger
+            .mark("task_003", crate::state::PlanNodeRunStatus::Completed)
+            .is_err());
 
         let node = ledger.node_mut("task_003")?;
+        node.status = crate::state::PlanNodeRunStatus::Completed;
         node.attempt = 1;
         node.green_evidence_paths.push("green.md".to_string());
         node.review_evidence_path = Some("review.md".to_string());
@@ -976,6 +1006,44 @@ mod tests {
         let path = store.write_plan_node_runs(&ledger)?;
         assert!(path.is_file());
         assert_eq!(store.read_plan_node_runs("goal")?, Some(ledger));
+        Ok(())
+    }
+
+    #[test]
+    fn final_verification_wave_receipt_is_typed_and_hash_bound() -> Result<()> {
+        let scope = Scope::new(vec!["src".to_string()], vec![".git".to_string()], 4);
+        let graph = PlanGraph::seal(
+            "goal",
+            1,
+            PlanSource::DeterministicFallback,
+            None,
+            deterministic_fallback_draft("graph", &scope, &[]),
+        )?;
+        let dimensions = [
+            crate::state::FinalVerificationDimension::PlanCompliance,
+            crate::state::FinalVerificationDimension::CodeQuality,
+            crate::state::FinalVerificationDimension::RealQa,
+            crate::state::FinalVerificationDimension::ScopeFidelity,
+        ]
+        .into_iter()
+        .map(|dimension| crate::state::FinalVerificationResult {
+            dimension,
+            passed: true,
+            summary: "evidence-backed pass".to_string(),
+            evidence_paths: vec!["evidence.md".to_string()],
+            reviewer_execution_ids: vec!["reviewer-1".to_string()],
+        })
+        .collect();
+        let receipt = crate::state::FinalVerificationWaveReceipt::seal(
+            "goal",
+            "epoch",
+            &graph,
+            dimensions,
+        )?;
+        receipt.validate(&graph)?;
+        let mut tampered = receipt.clone();
+        tampered.plan_hash = "f".repeat(64);
+        assert!(tampered.validate(&graph).is_err());
         Ok(())
     }
 }

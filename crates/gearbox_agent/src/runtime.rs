@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     fs as std_fs,
     path::PathBuf,
     sync::Arc,
@@ -26,7 +27,8 @@ use crate::plan_review::{
 };
 use crate::product;
 use crate::state::{
-    Budget, ContinuationStatus, CoordinatorModel, Event, EventKind, Goal, GoalEpochEventKind,
+    Budget, ContinuationStatus, CoordinatorModel, Event, EventKind, FinalVerificationDimension,
+    FinalVerificationResult, FinalVerificationWaveReceipt, Goal, GoalEpochEventKind,
     GoalRunLeaseGuard, GoalStatus, PlanNodeRunLedger, PlanNodeRunStatus, Scope, Session,
     SettledBudgetUsage, StateStore, Task, TaskInputs, TaskKind, TaskOutputs, TaskStatus,
     WorkLineage, event, id_timestamp, timestamp,
@@ -1038,6 +1040,7 @@ impl Orchestrator {
         let mut after_diff = before_diff.clone();
         let mut scope_check = check_scope(&after_diff, &scope);
         let mut worker_result = None;
+        let mut final_worker_outcome = None;
         let mut verification_results = Vec::new();
         let mut last_verification_path = None;
         let mut final_evaluation = None;
@@ -1106,6 +1109,7 @@ impl Orchestrator {
 
         let mut completed_plan_tasks = plan_node_runs.completed_task_ids();
         let mut current_plan_task_id: Option<String> = None;
+        let mut scheduled_plan_wave: VecDeque<String> = VecDeque::new();
 
         #[allow(clippy::explicit_counter_loop)]
         for iteration in 1..=max_iterations {
@@ -1124,11 +1128,32 @@ impl Orchestrator {
                 task_id
             } else {
                 let active = plan_node_runs.active_task_ids();
-                let next = plan_graph
-                    .runnable_tasks(&completed_plan_tasks, &active)?
-                    .into_iter()
-                    .next()
-                    .map(|task| task.task_id.clone());
+                if scheduled_plan_wave.is_empty() {
+                    let wave = plan_graph.runnable_wave(
+                        &completed_plan_tasks,
+                        &active,
+                        options.worker.max_parallel_workers,
+                    )?;
+                    if !wave.is_empty() {
+                        let wave_ids = wave
+                            .iter()
+                            .map(|task| task.task_id.clone())
+                            .collect::<Vec<_>>();
+                        scheduled_plan_wave.extend(wave_ids.iter().cloned());
+                        store.append_goal_epoch_event(
+                            &goal_id,
+                            &epoch_id,
+                            &format!("{epoch_id}.plan-wave.{}", iteration),
+                            GoalEpochEventKind::PhaseCompleted,
+                            json!({
+                                "phase": "plan_wave_scheduled",
+                                "capacity": options.worker.max_parallel_workers.max(1),
+                                "task_ids": wave_ids,
+                            }),
+                        )?;
+                    }
+                }
+                let next = scheduled_plan_wave.pop_front();
                 let Some(task_id) = next else {
                     if completed_plan_tasks.len() == plan_graph.draft.tasks.len() {
                         break;
@@ -1155,6 +1180,7 @@ impl Orchestrator {
                         .and_then(|review| review.route_hint.as_deref())
                 })
                 .or(initial_plan_route_hint);
+            let worker_route_is_review = worker_route_hint == Some("review");
             let worker_phase =
                 worker_phase_for_route_hint(&initial_preferred_phase, worker_route_hint);
             let phase_decision = phase_runtime.routes.resolve_for_worker(
@@ -1299,6 +1325,11 @@ impl Orchestrator {
                 let node = plan_node_runs.node_mut(&plan_task_id)?;
                 node.attempt = node.attempt.saturating_add(1);
                 node.worker_task_id = Some(worker_task_id.clone());
+                if first_plan_attempt {
+                    node.implementation_task_id = Some(worker_task_id.clone());
+                } else if worker_route_hint == Some("review") {
+                    node.review_task_id = Some(worker_task_id.clone());
+                }
                 node.status = PlanNodeRunStatus::Running;
                 node.updated_at = timestamp();
                 plan_node_runs.updated_at = timestamp();
@@ -1711,14 +1742,21 @@ impl Orchestrator {
                         options.cancellation_token.as_ref(),
                     )?
                 } else {
-                    (Vec::new(), iteration_worker_result.status == WorkerStatus::Succeeded)
+                    (
+                        Vec::new(),
+                        iteration_worker_result.status == WorkerStatus::Succeeded
+                            || (iteration_worker_result.status == WorkerStatus::Skipped
+                                && !options.worker.require_worker),
+                    )
                 };
             {
                 let node = plan_node_runs.node_mut(&plan_task_id)?;
-                node.green_evidence_paths = plan_green_paths
-                    .iter()
-                    .map(|path| path.to_string_lossy().to_string())
-                    .collect();
+                if !plan_green_paths.is_empty() {
+                    node.green_evidence_paths = plan_green_paths
+                        .iter()
+                        .map(|path| path.to_string_lossy().to_string())
+                        .collect();
+                }
                 if plan_green_passed {
                     node.status = PlanNodeRunStatus::GreenVerified;
                 } else if iteration_worker_result.status != WorkerStatus::Succeeded {
@@ -1859,6 +1897,7 @@ impl Orchestrator {
                 }),
             )?;
             worker_result = Some(iteration_worker_result);
+            final_worker_outcome = Some(iteration_worker_outcome.clone());
             worker_output_history.push(iteration_worker_outcome.summary.clone());
             if let Some(finished_at) = worker_task_record.finished_at.as_deref()
                 && let Some(notification) = CompletionNotifier::build_notification(
@@ -2138,6 +2177,29 @@ impl Orchestrator {
                 reviewed_execution_id.as_deref(),
                 &worker_task_record.attempts,
             );
+            let node_review_pending = phase_runtime.require_plan_approval
+                && plan_graph.draft.tasks.len() > 1
+                && !worker_route_is_review
+                && plan_green_passed
+                && verification_passed
+                && worker_result
+                    .as_ref()
+                    .is_some_and(|result| result.status == WorkerStatus::Succeeded)
+                && plan_node_runs
+                    .nodes
+                    .iter()
+                    .find(|node| node.task_id == plan_task_id)
+                    .is_some_and(|node| node.review_evidence_path.is_none());
+            if node_review_pending && iteration < max_iterations {
+                evaluation = GoalEvaluation {
+                    status: GoalStatus::Running,
+                    should_continue: true,
+                    summary: format!(
+                        "Plan node {plan_task_id} passed GREEN; a fresh node reviewer must run before completion."
+                    ),
+                    route_hint_override: Some("review".to_string()),
+                };
+            }
             if evaluation.status == GoalStatus::Complete {
                 if let Some(receipt_failure) = verify_broker_receipts_for_goal(
                     phase_runtime.broker.as_deref(),
@@ -2260,7 +2322,19 @@ impl Orchestrator {
             if node_review_passed {
                 let node = plan_node_runs.node_mut(&plan_task_id)?;
                 node.status = PlanNodeRunStatus::Reviewed;
-                node.review_evidence_path = Some(review_path.to_string_lossy().to_string());
+                node.review_evidence_path = review_gate
+                    .results
+                    .iter()
+                    .find_map(|result| {
+                        result
+                            .reviewer_evidence
+                            .as_ref()
+                            .and_then(|evidence| evidence.artifact_path.clone())
+                    })
+                    .or_else(|| Some(review_path.to_string_lossy().to_string()));
+                if worker_route_is_review {
+                    node.review_task_id = Some(worker_task_id.clone());
+                }
                 node.status = PlanNodeRunStatus::Completed;
                 node.updated_at = timestamp();
                 plan_node_runs.updated_at = timestamp();
@@ -2305,21 +2379,76 @@ impl Orchestrator {
             before_diff = after_diff.clone();
         }
 
-        let final_evaluation = final_evaluation.context("Gear loop did not evaluate the goal")?;
+        let mut final_evaluation =
+            final_evaluation.context("Gear loop did not evaluate the goal")?;
         let worker_result = worker_result.context("Gear loop did not produce a worker result")?;
+        let final_worker_outcome =
+            final_worker_outcome.context("Gear loop did not produce worker outcome evidence")?;
         let final_task_id = goal.current_task_id.clone();
+        let final_wave_receipt = build_final_verification_wave(
+            &goal_id,
+            &epoch_id,
+            &plan_graph,
+            &plan_node_runs,
+            &worker_result,
+            &final_worker_outcome,
+            &verification_results,
+            last_verification_path.as_deref(),
+            &scope_check,
+        )?;
+        if final_evaluation.status == GoalStatus::Complete && !final_wave_receipt.passed {
+            final_evaluation = GoalEvaluation {
+                status: GoalStatus::NeedsUser,
+                should_continue: false,
+                summary: format!(
+                    "Final Verification Wave did not pass: {}",
+                    final_wave_receipt
+                        .dimensions
+                        .iter()
+                        .filter(|result| !result.passed)
+                        .map(|result| format!("{:?}", result.dimension))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                route_hint_override: None,
+            };
+        }
         goal.status = final_evaluation.status;
         goal.current_task_id = None;
         goal.updated_at = timestamp();
         goal.summary = final_evaluation.summary;
 
-        let final_report = product::final_report(
+        let final_wave_path = store.write_artifact(
+            &goal_id,
+            "final-verification-wave.json",
+            &format!(
+                "{}\n",
+                serde_json::to_string_pretty(&final_wave_receipt)?
+            ),
+        )?;
+        store.append_goal_epoch_event(
+            &goal_id,
+            &epoch_id,
+            &format!("{epoch_id}.final-verification-wave.completed"),
+            GoalEpochEventKind::PhaseCompleted,
+            json!({
+                "phase": "final_verification_wave",
+                "passed": final_wave_receipt.passed,
+                "receipt_hash": final_wave_receipt.receipt_hash,
+                "receipt_path": final_wave_path.to_string_lossy(),
+            }),
+        )?;
+        let final_report = format!(
+            "{}\n\n{}",
+            product::final_report(
             &goal,
             &tasks,
             &worker_result,
             &after_diff,
             &scope_check,
             &verification_results,
+            ),
+            final_verification_wave_markdown(&final_wave_receipt),
         );
         let final_report_path = store.write_artifact(&goal_id, "final-report.md", &final_report)?;
         let mut strategist_prior_execution_ids = Vec::new();
@@ -2906,6 +3035,7 @@ fn build_approved_plan_graph_inner(
             planner_receipt_hash: planner_receipt.receipt_hash.clone(),
             verifier_report_hash: verifier.report_hash.clone(),
             critic_receipt_hash: None,
+            secondary_critic_receipt_hash: None,
             revisions_used: revisions_performed,
             updated_at: timestamp(),
         };
@@ -3049,6 +3179,156 @@ fn build_approved_plan_graph_inner(
 
         match critic_receipt.verdict.decision {
             PlanCriticDecision::Approve => {
+                if plan.draft.tasks.len() > 1 {
+                    let oracle_decision = phase_runtime.routes.resolve(
+                        &PhaseProfile::PlanCritic,
+                        &phase_runtime.inventory,
+                        phase_runtime.current_model.as_ref(),
+                    )?;
+                    check_phase_terminal_state(&oracle_decision)
+                        .context("independent plan review phase terminal state check failed")?;
+                    let oracle_ordinal = plan.revision.saturating_mul(10).saturating_add(3);
+                    let oracle_decision_path = store.write_phase_route_decision(
+                        &goal.id,
+                        oracle_ordinal,
+                        &oracle_decision,
+                    )?;
+                    let oracle_identity = PhaseExecutionIdentity {
+                        execution_id: format!("plan_oracle:{}:{}", goal.id, plan.plan_id),
+                        phase_session_id: format!(
+                            "plan_oracle:{}:{}",
+                            goal.id, plan.revision
+                        ),
+                        backend: PhaseExecutionBackend::DeterministicRules,
+                        agent_id: None,
+                        provider_id: None,
+                        model_id: None,
+                        actual_session_id: None,
+                    };
+                    let oracle_budget_key = format!("plan-oracle.{}", plan.revision);
+                    let oracle_budget = reserve_planning_phase_budget(
+                        goal,
+                        store,
+                        budget_context,
+                        &oracle_budget_key,
+                    )?;
+                    let oracle_submission_result = run_phase_via_broker(
+                        phase_runtime.broker.as_deref(),
+                        phase_runtime.broker_factory.as_deref(),
+                        &oracle_decision,
+                        &goal.id,
+                        &plan.plan_id,
+                        plan.revision,
+                        "plan_oracle",
+                        &oracle_identity,
+                        || {
+                            critic_hook(PlanCriticInput {
+                                request: goal.request.clone(),
+                                plan: plan.clone(),
+                                planner_receipt: planner_receipt.clone(),
+                                verifier_report: verifier.clone(),
+                                route_decision: oracle_decision.clone(),
+                            })
+                            .context("independent plan review hook failed")
+                        },
+                    );
+                    settle_planning_phase_budget(
+                        goal,
+                        store,
+                        budget_context,
+                        oracle_budget.as_deref(),
+                        &oracle_budget_key,
+                    )?;
+                    let oracle_submission = oracle_submission_result?;
+                    validate_phase_execution_identity(
+                        &oracle_decision,
+                        &oracle_submission.reviewer,
+                    )?;
+                    if seen_phase_identities
+                        .iter()
+                        .any(|seen| !oracle_submission.reviewer.is_independent_from(seen))
+                    {
+                        bail!(
+                            "independent plan review must use a fresh execution identity and session"
+                        );
+                    }
+                    let oracle_raw_path = store.write_plan_review_text(
+                        &goal.id,
+                        plan.revision,
+                        "oracle-output",
+                        &oracle_submission.raw_output,
+                    )?;
+                    let oracle_artifact_path = oracle_submission.artifact_path.clone();
+                    let oracle_receipt = PlanCriticReceipt::seal(
+                        &plan,
+                        &planner_receipt,
+                        &planner_raw_output,
+                        &verifier,
+                        oracle_submission.reviewer.clone(),
+                        oracle_submission.verdict,
+                        &oracle_submission.raw_output,
+                        oracle_artifact_path.clone().or_else(|| {
+                            Some(oracle_raw_path.to_string_lossy().to_string())
+                        }),
+                        timestamp(),
+                    )?;
+                    let oracle_receipt_path = store.write_plan_review_text(
+                        &goal.id,
+                        plan.revision,
+                        "oracle-receipt",
+                        &format!("{}\n", serde_json::to_string_pretty(&oracle_receipt)?),
+                    )?;
+                    if oracle_receipt.verdict.decision != PlanCriticDecision::Approve {
+                        goal.status = GoalStatus::NeedsUser;
+                        goal.summary = format!(
+                            "Independent plan review did not approve revision {}: {}",
+                            plan.revision, oracle_receipt.verdict.summary
+                        );
+                        goal.updated_at = timestamp();
+                        store.write_goal(goal)?;
+                        bail!("{}", goal.summary);
+                    }
+                    approval_state.secondary_critic_receipt_hash =
+                        Some(oracle_receipt.receipt_hash.clone());
+                    seen_phase_identities.push(oracle_submission.reviewer.clone());
+                    let oracle_route_receipt = phase_route_receipt_for_identity(
+                        &oracle_decision,
+                        oracle_ordinal,
+                        &goal.id,
+                        &plan,
+                        &oracle_submission.reviewer,
+                        Some("plan_oracle"),
+                        oracle_artifact_path.as_deref(),
+                    )?;
+                    let oracle_route_receipt_path = store.write_phase_route_receipt(
+                        &goal.id,
+                        oracle_ordinal,
+                        &oracle_route_receipt,
+                    )?;
+                    append_event(
+                        store,
+                        event_sink,
+                        event(
+                            session_id,
+                            Some(&goal.id),
+                            None,
+                            EventKind::PlanReviewApproved,
+                            format!(
+                                "Independent plan review approved revision {}",
+                                plan.revision
+                            ),
+                            json!({
+                                "plan_id": plan.plan_id,
+                                "plan_hash": plan.plan_hash,
+                                "revision": plan.revision,
+                                "review_role": "oracle",
+                                "receipt_path": oracle_receipt_path.to_string_lossy(),
+                                "route_decision_path": oracle_decision_path.to_string_lossy(),
+                                "route_receipt_path": oracle_route_receipt_path.to_string_lossy(),
+                            }),
+                        ),
+                    )?;
+                }
                 approval_state.status = PlanApprovalStatus::Approved;
                 approval_state.updated_at = timestamp();
                 store.write_plan_approval_state(&approval_state)?;
@@ -3928,6 +4208,132 @@ fn run_plan_green_evidence(
         passed &= result.success;
     }
     Ok((paths, passed))
+}
+
+fn final_verification_wave_markdown(
+    receipt: &FinalVerificationWaveReceipt,
+) -> String {
+    let mut markdown = format!(
+        "## Final Verification Wave\n\nReceipt hash: {}\n\nPassed: {}\n\n",
+        receipt.receipt_hash, receipt.passed
+    );
+    for result in &receipt.dimensions {
+        markdown.push_str(&format!(
+            "- {:?}: {} — {}\n  - evidence: {}\n  - reviewer executions: {}\n",
+            result.dimension,
+            if result.passed { "pass" } else { "fail" },
+            result.summary,
+            result.evidence_paths.join(", "),
+            result.reviewer_execution_ids.join(", "),
+        ));
+    }
+    markdown
+}
+
+fn build_final_verification_wave(
+    goal_id: &str,
+    epoch_id: &str,
+    plan: &PlanGraph,
+    node_runs: &PlanNodeRunLedger,
+    worker_result: &WorkerResult,
+    worker_outcome: &WorkerOutcome,
+    verification_results: &[ShellCommandResult],
+    verification_path: Option<&std::path::Path>,
+    scope_check: &crate::tools::ScopeCheck,
+) -> Result<FinalVerificationWaveReceipt> {
+    let all_nodes_completed = node_runs
+        .nodes
+        .iter()
+        .all(|node| node.status == PlanNodeRunStatus::Completed);
+    let node_evidence = node_runs
+        .nodes
+        .iter()
+        .flat_map(|node| {
+            node.review_evidence_path
+                .iter()
+                .chain(node.green_evidence_paths.iter())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let node_evidence = if node_evidence.is_empty() {
+        vec!["runtime-plan-node-ledger".to_string()]
+    } else {
+        node_evidence
+    };
+    let node_reviewer_ids = node_runs
+        .nodes
+        .iter()
+        .filter_map(|node| {
+            node.review_task_id.clone().or_else(|| {
+                (node_runs.nodes.len() == 1)
+                    .then(|| node.worker_task_id.clone())
+                    .flatten()
+            })
+        })
+        .collect::<Vec<_>>();
+    let worker_evidence = vec![
+        worker_result.result_path.to_string_lossy().to_string(),
+        worker_result.outcome_path.to_string_lossy().to_string(),
+    ];
+    let worker_reviewer_id = worker_outcome
+        .session_id
+        .clone()
+        .unwrap_or_else(|| "worker-outcome".to_string());
+    let qa_evidence = verification_path
+        .map(|path| vec![path.to_string_lossy().to_string()])
+        .unwrap_or_default();
+    let scope_evidence = vec![worker_result.result_path.to_string_lossy().to_string()];
+    let dimensions = vec![
+        FinalVerificationResult {
+            dimension: FinalVerificationDimension::PlanCompliance,
+            passed: all_nodes_completed
+                && node_evidence.len() >= node_runs.nodes.len()
+                && (node_runs.nodes.len() == 1
+                    || node_reviewer_ids.len() >= node_runs.nodes.len()),
+            summary: "Every PlanGraph node has terminal execution, GREEN, and review evidence."
+                .to_string(),
+            evidence_paths: node_evidence.clone(),
+            reviewer_execution_ids: if node_reviewer_ids.is_empty() {
+                vec!["runtime-plan-reducer".to_string()]
+            } else {
+                node_reviewer_ids.clone()
+            },
+        },
+        FinalVerificationResult {
+            dimension: FinalVerificationDimension::CodeQuality,
+            passed: worker_result.status == WorkerStatus::Succeeded,
+            summary: "The final worker result is successful and has a persisted outcome chain."
+                .to_string(),
+            evidence_paths: if worker_evidence.is_empty() {
+                vec!["runtime-worker-result".to_string()]
+            } else {
+                worker_evidence
+            },
+            reviewer_execution_ids: vec![worker_reviewer_id.clone()],
+        },
+        FinalVerificationResult {
+            dimension: FinalVerificationDimension::RealQa,
+            passed: !verification_results.is_empty()
+                && verification_results.iter().all(|result| result.success),
+            summary: "Gear-owned verification commands all passed.".to_string(),
+            evidence_paths: if qa_evidence.is_empty() {
+                vec!["runtime-verification".to_string()]
+            } else {
+                qa_evidence
+            },
+            reviewer_execution_ids: vec![worker_reviewer_id.clone()],
+        },
+        FinalVerificationResult {
+            dimension: FinalVerificationDimension::ScopeFidelity,
+            passed: !scope_check.max_files_exceeded
+                && scope_check.forbidden_touches.is_empty()
+                && scope_check.outside_allowed_paths.is_empty(),
+            summary: "The final diff remains inside the approved scope.".to_string(),
+            evidence_paths: scope_evidence,
+            reviewer_execution_ids: vec!["runtime-scope-check".to_string()],
+        },
+    ];
+    FinalVerificationWaveReceipt::seal(goal_id, epoch_id, plan, dimensions)
 }
 
 fn run_coordinator_review(
@@ -7585,6 +7991,10 @@ mod tests {
         assert!(epoch_events.iter().any(|event| {
             event.kind == GoalEpochEventKind::PhaseCompleted
                 && event.payload.get("phase") == Some(&json!("worker"))
+        }));
+        assert!(epoch_events.iter().any(|event| {
+            event.kind == GoalEpochEventKind::PhaseCompleted
+                && event.payload.get("phase") == Some(&json!("plan_wave_scheduled"))
         }));
         assert!(epoch_events.iter().any(|event| {
             event.kind == GoalEpochEventKind::PhaseCompleted

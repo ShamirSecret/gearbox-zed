@@ -362,6 +362,52 @@ impl PlanNodeRunStatus {
             Self::Completed | Self::Failed | Self::NeedsUser | Self::Cancelled
         )
     }
+
+    fn can_transition_to(&self, next: &Self) -> bool {
+        match self {
+            Self::Pending => matches!(next, Self::Runnable | Self::NeedsUser | Self::Cancelled),
+            Self::Runnable => {
+                matches!(next, Self::Running | Self::NeedsUser | Self::Cancelled)
+            }
+            Self::Running => matches!(
+                next,
+                Self::RedVerified
+                    | Self::Implemented
+                    | Self::GreenVerified
+                    | Self::Reviewed
+                    | Self::Completed
+                    | Self::Failed
+                    | Self::NeedsUser
+                    | Self::Cancelled
+            ),
+            Self::RedVerified => matches!(
+                next,
+                Self::Running
+                    | Self::Implemented
+                    | Self::GreenVerified
+                    | Self::Failed
+                    | Self::NeedsUser
+                    | Self::Cancelled
+            ),
+            Self::Implemented => matches!(
+                next,
+                Self::Running
+                    | Self::GreenVerified
+                    | Self::Failed
+                    | Self::NeedsUser
+                    | Self::Cancelled
+            ),
+            Self::GreenVerified => matches!(
+                next,
+                Self::Reviewed | Self::Completed | Self::Failed | Self::NeedsUser | Self::Cancelled
+            ),
+            Self::Reviewed => matches!(
+                next,
+                Self::Completed | Self::Failed | Self::NeedsUser | Self::Cancelled
+            ),
+            Self::Completed | Self::Failed | Self::NeedsUser | Self::Cancelled => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -377,6 +423,10 @@ pub struct PlanNodeRun {
     pub status: PlanNodeRunStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub implementation_task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_task_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub red_evidence_path: Option<String>,
     #[serde(default)]
@@ -431,6 +481,8 @@ impl PlanNodeRunLedger {
                     dependencies: task.dependencies.clone(),
                     status: PlanNodeRunStatus::Pending,
                     worker_task_id: None,
+                    implementation_task_id: None,
+                    review_task_id: None,
                     red_evidence_path: None,
                     green_evidence_paths: Vec::new(),
                     review_evidence_path: None,
@@ -465,7 +517,8 @@ impl PlanNodeRunLedger {
             if node.status == PlanNodeRunStatus::Completed
                 && (node.attempt == 0
                     || node.green_evidence_paths.is_empty()
-                    || node.review_evidence_path.is_none())
+                    || node.review_evidence_path.is_none()
+                    || (self.nodes.len() > 1 && node.review_task_id.is_none()))
             {
                 bail!(
                     "completed PlanNodeRun `{}` is missing attempt, GREEN, or review evidence",
@@ -518,10 +571,122 @@ impl PlanNodeRunLedger {
                 status
             );
         }
+        if node.status != status && !node.status.can_transition_to(&status) {
+            bail!(
+                "invalid PlanNodeRun transition `{task_id}` from {:?} to {:?}",
+                node.status,
+                status
+            );
+        }
         node.status = status;
         node.updated_at = timestamp();
         self.updated_at = timestamp();
         Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FinalVerificationDimension {
+    PlanCompliance,
+    CodeQuality,
+    RealQa,
+    ScopeFidelity,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalVerificationResult {
+    pub dimension: FinalVerificationDimension,
+    pub passed: bool,
+    pub summary: String,
+    pub evidence_paths: Vec<String>,
+    pub reviewer_execution_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalVerificationWaveReceipt {
+    pub schema_version: u32,
+    pub goal_id: String,
+    pub epoch_id: String,
+    pub plan_id: String,
+    pub plan_revision: usize,
+    pub plan_hash: String,
+    pub dimensions: Vec<FinalVerificationResult>,
+    pub passed: bool,
+    pub receipt_hash: String,
+    pub created_at: String,
+}
+
+pub const FINAL_VERIFICATION_WAVE_SCHEMA_VERSION: u32 = 1;
+
+impl FinalVerificationWaveReceipt {
+    pub fn seal(
+        goal_id: &str,
+        epoch_id: &str,
+        plan: &crate::plan_graph::PlanGraph,
+        dimensions: Vec<FinalVerificationResult>,
+    ) -> Result<Self> {
+        let mut receipt = Self {
+            schema_version: FINAL_VERIFICATION_WAVE_SCHEMA_VERSION,
+            goal_id: goal_id.to_string(),
+            epoch_id: epoch_id.to_string(),
+            plan_id: plan.plan_id.clone(),
+            plan_revision: plan.revision,
+            plan_hash: plan.plan_hash.clone(),
+            passed: dimensions.len() == 4 && dimensions.iter().all(|result| result.passed),
+            dimensions,
+            receipt_hash: String::new(),
+            created_at: timestamp(),
+        };
+        receipt.receipt_hash = receipt.expected_hash()?;
+        receipt.validate(plan)?;
+        Ok(receipt)
+    }
+
+    pub fn validate(&self, plan: &crate::plan_graph::PlanGraph) -> Result<()> {
+        if self.schema_version != FINAL_VERIFICATION_WAVE_SCHEMA_VERSION
+            || self.goal_id != plan.goal_id
+            || self.plan_id != plan.plan_id
+            || self.plan_revision != plan.revision
+            || self.plan_hash != plan.plan_hash
+            || self.receipt_hash != self.expected_hash()?
+        {
+            bail!("final verification wave receipt binding or hash is invalid");
+        }
+        let required = [
+            FinalVerificationDimension::PlanCompliance,
+            FinalVerificationDimension::CodeQuality,
+            FinalVerificationDimension::RealQa,
+            FinalVerificationDimension::ScopeFidelity,
+        ];
+        if self.dimensions.len() != required.len()
+            || required
+                .iter()
+                .any(|dimension| !self.dimensions.iter().any(|result| &result.dimension == dimension))
+        {
+            bail!("final verification wave must contain exactly four dimensions");
+        }
+        if self.passed != self.dimensions.iter().all(|result| result.passed) {
+            bail!("final verification wave passed flag disagrees with dimensions");
+        }
+        for result in &self.dimensions {
+            if result.summary.trim().is_empty()
+                || result.evidence_paths.is_empty()
+                || result.reviewer_execution_ids.is_empty()
+            {
+                bail!("final verification dimension is missing evidence or reviewer identity");
+            }
+        }
+        Ok(())
+    }
+
+    fn expected_hash(&self) -> Result<String> {
+        let mut payload = self.clone();
+        payload.receipt_hash.clear();
+        let bytes = serde_json::to_vec(&payload).context("failed to serialize final wave")?;
+        Ok(format!("{:x}", Sha256::digest(bytes)))
     }
 }
 
@@ -1516,6 +1681,33 @@ impl StateStore {
             || approval.critic_receipt_hash.as_deref() != Some(critic_receipt.receipt_hash.as_str())
         {
             bail!("approval manifest does not match its persisted receipt chain");
+        }
+        if plan_graph.draft.tasks.len() > 1 {
+            let oracle_hash = approval
+                .secondary_critic_receipt_hash
+                .as_deref()
+                .context("multi-node PlanGraph requires an independent plan review receipt")?;
+            let oracle_raw_output = fs::read_to_string(
+                review_dir.join(format!("revision-{revision:03}-oracle-output.txt")),
+            )
+            .context("multi-node PlanGraph is missing independent reviewer output")?;
+            let oracle_receipt_json = fs::read_to_string(
+                review_dir.join(format!("revision-{revision:03}-oracle-receipt.txt")),
+            )
+            .context("multi-node PlanGraph is missing independent reviewer receipt")?;
+            let oracle_receipt: crate::plan_review::PlanCriticReceipt =
+                serde_json::from_str(&oracle_receipt_json)
+                    .context("independent reviewer receipt is invalid JSON")?;
+            oracle_receipt.validate(
+                plan_graph,
+                &planner_receipt,
+                &planner_raw_output,
+                &verifier,
+                &oracle_raw_output,
+            )?;
+            if !oracle_receipt.approved() || oracle_hash != oracle_receipt.receipt_hash {
+                bail!("independent plan review receipt does not approve this PlanGraph");
+            }
         }
         Ok(())
     }

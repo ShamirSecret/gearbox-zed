@@ -377,6 +377,31 @@ pub struct BrokerLifecycleReceipt {
     pub receipt_hash: String,
 }
 
+fn declared_model_usage_evidence(
+    request: &BrokerPhaseRequest,
+) -> (Option<BrokerUsage>, Option<ModelSelectorId>) {
+    match &request.requested_model {
+        ModelAvailability::Available(model) => {
+            let qualified_model = format!("{}/{}", model.provider_id, model.model_id);
+            (
+                Some(BrokerUsage {
+                    requested_tokens: None,
+                    actual_tokens: None,
+                    model: qualified_model,
+                    duration_ms: None,
+                    cost_micros: None,
+                    cache_hit: None,
+                    unavailable_reason: Some(
+                        "backend completed without provider usage telemetry".to_string(),
+                    ),
+                }),
+                Some(model.clone()),
+            )
+        }
+        ModelAvailability::Unavailable(_) => (None, None),
+    }
+}
+
 impl BrokerLifecycleReceipt {
     /// Seal the receipt by computing and setting its cryptographic hash.
     ///
@@ -1090,6 +1115,7 @@ impl WorkerBroker {
         // Determine binding status from the identity's backend kind before
         // identity is consumed by the receipt struct.
         let backend_kind = identity.backend_kind;
+        let (usage, actual_model) = declared_model_usage_evidence(&phase_request);
 
         // Seal and write the first receipt.
         let receipt = BrokerLifecycleReceipt {
@@ -1100,9 +1126,9 @@ impl WorkerBroker {
             request: phase_request,
             outcome: BrokerOutcome::Completed,
             terminal_reason: None,
-            usage: None,
+            usage,
             permission_evidence: None,
-            actual_model: None,
+            actual_model,
             binding_status: binding_status_for_kind(backend_kind, true),
             receipt_hash: String::new(),
         }
@@ -1512,6 +1538,7 @@ impl WorkerBroker {
 
         // Write final receipt.
         if let (Some(identity), Some(phase_request)) = (&identity, &phase_request) {
+            let (usage, actual_model) = declared_model_usage_evidence(phase_request);
             let receipt = BrokerLifecycleReceipt {
                 schema_version: BROKER_SCHEMA_VERSION,
                 interaction_ordinal: ordinal,
@@ -1520,9 +1547,9 @@ impl WorkerBroker {
                 request: phase_request.clone(),
                 outcome: broker_outcome,
                 terminal_reason: Some(outcome.summary),
-                usage: None,
+                usage,
                 permission_evidence: None,
-                actual_model: None,
+                actual_model,
                 binding_status: binding_status_for_kind(identity.backend_kind, true),
                 receipt_hash: String::new(),
             }
@@ -1669,7 +1696,6 @@ impl WorkerBroker {
             .session_identity
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("no session identity"))?;
-
         BrokerLifecycleReceipt {
             schema_version: BROKER_SCHEMA_VERSION,
             interaction_ordinal: ordinal,
@@ -1706,6 +1732,7 @@ impl WorkerBroker {
             .session_identity
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("no session identity"))?;
+        let (usage, actual_model) = declared_model_usage_evidence(phase_request);
 
         BrokerLifecycleReceipt {
             schema_version: BROKER_SCHEMA_VERSION,
@@ -1715,9 +1742,9 @@ impl WorkerBroker {
             request: phase_request.clone(),
             outcome,
             terminal_reason,
-            usage: None,
+            usage,
             permission_evidence: None,
-            actual_model: None,
+            actual_model,
             binding_status: binding_status_for_kind(identity.backend_kind, true),
             receipt_hash: String::new(),
         }

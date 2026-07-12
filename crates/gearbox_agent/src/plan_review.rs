@@ -33,6 +33,8 @@ pub struct PlanApprovalState {
     pub verifier_report_hash: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub critic_receipt_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secondary_critic_receipt_hash: Option<String>,
     pub revisions_used: usize,
     pub updated_at: String,
 }
@@ -59,6 +61,14 @@ impl PlanApprovalState {
         )?;
         if let Some(critic_receipt_hash) = self.critic_receipt_hash.as_deref() {
             validate_sha256("plan approval critic receipt hash", critic_receipt_hash)?;
+        }
+        if let Some(secondary_critic_receipt_hash) =
+            self.secondary_critic_receipt_hash.as_deref()
+        {
+            validate_sha256(
+                "plan approval secondary critic receipt hash",
+                secondary_critic_receipt_hash,
+            )?;
         }
         if matches!(
             self.status,
@@ -1935,6 +1945,7 @@ mod tests {
             planner_receipt_hash: "2".repeat(64),
             verifier_report_hash: "3".repeat(64),
             critic_receipt_hash: Some("4".repeat(64)),
+            secondary_critic_receipt_hash: None,
             revisions_used: 1,
             updated_at: "2026-07-11T00:00:00Z".to_string(),
         };
@@ -1958,6 +1969,7 @@ mod tests {
             planner_receipt_hash: fixture.planner.receipt_hash.clone(),
             verifier_report_hash: fixture.verifier.report_hash.clone(),
             critic_receipt_hash: Some("4".repeat(64)),
+            secondary_critic_receipt_hash: None,
             revisions_used: 0,
             updated_at: "2026-07-11T00:00:00Z".to_string(),
         };
