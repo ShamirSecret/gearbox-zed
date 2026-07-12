@@ -2756,6 +2756,40 @@ pub fn worker_prompt(packet: &WorkerPacket) -> Result<String> {
         .unwrap_or_default();
     let model_metadata = worker_model_metadata(packet);
 
+    if packet.inputs.phase_route_locked && packet.inputs.plan_task.is_none() {
+        return Ok(format!(
+            r#"# Gear phase worker packet
+
+You are a `{}` phase worker controlled by Gearbox Gear. Treat this packet as the contract.
+
+```json
+{}
+```
+
+## Model metadata
+
+{}
+
+## Tool policy
+
+{}
+
+## Phase request
+
+{}
+
+{}
+Return only the response format required by the phase request. Do not add a generic worker report or markdown fence.
+"#,
+            packet.worker,
+            packet_json,
+            model_metadata,
+            packet.tools.to_markdown(),
+            packet.goal,
+            prompt_append
+        ));
+    }
+
     Ok(format!(
         r#"# Gear worker packet
 

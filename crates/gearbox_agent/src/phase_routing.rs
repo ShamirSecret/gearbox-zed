@@ -135,6 +135,27 @@ pub struct LiveModelInventory {
     pub models: Vec<ModelSelectorId>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenCodeModelProfiles {
+    pub planner: String,
+    pub executor: String,
+    pub reviewer: String,
+}
+
+impl OpenCodeModelProfiles {
+    pub fn validate(&self) -> Result<()> {
+        for (role, model) in [
+            ("planner", self.planner.as_str()),
+            ("executor", self.executor.as_str()),
+            ("reviewer", self.reviewer.as_str()),
+        ] {
+            ModelSelectorId::from_qualified("opencode_session", model)
+                .map_err(|error| anyhow::anyhow!("OpenCode {role} model is invalid: {error}"))?;
+        }
+        Ok(())
+    }
+}
+
 impl LiveModelInventory {
     pub fn validate(&self) -> Result<()> {
         for (index, model) in self.models.iter().enumerate() {
@@ -257,6 +278,37 @@ pub struct PhaseRouteReceipt {
 }
 
 impl PhaseRouteTable {
+    pub fn opencode_only(models: OpenCodeModelProfiles) -> Result<Self> {
+        models.validate()?;
+        let mut table = Self::legacy_defaults();
+        for profile in &mut table.profiles {
+            let model = match profile.phase {
+                PhaseProfile::Planner | PhaseProfile::StrategistNextGoal => {
+                    Some(models.planner.as_str())
+                }
+                PhaseProfile::ExecutorQuick
+                | PhaseProfile::ExecutorDeep
+                | PhaseProfile::Summarizer => Some(models.executor.as_str()),
+                PhaseProfile::PlanCritic
+                | PhaseProfile::ReviewerTask
+                | PhaseProfile::ReviewerFinal => Some(models.reviewer.as_str()),
+                PhaseProfile::Orchestrator => None,
+            };
+            let Some(model) = model else {
+                profile.source = PhaseRouteSource::BuiltIn;
+                continue;
+            };
+            profile.candidates = vec![PhaseRouteCandidate {
+                backend: PhaseBackend::Worker(WorkerKind::OpencodeSession),
+                model: PhaseModelBinding::BackendDeclared(model.to_string()),
+                command: None,
+            }];
+            profile.source = PhaseRouteSource::BuiltIn;
+        }
+        table.validate()?;
+        Ok(table)
+    }
+
     pub fn legacy_defaults() -> Self {
         let profile = |phase,
                        category,
@@ -1460,5 +1512,51 @@ mod tests {
 
         receipt.validate()?;
         Ok(())
+    }
+
+    #[test]
+    fn opencode_only_routes_every_model_phase_to_resident_sessions() -> Result<()> {
+        let table = PhaseRouteTable::opencode_only(OpenCodeModelProfiles {
+            planner: "openai/gpt-planner".to_string(),
+            executor: "deepseek/flash".to_string(),
+            reviewer: "openai/gpt-reviewer".to_string(),
+        })?;
+
+        for (phase, expected_model) in [
+            (PhaseProfile::Planner, "openai/gpt-planner"),
+            (PhaseProfile::PlanCritic, "openai/gpt-reviewer"),
+            (PhaseProfile::ExecutorQuick, "deepseek/flash"),
+            (PhaseProfile::ExecutorDeep, "deepseek/flash"),
+            (PhaseProfile::ReviewerTask, "openai/gpt-reviewer"),
+            (PhaseProfile::ReviewerFinal, "openai/gpt-reviewer"),
+            (PhaseProfile::StrategistNextGoal, "openai/gpt-planner"),
+            (PhaseProfile::Summarizer, "deepseek/flash"),
+        ] {
+            let decision = table.resolve(&phase, &LiveModelInventory::default(), None)?;
+            assert_eq!(decision.worker_kind, Some(WorkerKind::OpencodeSession));
+            assert_eq!(
+                decision.candidate.model,
+                PhaseModelBinding::BackendDeclared(expected_model.to_string())
+            );
+        }
+
+        let orchestrator = table.resolve(
+            &PhaseProfile::Orchestrator,
+            &LiveModelInventory::default(),
+            None,
+        )?;
+        assert_eq!(orchestrator.candidate.backend, PhaseBackend::Deterministic);
+        Ok(())
+    }
+
+    #[test]
+    fn opencode_only_requires_qualified_models() {
+        let error = PhaseRouteTable::opencode_only(OpenCodeModelProfiles {
+            planner: "unqualified".to_string(),
+            executor: "deepseek/flash".to_string(),
+            reviewer: "openai/gpt-reviewer".to_string(),
+        })
+        .expect_err("an unqualified OpenCode model must be rejected");
+        assert!(error.to_string().contains("planner"));
     }
 }

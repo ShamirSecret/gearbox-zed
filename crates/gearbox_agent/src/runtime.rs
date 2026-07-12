@@ -41,7 +41,7 @@ use crate::tools::{
 };
 use crate::worker_broker::{
     BrokerLifecycleReceipt, BrokerOutcome, BrokerPhaseRequest, LifecycleState, LifecycleStateName,
-    ModelAvailability, PhaseBrokerFactory, WorkerBroker,
+    PhaseBrokerFactory, WorkerBroker,
 };
 use crate::workers::{
     CategoryResolution, CategoryResolutionResult, FallbackRoute, WorkerCategory, WorkerConfig,
@@ -53,6 +53,8 @@ pub type EventSink = Arc<dyn Fn(&Event) + Send + Sync + 'static>;
 pub type CoordinatorReviewHook = Arc<
     dyn Fn(CoordinatorReviewInput) -> Result<Option<CoordinatorReview>> + Send + Sync + 'static,
 >;
+pub type PlannerHook =
+    Arc<dyn Fn(PlannerInput) -> Result<PlannerSubmission> + Send + Sync + 'static>;
 pub type PlanCriticHook =
     Arc<dyn Fn(PlanCriticInput) -> Result<PlanCriticSubmission> + Send + Sync + 'static>;
 pub type PlanRevisionHook =
@@ -115,6 +117,23 @@ impl PhaseActorTerminalState {
 }
 
 #[derive(Clone, Debug)]
+pub struct PlannerInput {
+    pub goal_id: String,
+    pub request: String,
+    pub scope: Scope,
+    pub verification_commands: Vec<String>,
+    pub route_decision: PhaseRouteDecision,
+}
+
+#[derive(Clone, Debug)]
+pub struct PlannerSubmission {
+    pub draft: PlanGraphDraft,
+    pub planner: PhaseExecutionIdentity,
+    pub raw_output: String,
+    pub artifact_path: Option<String>,
+}
+
+#[derive(Clone, Debug)]
 pub struct PlanCriticInput {
     pub request: String,
     pub plan: PlanGraph,
@@ -154,6 +173,7 @@ pub struct PhaseRuntime {
     pub inventory: LiveModelInventory,
     pub current_model: Option<ModelSelectorId>,
     pub planner: Option<PhaseExecutionIdentity>,
+    pub planner_hook: Option<PlannerHook>,
     pub plan_critic_hook: Option<PlanCriticHook>,
     pub plan_revision_hook: Option<PlanRevisionHook>,
     pub require_plan_approval: bool,
@@ -177,6 +197,7 @@ impl PhaseRuntime {
             inventory: LiveModelInventory::default(),
             current_model: None,
             planner: None,
+            planner_hook: None,
             plan_critic_hook: None,
             plan_revision_hook: None,
             require_plan_approval: false,
@@ -200,29 +221,13 @@ fn build_broker_phase_request(
     plan_revision: usize,
     task_id: &str,
 ) -> Result<BrokerPhaseRequest> {
-    let decision_hash = phase_decision
-        .hash()
-        .context("failed to hash phase route decision for broker")?;
-    let requested_model = match &phase_decision.requested_model {
-        Some(model) => ModelAvailability::Available(model.clone()),
-        None => {
-            ModelAvailability::Unavailable(crate::worker_broker::UnavailableReason::NotConfigured)
-        }
-    };
-    Ok(BrokerPhaseRequest {
-        schema_version: crate::worker_broker::BROKER_SCHEMA_VERSION,
-        phase_decision_hash: decision_hash,
-        goal_id: goal_id.to_string(),
-        plan_id: plan_id.to_string(),
+    BrokerPhaseRequest::from_phase_decision(
+        phase_decision,
+        goal_id,
+        plan_id,
         plan_revision,
-        task_id: task_id.to_string(),
-        requested_agent: phase_decision
-            .worker_kind
-            .map(|k| k.as_str().to_string())
-            .unwrap_or_else(|| "direct".to_string()),
-        requested_model,
-        allowed_fallback_models: Vec::new(),
-    })
+        task_id,
+    )
 }
 
 fn write_direct_execution_receipt(
@@ -338,6 +343,9 @@ fn run_phase_via_broker<T>(
     execution_identity: &PhaseExecutionIdentity,
     f: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
+    if matches!(phase_decision.candidate.backend, PhaseBackend::Worker(_)) {
+        return f();
+    }
     if let Some(factory) = broker_factory {
         let phase_broker = factory.create_broker(
             phase_decision,
@@ -1859,7 +1867,66 @@ fn build_approved_plan_graph(
     cancellation_token: Option<&CancellationToken>,
     phase_runtime: &PhaseRuntime,
 ) -> Result<PlanGraph> {
-    let mut plan = build_plan_graph(goal, scope, verification_commands)?;
+    if !phase_runtime.require_plan_approval && phase_runtime.planner_hook.is_none() {
+        return build_plan_graph(goal, scope, verification_commands);
+    }
+    let (mut plan, mut planner_raw_output, mut planner_identity, mut planner_artifact_path) =
+        if let Some(planner_hook) = phase_runtime.planner_hook.as_ref() {
+            let planner_decision = phase_runtime.routes.resolve(
+                &PhaseProfile::Planner,
+                &phase_runtime.inventory,
+                phase_runtime.current_model.as_ref(),
+            )?;
+            check_phase_terminal_state(&planner_decision)
+                .context("planner phase terminal state check failed")?;
+            let submission = planner_hook(PlannerInput {
+                goal_id: goal.id.clone(),
+                request: goal.request.clone(),
+                scope: scope.clone(),
+                verification_commands: verification_commands.to_vec(),
+                route_decision: planner_decision.clone(),
+            })
+            .context("planner hook failed before plan construction")?;
+            let parsed = parse_planner_draft(&submission.raw_output)
+                .context("planner hook raw output is not a PlanGraphDraft")?;
+            if parsed != submission.draft {
+                bail!("planner hook raw output does not match its typed draft");
+            }
+            validate_phase_execution_identity(&planner_decision, &submission.planner)?;
+            let provider_id = submission
+                .planner
+                .provider_id
+                .clone()
+                .context("planner hook is missing provider identity")?;
+            let model_id = submission
+                .planner
+                .model_id
+                .clone()
+                .context("planner hook is missing model identity")?;
+            let plan = PlanGraph::seal(
+                &goal.id,
+                1,
+                PlanSource::PlannerModel,
+                Some(PlannerReceipt {
+                    provider_id,
+                    model_id,
+                    session_id: submission.planner.actual_session_id.clone(),
+                }),
+                submission.draft,
+            )?;
+            goal.coordinator_brief = Some(submission.raw_output.clone());
+            (
+                plan,
+                submission.raw_output,
+                submission.planner,
+                submission.artifact_path,
+            )
+        } else {
+            let plan = build_plan_graph(goal, scope, verification_commands)?;
+            let planner_raw_output = planner_raw_output(goal, &plan)?;
+            let planner_identity = planner_identity_for_plan(&plan, phase_runtime.planner.clone())?;
+            (plan, planner_raw_output, planner_identity, None)
+        };
     if !phase_runtime.require_plan_approval {
         return Ok(plan);
     }
@@ -1868,8 +1935,6 @@ fn build_approved_plan_graph(
         .plan_critic_hook
         .as_ref()
         .context("plan approval is required but no PlanCritic hook is configured")?;
-    let mut planner_raw_output = planner_raw_output(goal, &plan)?;
-    let mut planner_identity = planner_identity_for_plan(&plan, phase_runtime.planner.clone())?;
     let mut seen_phase_identities = vec![planner_identity.clone()];
     let mut revisions_performed = 0usize;
 
@@ -1924,6 +1989,8 @@ fn build_approved_plan_graph(
             &goal.id,
             &plan,
             &planner_identity,
+            Some("planner"),
+            planner_artifact_path.as_deref(),
         )?;
         let planner_route_receipt_path =
             store.write_phase_route_receipt(&goal.id, planner_ordinal, &planner_route_receipt)?;
@@ -2041,6 +2108,7 @@ fn build_approved_plan_graph(
             "critic-output",
             &submission.raw_output,
         )?;
+        let critic_artifact_path = submission.artifact_path.clone();
         let critic_receipt = PlanCriticReceipt::seal(
             &plan,
             &planner_receipt,
@@ -2061,6 +2129,8 @@ fn build_approved_plan_graph(
             &goal.id,
             &plan,
             &submission.reviewer,
+            Some("plan_critic"),
+            critic_artifact_path.as_deref(),
         )?;
         let critic_route_receipt_path =
             store.write_phase_route_receipt(&goal.id, critic_ordinal, &critic_route_receipt)?;
@@ -2253,6 +2323,7 @@ fn build_approved_plan_graph(
                 plan = revised_plan;
                 planner_raw_output = revision.raw_output;
                 planner_identity = revision.planner;
+                planner_artifact_path = revision.artifact_path;
                 seen_phase_identities.push(planner_identity.clone());
                 revisions_performed += 1;
             }
@@ -2312,8 +2383,24 @@ fn validate_phase_execution_identity(
                 bail!("deterministic phase must use a deterministic-rules identity");
             }
         }
-        PhaseBackend::Worker(_) | PhaseBackend::LegacyCategory => {
-            bail!("planner and PlanCritic phases require a trusted direct or native backend")
+        PhaseBackend::Worker(worker_kind) => {
+            if identity.backend != PhaseExecutionBackend::WorkerSession {
+                bail!("worker phase must use a worker-session execution identity");
+            }
+            if identity.agent_id.as_deref() != Some(worker_kind.as_str()) {
+                bail!("worker phase execution identity does not match its backend");
+            }
+            if let PhaseModelBinding::BackendDeclared(model) = &decision.candidate.model {
+                let declared = ModelSelectorId::from_qualified(worker_kind.as_str(), model)?;
+                if identity.provider_id.as_deref() != Some(declared.provider_id.as_str())
+                    || identity.model_id.as_deref() != Some(declared.model_id.as_str())
+                {
+                    bail!("worker phase execution identity does not match its declared model");
+                }
+            }
+        }
+        PhaseBackend::LegacyCategory => {
+            bail!("planner and PlanCritic phases cannot use a legacy category route")
         }
     }
     if let Some(requested_model) = decision.requested_model.as_ref()
@@ -2332,6 +2419,8 @@ fn phase_route_receipt_for_identity(
     goal_id: &str,
     plan: &PlanGraph,
     identity: &PhaseExecutionIdentity,
+    worker_task_id: Option<&str>,
+    worker_artifact_path: Option<&str>,
 ) -> Result<PhaseRouteReceipt> {
     let (binding_status, applied_model) =
         match (&decision.candidate.backend, &decision.candidate.model) {
@@ -2346,8 +2435,38 @@ fn phase_route_receipt_for_identity(
                 ModelBindingStatus::Applied,
                 decision.requested_model.clone(),
             ),
+            (PhaseBackend::Worker(_), PhaseModelBinding::BackendDeclared(_)) => {
+                (ModelBindingStatus::DeclaredUnverified, None)
+            }
+            (PhaseBackend::Worker(_), PhaseModelBinding::None) => {
+                (ModelBindingStatus::LegacyUnverified, None)
+            }
             _ => bail!("unsupported trusted planning phase backend/model binding"),
         };
+    let worker_binding = match decision.candidate.backend {
+        PhaseBackend::Worker(worker_kind) => {
+            let task_id = worker_task_id.context("worker phase receipt is missing its task id")?;
+            let artifact_path = worker_artifact_path
+                .context("worker phase receipt is missing its terminal artifact")?;
+            let artifact_bytes = std::fs::read(artifact_path).with_context(|| {
+                format!("failed to read worker phase artifact at {artifact_path}")
+            })?;
+            let worker_model = match &decision.candidate.model {
+                PhaseModelBinding::BackendDeclared(model) => Some(model.clone()),
+                PhaseModelBinding::None => None,
+                _ => None,
+            };
+            Some((
+                task_id.to_string(),
+                worker_kind,
+                decision.category,
+                worker_model,
+                artifact_path.to_string(),
+                format!("{:x}", Sha256::digest(artifact_bytes)),
+            ))
+        }
+        _ => None,
+    };
     PhaseRouteReceipt {
         decision: decision.clone(),
         ordinal,
@@ -2356,15 +2475,29 @@ fn phase_route_receipt_for_identity(
         goal_id: Some(goal_id.to_string()),
         plan_id: Some(plan.plan_id.clone()),
         plan_hash: Some(plan.plan_hash.clone()),
-        task_id: None,
+        task_id: worker_binding
+            .as_ref()
+            .map(|(task_id, _, _, _, _, _)| task_id.clone()),
         worker_session_id: identity.actual_session_id.clone(),
         applied_model,
-        actual_worker_kind: None,
-        actual_category: None,
-        actual_worker_model: None,
-        actual_route_reason: None,
-        task_record_path: None,
-        task_record_sha256: None,
+        actual_worker_kind: worker_binding
+            .as_ref()
+            .map(|(_, worker_kind, _, _, _, _)| *worker_kind),
+        actual_category: worker_binding
+            .as_ref()
+            .map(|(_, _, category, _, _, _)| *category),
+        actual_worker_model: worker_binding
+            .as_ref()
+            .and_then(|(_, _, _, model, _, _)| model.clone()),
+        actual_route_reason: worker_binding
+            .as_ref()
+            .map(|_| "phase worker session".to_string()),
+        task_record_path: worker_binding
+            .as_ref()
+            .map(|(_, _, _, _, path, _)| path.clone()),
+        task_record_sha256: worker_binding
+            .as_ref()
+            .map(|(_, _, _, _, _, hash)| hash.clone()),
         binding_status,
         receipt_hash: String::new(),
     }
@@ -5582,6 +5715,7 @@ mod tests {
             },
             current_model: Some(current_model),
             planner: Some(phase_identity("planner")),
+            planner_hook: None,
             plan_critic_hook: critic_hook,
             plan_revision_hook: None,
             require_plan_approval: true,
@@ -5687,6 +5821,79 @@ mod tests {
         assert!(format!("{error:#}").contains("requires an approving PlanCritic receipt"));
         assert_eq!(fs::read_dir(store.workers_dir())?.count(), 0);
         assert_eq!(fs::read_dir(store.plans_dir())?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn planner_hook_builds_a_plan_from_an_opencode_worker_identity() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let scope = Scope::new(Vec::new(), vec![".git".to_string()], 10);
+        let draft = deterministic_fallback_draft(
+            "Implement through an OpenCode planner",
+            &scope,
+            &["echo verify".to_string()],
+        );
+        let mut goal = planning_goal(&draft)?;
+        goal.coordinator_brief = None;
+        goal.coordinator_model = None;
+        let submitted_draft = draft.clone();
+        let planner_hook: PlannerHook = Arc::new(move |_input| {
+            Ok(PlannerSubmission {
+                raw_output: serde_json::to_string(&submitted_draft)?,
+                draft: submitted_draft.clone(),
+                planner: PhaseExecutionIdentity {
+                    execution_id: "opencode_planner_execution".to_string(),
+                    phase_session_id: "opencode_planner_phase".to_string(),
+                    backend: PhaseExecutionBackend::WorkerSession,
+                    agent_id: Some(WorkerKind::OpencodeSession.as_str().to_string()),
+                    provider_id: Some("openai".to_string()),
+                    model_id: Some("gpt-planner".to_string()),
+                    actual_session_id: Some("opencode_planner_session".to_string()),
+                },
+                artifact_path: None,
+            })
+        });
+        let phase_runtime = PhaseRuntime {
+            routes: PhaseRouteTable::opencode_only(crate::phase_routing::OpenCodeModelProfiles {
+                planner: "openai/gpt-planner".to_string(),
+                executor: "deepseek/flash".to_string(),
+                reviewer: "openai/gpt-reviewer".to_string(),
+            })?,
+            inventory: LiveModelInventory::default(),
+            current_model: None,
+            planner: None,
+            planner_hook: Some(planner_hook),
+            plan_critic_hook: None,
+            plan_revision_hook: None,
+            require_plan_approval: false,
+            max_plan_revisions: 2,
+            broker: None,
+            broker_factory: None,
+        };
+
+        let plan = build_approved_plan_graph(
+            &mut goal,
+            &scope,
+            &["echo verify".to_string()],
+            temp_dir.path(),
+            &store,
+            "session-opencode-planner",
+            &None,
+            None,
+            &phase_runtime,
+        )?;
+
+        assert_eq!(plan.draft, draft);
+        assert_eq!(plan.source, PlanSource::PlannerModel);
+        assert_eq!(
+            plan.planner
+                .as_ref()
+                .and_then(|receipt| receipt.session_id.as_deref()),
+            Some("opencode_planner_session")
+        );
+        assert!(goal.coordinator_brief.is_some());
         Ok(())
     }
 
@@ -9221,6 +9428,7 @@ mod tests {
             },
             current_model: Some(current_model),
             planner: Some(planner_identity),
+            planner_hook: None,
             plan_critic_hook: Some(critic_hook),
             plan_revision_hook: Some(revision_hook),
             require_plan_approval: true,

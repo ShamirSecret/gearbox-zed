@@ -14,11 +14,15 @@ use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::phase_routing::{ModelBindingStatus, ModelSelectorId, PhaseRouteDecision};
+use crate::phase_routing::{
+    ModelBindingStatus, ModelSelectorId, PhaseModelBinding, PhaseRouteDecision,
+};
 use crate::plan_graph::PhaseProfile;
 use crate::plan_review::PhaseExecutionIdentity;
 use crate::state::{timestamp, write_json};
-use crate::workers::{WorkerKind, WorkerRegistry, WorkerSessionHandle};
+use crate::workers::{
+    WorkerKind, WorkerRegistry, WorkerResult, WorkerSessionHandle, WorkerStartRequest,
+};
 
 pub const BROKER_SCHEMA_VERSION: u32 = 1;
 
@@ -114,6 +118,45 @@ pub struct BrokerPhaseRequest {
 }
 
 impl BrokerPhaseRequest {
+    pub fn from_phase_decision(
+        phase_decision: &PhaseRouteDecision,
+        goal_id: &str,
+        plan_id: &str,
+        plan_revision: usize,
+        task_id: &str,
+    ) -> Result<Self> {
+        let requested_model = match &phase_decision.requested_model {
+            Some(model) => ModelAvailability::Available(model.clone()),
+            None => match (&phase_decision.worker_kind, &phase_decision.candidate.model) {
+                (Some(worker_kind), PhaseModelBinding::BackendDeclared(model)) => {
+                    match ModelSelectorId::from_qualified(worker_kind.as_str(), model) {
+                        Ok(model) => ModelAvailability::Available(model),
+                        Err(_) => ModelAvailability::Unavailable(UnavailableReason::NotConfigured),
+                    }
+                }
+                _ => ModelAvailability::Unavailable(UnavailableReason::NotConfigured),
+            },
+        };
+        let request = Self {
+            schema_version: BROKER_SCHEMA_VERSION,
+            phase_decision_hash: phase_decision
+                .hash()
+                .context("failed to hash phase route decision for broker")?,
+            goal_id: goal_id.to_string(),
+            plan_id: plan_id.to_string(),
+            plan_revision,
+            task_id: task_id.to_string(),
+            requested_agent: phase_decision
+                .worker_kind
+                .map(|kind| kind.as_str().to_string())
+                .unwrap_or_else(|| "direct".to_string()),
+            requested_model,
+            allowed_fallback_models: Vec::new(),
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
     /// Validate that all required fields are present and well-formed.
     pub fn validate(&self) -> Result<()> {
         if self.schema_version != BROKER_SCHEMA_VERSION {
@@ -2009,6 +2052,14 @@ pub struct PhaseBrokerFactory {
     completed_sessions: Arc<Mutex<Vec<CompletedSessionEntry>>>,
 }
 
+#[derive(Clone, Debug)]
+pub struct PhaseWorkerExecution {
+    pub result: WorkerResult,
+    pub execution_identity: PhaseExecutionIdentity,
+    pub session_identity: BrokerSessionIdentity,
+    pub session_dir: PathBuf,
+}
+
 impl PhaseBrokerFactory {
     /// Create a new phase broker factory.
     pub fn new(registry: Arc<WorkerRegistry>, artifacts_root: PathBuf) -> Self {
@@ -2121,6 +2172,115 @@ impl PhaseBrokerFactory {
         });
 
         Ok(broker)
+    }
+
+    pub fn execute_worker_phase(
+        &self,
+        phase_decision: &PhaseRouteDecision,
+        goal_id: &str,
+        plan_id: &str,
+        plan_revision: usize,
+        task_id: &str,
+        execution_id: &str,
+        phase_session_id: &str,
+        request: WorkerStartRequest<'_>,
+    ) -> Result<PhaseWorkerExecution> {
+        if phase_decision.worker_kind.is_none() {
+            bail!(
+                "phase {:?} is not configured for a worker session",
+                phase_decision.phase
+            );
+        }
+        if request.task.id != task_id || request.task.goal_id != goal_id {
+            bail!("phase worker request does not match its goal/task binding");
+        }
+        let execution_identity = PhaseExecutionIdentity {
+            execution_id: execution_id.to_string(),
+            phase_session_id: phase_session_id.to_string(),
+            backend: crate::plan_review::PhaseExecutionBackend::DeterministicRules,
+            agent_id: None,
+            provider_id: None,
+            model_id: None,
+            actual_session_id: None,
+        };
+        execution_identity.validate()?;
+
+        let phase_request = BrokerPhaseRequest::from_phase_decision(
+            phase_decision,
+            goal_id,
+            plan_id,
+            plan_revision,
+            task_id,
+        )?;
+        let broker = self.create_broker(
+            phase_decision,
+            goal_id,
+            plan_id,
+            plan_revision,
+            task_id,
+            &execution_identity,
+        )?;
+
+        let execution = (|| -> Result<PhaseWorkerExecution> {
+            broker.resolve(phase_request)?;
+            let handle = broker.start_via_broker(request)?;
+            broker.wait_for_outcome()?;
+            let result = handle.wait_for_result()?;
+            let session_identity = broker.session_identity()?;
+            let session_dir = broker.session_ledger_dir()?;
+            let model = match &phase_decision.requested_model {
+                Some(model) => model.clone(),
+                None => match &phase_decision.candidate.model {
+                    PhaseModelBinding::BackendDeclared(model) => ModelSelectorId::from_qualified(
+                        phase_decision
+                            .worker_kind
+                            .context("phase worker kind is missing")?
+                            .as_str(),
+                        model,
+                    )?,
+                    _ => bail!("phase worker session is missing a qualified model binding"),
+                },
+            };
+            let actual_execution_identity = PhaseExecutionIdentity {
+                execution_id: execution_identity.execution_id.clone(),
+                phase_session_id: execution_identity.phase_session_id.clone(),
+                backend: crate::plan_review::PhaseExecutionBackend::WorkerSession,
+                agent_id: Some(model.agent_id.clone()),
+                provider_id: Some(model.provider_id.clone()),
+                model_id: Some(model.model_id.clone()),
+                actual_session_id: Some(session_identity.session_id.clone()),
+            };
+            actual_execution_identity.validate()?;
+            self.finalize_session(
+                &broker,
+                &execution_identity,
+                goal_id,
+                task_id,
+                plan_revision,
+            )?;
+            Ok(PhaseWorkerExecution {
+                result,
+                execution_identity: actual_execution_identity,
+                session_identity,
+                session_dir,
+            })
+        })();
+
+        if execution.is_err() {
+            if matches!(
+                broker.lifecycle_state(),
+                Ok(LifecycleState::Starting)
+                    | Ok(LifecycleState::Active)
+                    | Ok(LifecycleState::IdleSteering)
+            ) {
+                broker
+                    .cancel()
+                    .context("failed to cancel phase worker after execution error")?;
+            }
+            self.remove_session(&execution_identity, goal_id, task_id, plan_revision)?;
+        }
+
+        execution
     }
 
     /// Remove a session from the active sessions list.
@@ -3347,6 +3507,121 @@ mod tests {
             broker_capabilities_for_kind(WorkerKind::OpencodeSession, false)
                 .contains(&BrokerCapability::ModelSelection)
         );
+    }
+
+    #[test]
+    fn factory_executes_an_opencode_phase_with_a_terminal_receipt() -> Result<()> {
+        use crate::phase_routing::{LiveModelInventory, OpenCodeModelProfiles, PhaseRouteTable};
+        use crate::state::{
+            Scope, StateStore, Task, TaskInputs, TaskKind, TaskOutputs, TaskStatus,
+        };
+        use crate::workers::{WorkerConfig, WorkerRoute};
+
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = Task {
+            id: "phase_planner".to_string(),
+            goal_id: "goal_opencode".to_string(),
+            parent_task_id: None,
+            title: "OpenCode planner phase".to_string(),
+            kind: TaskKind::Plan,
+            status: TaskStatus::Pending,
+            assigned_worker: Some(WorkerKind::OpencodeSession.as_str().to_string()),
+            attempt: 1,
+            scope: Scope::new(Vec::new(), Vec::new(), 1),
+            inputs: TaskInputs {
+                phase_route_locked: true,
+                ..TaskInputs::default()
+            },
+            outputs: TaskOutputs::default(),
+        };
+        let command = "sh -c 'cat \"$GEARBOX_WORKER_PROMPT\"'".to_string();
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::OpencodeSession,
+            worker_command: Some(command.clone()),
+            worker_model: Some("openai/gpt-planner".to_string()),
+            worker_routes: vec![WorkerRoute {
+                worker_kind: WorkerKind::OpencodeSession,
+                worker_command: Some(command),
+                worker_model: Some("openai/gpt-planner".to_string()),
+            }],
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::OpencodeSession,
+        };
+        let routes = PhaseRouteTable::opencode_only(OpenCodeModelProfiles {
+            planner: "openai/gpt-planner".to_string(),
+            executor: "deepseek/flash".to_string(),
+            reviewer: "openai/gpt-reviewer".to_string(),
+        })?;
+        let decision =
+            routes.resolve(&PhaseProfile::Planner, &LiveModelInventory::default(), None)?;
+        let factory = PhaseBrokerFactory::new(
+            Arc::new(WorkerRegistry::default()),
+            temp_dir.path().join(".gearbox-agent"),
+        );
+
+        let execution = factory.execute_worker_phase(
+            &decision,
+            &task.goal_id,
+            "plan_opencode",
+            0,
+            &task.id,
+            "planner_execution_1",
+            "planner_session_1",
+            WorkerStartRequest {
+                store: &store,
+                workspace: temp_dir.path(),
+                task: &task,
+                route_attempt: 1,
+                goal: "Return a typed plan",
+                verification_commands: &[],
+                config: &config,
+                cancellation_token: None,
+                coordinator_model: None,
+                coordinator_brief: None,
+                route_hint: None,
+            },
+        )?;
+
+        assert_eq!(
+            execution.result.status,
+            crate::workers::WorkerStatus::Succeeded
+        );
+        let phase_prompt = std::fs::read_to_string(&execution.result.prompt_path)?;
+        assert!(phase_prompt.contains("Return only the response format required"));
+        assert!(!phase_prompt.contains("Return a concise report with"));
+        assert_eq!(
+            execution.session_identity.backend_kind,
+            WorkerKind::OpencodeSession
+        );
+        assert_eq!(
+            execution.execution_identity.backend,
+            crate::plan_review::PhaseExecutionBackend::WorkerSession
+        );
+        assert_eq!(
+            execution.execution_identity.provider_id.as_deref(),
+            Some("openai")
+        );
+        assert_eq!(
+            execution.execution_identity.model_id.as_deref(),
+            Some("gpt-planner")
+        );
+        assert!(
+            execution
+                .session_dir
+                .join("terminal-outcome.json")
+                .is_file()
+        );
+        validate_session_ledger(&execution.session_dir)?;
+        factory.validate_goal_receipts(&task.goal_id, true)?;
+        Ok(())
     }
 
     // -----------------------------------------------------------------------

@@ -95,6 +95,7 @@ pub enum PhaseExecutionBackend {
     LanguageModelRequest,
     NativeAgent,
     Acp,
+    WorkerSession,
     DeterministicRules,
 }
 
@@ -128,7 +129,9 @@ impl PhaseExecutionIdentity {
                 require_some_non_empty("provider_id", self.provider_id.as_deref())?;
                 require_some_non_empty("model_id", self.model_id.as_deref())?;
             }
-            PhaseExecutionBackend::NativeAgent | PhaseExecutionBackend::Acp => {
+            PhaseExecutionBackend::NativeAgent
+            | PhaseExecutionBackend::Acp
+            | PhaseExecutionBackend::WorkerSession => {
                 require_some_non_empty("agent_id", self.agent_id.as_deref())?;
                 require_some_non_empty("provider_id", self.provider_id.as_deref())?;
                 require_some_non_empty("model_id", self.model_id.as_deref())?;

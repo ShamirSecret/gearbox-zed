@@ -60,8 +60,8 @@ use futures::channel::{mpsc, oneshot};
 use futures::future::Shared;
 use futures::{FutureExt as _, StreamExt as _, future};
 use gearbox_agent::phase_routing::{
-    LiveModelInventory, ModelSelectorId, PhaseRouteCandidate, PhaseRouteSource,
-    PhaseRouteTable,
+    LiveModelInventory, ModelSelectorId, OpenCodeModelProfiles, PhaseBackend, PhaseRouteCandidate,
+    PhaseRouteSource, PhaseRouteTable,
 };
 use gearbox_agent::plan_graph::PhaseProfile;
 use gearbox_agent::plan_review::{
@@ -71,10 +71,13 @@ use gearbox_agent::runtime::{
     CoordinatorReview, CoordinatorReviewHook, CoordinatorReviewInput, DEFAULT_MAX_ITERATIONS,
     DEFAULT_MAX_PLAN_REVISIONS, DEFAULT_MAX_PROVIDER_UNKNOWN_STREAK, DEFAULT_MAX_RUNTIME_MINUTES,
     Orchestrator, PhaseRuntime, PlanCriticHook, PlanCriticInput, PlanCriticSubmission,
-    PlanRevisionHook, PlanRevisionInput, PlanRevisionSubmission, RunOptions,
+    PlanRevisionHook, PlanRevisionInput, PlanRevisionSubmission, PlannerHook, PlannerInput,
+    PlannerSubmission, RunOptions,
 };
 use gearbox_agent::state::{
-    ContinuationStatus, CoordinatorModel, EventKind, StateStore, event, id_timestamp,
+    ContinuationStatus, CoordinatorModel, EventKind, Scope, StateStore, Task as GearTask,
+    TaskInputs as GearTaskInputs, TaskKind as GearTaskKind, TaskOutputs as GearTaskOutputs,
+    TaskStatus as GearTaskStatus, event, id_timestamp,
 };
 use gearbox_agent::task_manager::{
     ActionOutcome, ManagedTaskStatus, OutcomeContext, SendOutcome, SharedTaskManager, SteerOutcome,
@@ -2757,6 +2760,17 @@ impl NativeAgentConnection {
             .and_then(|s| s.gear_lifecycle_events.clone());
         #[cfg(test)]
         let gear_worker_config_override = self.agent.read(cx).gear_worker_config_override.clone();
+        #[cfg(test)]
+        let phase_worker_config = gear_worker_config_override
+            .clone()
+            .unwrap_or_else(|| gear_worker_config_from_env(cx));
+        #[cfg(not(test))]
+        let phase_worker_config = gear_worker_config_from_env(cx);
+        let phase_worker_config = if gear_phase_table_uses_opencode(&phase_models.routes) {
+            gear_open_code_phase_worker_config(phase_worker_config)
+        } else {
+            phase_worker_config
+        };
 
         let (native_worker_tx, native_worker_rx) =
             async_channel::unbounded::<GearZedWorkerDispatch>();
@@ -2771,8 +2785,7 @@ impl NativeAgentConnection {
             cx,
         );
 
-        let (acp_broker_tx, acp_broker_rx) =
-            async_channel::unbounded::<GearAcpBrokerDispatch>();
+        let (acp_broker_tx, acp_broker_rx) = async_channel::unbounded::<GearAcpBrokerDispatch>();
         let running_acp_sessions: Arc<Mutex<HashMap<String, acp::SessionId>>> =
             Arc::new(Mutex::new(HashMap::default()));
         spawn_gear_acp_broker_dispatcher(
@@ -2785,8 +2798,7 @@ impl NativeAgentConnection {
 
         let native_backend: Arc<dyn NativeWorkerBackend> =
             Arc::new(GearZedWorkerBackend::new(native_worker_tx));
-        let broker_registry =
-            Arc::new(WorkerRegistry::with_native_backend(native_backend.clone()));
+        let broker_registry = Arc::new(WorkerRegistry::with_native_backend(native_backend.clone()));
         let broker = Arc::new(WorkerBroker::new(
             broker_registry.clone(),
             workspace.join(".gearbox-agent").join("artifacts"),
@@ -2797,8 +2809,8 @@ impl NativeAgentConnection {
             broker_registry,
             workspace.join(".gearbox-agent"),
         ));
-        let task_registry = WorkerRegistry::with_native_backend(native_backend)
-            .with_broker(broker.clone());
+        let task_registry =
+            WorkerRegistry::with_native_backend(native_backend).with_broker(broker.clone());
 
         let mut task_manager = TaskManager::with_control(task_manager_control.clone());
         task_manager.set_session_scope(session_id.to_string());
@@ -2827,6 +2839,16 @@ impl NativeAgentConnection {
         let run_broker = broker;
         let run_broker_factory = broker_factory;
         cx.spawn(async move |cx| {
+            let planner_uses_opencode =
+                gear_phase_uses_opencode_worker(&phase_models, PhaseProfile::Planner)?;
+            let critic_uses_opencode =
+                gear_phase_uses_opencode_worker(&phase_models, PhaseProfile::PlanCritic)?;
+            let opencode_phase_runner = GearOpenCodePhaseRunner {
+                broker_factory: run_broker_factory.clone(),
+                workspace: workspace.clone(),
+                worker_config: phase_worker_config.clone(),
+                cancellation_token: cancellation_token.clone(),
+            };
             let review_language_model = phase_models.critic_model.clone();
             let review_workspace = workspace.clone();
             let review_task = cx.spawn(async move |cx| {
@@ -2876,28 +2898,32 @@ impl NativeAgentConnection {
                 }
             });
 
-            let coordinator_review_hook =
-                if gear_provider_review_enabled(Some(&phase_models.critic_model)) {
-                    let review_tx = review_tx.clone();
-                    Some(Arc::new(move |input: CoordinatorReviewInput| {
-                        let (response_tx, response_rx) = async_channel::bounded(1);
-                        review_tx
-                            .send_blocking(GearCoordinatorReviewJob {
-                                input,
-                                workspace: review_workspace.clone(),
-                                response_tx,
-                            })
-                            .context("failed to send Gear coordinator review request")?;
-                        response_rx
-                            .recv_blocking()
-                            .context("failed to receive Gear coordinator review response")?
-                    }) as CoordinatorReviewHook)
-                } else {
-                    None
-                };
+            let coordinator_review_hook = if !critic_uses_opencode
+                && gear_provider_review_enabled(Some(&phase_models.critic_model))
+            {
+                let review_tx = review_tx.clone();
+                Some(Arc::new(move |input: CoordinatorReviewInput| {
+                    let (response_tx, response_rx) = async_channel::bounded(1);
+                    review_tx
+                        .send_blocking(GearCoordinatorReviewJob {
+                            input,
+                            workspace: review_workspace.clone(),
+                            response_tx,
+                        })
+                        .context("failed to send Gear coordinator review request")?;
+                    response_rx
+                        .recv_blocking()
+                        .context("failed to receive Gear coordinator review response")?
+                }) as CoordinatorReviewHook)
+            } else {
+                None
+            };
             drop(review_tx);
 
-            let plan_critic_hook = {
+            let plan_critic_hook: PlanCriticHook = if critic_uses_opencode {
+                let runner = opencode_phase_runner.clone();
+                Arc::new(move |input| runner.critique(input))
+            } else {
                 let plan_critic_tx = plan_critic_tx.clone();
                 Arc::new(move |input: PlanCriticInput| {
                     let (response_tx, response_rx) = async_channel::bounded(1);
@@ -2907,9 +2933,12 @@ impl NativeAgentConnection {
                     response_rx
                         .recv_blocking()
                         .context("failed to receive Gear PlanCritic response")?
-                }) as PlanCriticHook
+                })
             };
-            let plan_revision_hook = {
+            let plan_revision_hook: PlanRevisionHook = if planner_uses_opencode {
+                let runner = opencode_phase_runner.clone();
+                Arc::new(move |input| runner.revise(input))
+            } else {
                 let plan_revision_tx = plan_revision_tx.clone();
                 Arc::new(move |input: PlanRevisionInput| {
                     let (response_tx, response_rx) = async_channel::bounded(1);
@@ -2919,37 +2948,44 @@ impl NativeAgentConnection {
                     response_rx
                         .recv_blocking()
                         .context("failed to receive Gear plan revision response")?
-                }) as PlanRevisionHook
+                })
             };
             drop(plan_critic_tx);
             drop(plan_revision_tx);
 
-            let planner_identity = phase_execution_identity_for_model(
-                "planner",
-                &cancellation_session_id.to_string(),
-                &phase_models.planner_model,
-            );
-            let coordinator_brief = generate_gear_coordinator_brief(
-                Some(phase_models.planner_model.clone()),
-                &request,
-                cx,
-            )
-            .await;
+            let (planner_identity, planner_hook, coordinator_brief) = if planner_uses_opencode {
+                let runner = opencode_phase_runner.clone();
+                (
+                    None,
+                    Some(Arc::new(move |input| runner.plan(input)) as PlannerHook),
+                    None,
+                )
+            } else {
+                (
+                    Some(phase_execution_identity_for_model(
+                        "planner",
+                        &cancellation_session_id.to_string(),
+                        &phase_models.planner_model,
+                    )),
+                    None,
+                    generate_gear_coordinator_brief(
+                        Some(phase_models.planner_model.clone()),
+                        &request,
+                        cx,
+                    )
+                    .await,
+                )
+            };
             let run_cancellation_token = cancellation_token.clone();
             let run_task_manager_control = task_manager_control.clone();
             let run_task_manager = task_manager.clone();
-            let run_worker_config = cx.update(|cx| {
-                #[cfg(test)]
-                if let Some(config) = gear_worker_config_override {
-                    return config;
-                }
-                gear_worker_config_from_env(cx)
-            });
+            let run_worker_config = phase_worker_config.clone();
             let run_phase_runtime = PhaseRuntime {
                 routes: phase_models.routes.clone(),
                 inventory: phase_models.inventory.clone(),
                 current_model: phase_models.current_model.clone(),
-                planner: Some(planner_identity),
+                planner: planner_identity,
+                planner_hook,
                 plan_critic_hook: Some(plan_critic_hook),
                 plan_revision_hook: Some(plan_revision_hook),
                 require_plan_approval: true,
@@ -3232,10 +3268,16 @@ fn gear_phase_models(
         current_model.as_ref(),
     )?;
     let models = &agent.read(cx).models;
-    let planner_model =
-        resolve_phase_language_model(&planner_decision, current_language_model.as_ref(), models)?;
-    let critic_model =
-        resolve_phase_language_model(&critic_decision, current_language_model.as_ref(), models)?;
+    let planner_model = resolve_phase_host_language_model(
+        &planner_decision,
+        current_language_model.as_ref(),
+        models,
+    )?;
+    let critic_model = resolve_phase_host_language_model(
+        &critic_decision,
+        current_language_model.as_ref(),
+        models,
+    )?;
     Ok(GearPhaseModels {
         routes,
         inventory,
@@ -3243,6 +3285,19 @@ fn gear_phase_models(
         planner_model,
         critic_model,
     })
+}
+
+fn resolve_phase_host_language_model(
+    decision: &gearbox_agent::phase_routing::PhaseRouteDecision,
+    current_language_model: Option<&Arc<dyn LanguageModel>>,
+    models: &LanguageModels,
+) -> Result<Arc<dyn LanguageModel>> {
+    if matches!(decision.candidate.backend, PhaseBackend::Worker(_)) {
+        return current_language_model
+            .cloned()
+            .context("Gear requires a host model while an OpenCode phase session is active");
+    }
+    resolve_phase_language_model(decision, current_language_model, models)
 }
 
 fn resolve_phase_language_model(
@@ -3277,7 +3332,10 @@ fn gear_phase_route_table_from_env() -> Result<PhaseRouteTable> {
         return Ok(table);
     }
 
-    let mut table = PhaseRouteTable::legacy_defaults();
+    let mut table = match gear_opencode_model_profiles_from_env()? {
+        Some(models) => PhaseRouteTable::opencode_only(models)?,
+        None => PhaseRouteTable::legacy_defaults(),
+    };
     for (phase, environment_name) in [
         (PhaseProfile::Planner, "GEARBOX_GEAR_PHASE_PLANNER"),
         (PhaseProfile::PlanCritic, "GEARBOX_GEAR_PHASE_PLAN_CRITIC"),
@@ -3327,6 +3385,52 @@ fn gear_phase_route_table_from_env() -> Result<PhaseRouteTable> {
     Ok(table)
 }
 
+fn gear_phase_table_uses_opencode(table: &PhaseRouteTable) -> bool {
+    table.profiles.iter().any(|profile| {
+        profile.candidates.iter().any(|candidate| {
+            matches!(
+                candidate.backend,
+                PhaseBackend::Worker(WorkerKind::OpencodeSession)
+            )
+        })
+    })
+}
+
+fn gear_opencode_model_profiles_from_env() -> Result<Option<OpenCodeModelProfiles>> {
+    let explicitly_enabled = trimmed_env_value("GEARBOX_GEAR_OPENCODE_PHASES")
+        .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
+    gear_opencode_model_profiles_from_values(
+        explicitly_enabled,
+        trimmed_env_value("GEARBOX_GEAR_OPENCODE_PLANNER_MODEL"),
+        trimmed_env_value("GEARBOX_GEAR_OPENCODE_EXECUTOR_MODEL"),
+        trimmed_env_value("GEARBOX_GEAR_OPENCODE_REVIEWER_MODEL"),
+        trimmed_env_value("GEARBOX_GEAR_WORKER_MODEL"),
+    )
+}
+
+fn gear_opencode_model_profiles_from_values(
+    explicitly_enabled: bool,
+    planner: Option<String>,
+    executor: Option<String>,
+    reviewer: Option<String>,
+    default_worker_model: Option<String>,
+) -> Result<Option<OpenCodeModelProfiles>> {
+    let has_phase_model = planner.is_some() || executor.is_some() || reviewer.is_some();
+    if !explicitly_enabled && !has_phase_model {
+        return Ok(None);
+    }
+    let planner = planner.or(default_worker_model).context(
+        "OpenCode phase mode requires GEARBOX_GEAR_OPENCODE_PLANNER_MODEL or GEARBOX_GEAR_WORKER_MODEL",
+    )?;
+    let profiles = OpenCodeModelProfiles {
+        executor: executor.unwrap_or_else(|| planner.clone()),
+        reviewer: reviewer.unwrap_or_else(|| planner.clone()),
+        planner,
+    };
+    profiles.validate()?;
+    Ok(Some(profiles))
+}
+
 fn gear_provider_review_enabled(model: Option<&Arc<dyn LanguageModel>>) -> bool {
     let Some(_) = model else {
         return false;
@@ -3364,6 +3468,232 @@ struct GearPhaseModels {
     current_model: Option<ModelSelectorId>,
     planner_model: Arc<dyn LanguageModel>,
     critic_model: Arc<dyn LanguageModel>,
+}
+
+fn gear_phase_uses_opencode_worker(models: &GearPhaseModels, phase: PhaseProfile) -> Result<bool> {
+    let decision =
+        models
+            .routes
+            .resolve(&phase, &models.inventory, models.current_model.as_ref())?;
+    Ok(matches!(
+        decision.candidate.backend,
+        PhaseBackend::Worker(WorkerKind::OpencodeSession)
+    ))
+}
+
+#[derive(Clone)]
+struct GearOpenCodePhaseRunner {
+    broker_factory: Arc<PhaseBrokerFactory>,
+    workspace: PathBuf,
+    worker_config: WorkerConfig,
+    cancellation_token: CancellationToken,
+}
+
+struct GearOpenCodePhaseOutput {
+    raw_output: String,
+    execution_identity: PhaseExecutionIdentity,
+    artifact_path: String,
+}
+
+impl GearOpenCodePhaseRunner {
+    fn run(
+        &self,
+        decision: &gearbox_agent::phase_routing::PhaseRouteDecision,
+        goal_id: &str,
+        plan_id: &str,
+        plan_revision: usize,
+        task_id: &str,
+        task_kind: GearTaskKind,
+        scope: Scope,
+        prompt: String,
+    ) -> Result<GearOpenCodePhaseOutput> {
+        if !matches!(
+            decision.candidate.backend,
+            PhaseBackend::Worker(WorkerKind::OpencodeSession)
+        ) {
+            anyhow::bail!("Gear OpenCode phase runner received a non-OpenCode route");
+        }
+        let config = decision.overlay_worker_config(&self.worker_config)?;
+        let store = StateStore::new(&self.workspace);
+        store.initialize()?;
+        let task = GearTask {
+            id: task_id.to_string(),
+            goal_id: goal_id.to_string(),
+            parent_task_id: None,
+            title: format!("Gear {:?} phase", decision.phase),
+            kind: task_kind,
+            status: GearTaskStatus::Pending,
+            assigned_worker: Some(WorkerKind::OpencodeSession.as_str().to_string()),
+            attempt: 1,
+            scope,
+            inputs: GearTaskInputs {
+                phase_route_locked: true,
+                ..GearTaskInputs::default()
+            },
+            outputs: GearTaskOutputs::default(),
+        };
+        let suffix = id_timestamp();
+        let execution = self.broker_factory.execute_worker_phase(
+            decision,
+            goal_id,
+            plan_id,
+            plan_revision,
+            task_id,
+            &format!("{:?}_execution_{suffix}", decision.phase).to_ascii_lowercase(),
+            &format!("{:?}_session_{suffix}", decision.phase).to_ascii_lowercase(),
+            WorkerStartRequest {
+                store: &store,
+                workspace: &self.workspace,
+                task: &task,
+                route_attempt: 1,
+                goal: &prompt,
+                verification_commands: &[],
+                config: &config,
+                cancellation_token: Some(self.cancellation_token.clone()),
+                coordinator_model: None,
+                coordinator_brief: None,
+                route_hint: None,
+            },
+        )?;
+        if execution.result.status != WorkerStatus::Succeeded {
+            anyhow::bail!(
+                "OpenCode {:?} phase failed: {}",
+                decision.phase,
+                execution.result.summary
+            );
+        }
+        let raw_output = execution
+            .result
+            .last_message_path
+            .as_ref()
+            .filter(|path| path.is_file())
+            .or_else(|| {
+                execution
+                    .result
+                    .stdout_path
+                    .as_ref()
+                    .filter(|path| path.is_file())
+            })
+            .map(std_fs::read_to_string)
+            .transpose()?
+            .unwrap_or_else(|| execution.result.summary.clone());
+        let raw_output = raw_output.trim().to_string();
+        if raw_output.is_empty() {
+            anyhow::bail!(
+                "OpenCode {:?} phase returned an empty response",
+                decision.phase
+            );
+        }
+        Ok(GearOpenCodePhaseOutput {
+            raw_output,
+            execution_identity: execution.execution_identity,
+            artifact_path: execution.result.result_path.to_string_lossy().to_string(),
+        })
+    }
+
+    fn plan(&self, input: PlannerInput) -> Result<PlannerSubmission> {
+        let prompt = gear_opencode_planner_prompt(&input)?;
+        let task_id = format!("planner_{}", input.goal_id);
+        let output = self.run(
+            &input.route_decision,
+            &input.goal_id,
+            &format!("pending_{}", input.goal_id),
+            0,
+            &task_id,
+            GearTaskKind::Plan,
+            input.scope,
+            prompt,
+        )?;
+        let draft = gearbox_agent::plan_graph::parse_planner_draft(&output.raw_output)?;
+        Ok(PlannerSubmission {
+            draft,
+            planner: output.execution_identity,
+            raw_output: output.raw_output,
+            artifact_path: Some(output.artifact_path),
+        })
+    }
+
+    fn critique(&self, input: PlanCriticInput) -> Result<PlanCriticSubmission> {
+        let prompt = gear_opencode_plan_critic_prompt(&input)?;
+        let task_id = format!("plan_critic_{}_{}", input.plan.goal_id, input.plan.revision);
+        let output = self.run(
+            &input.route_decision,
+            &input.plan.goal_id,
+            &input.plan.plan_id,
+            input.plan.revision,
+            &task_id,
+            GearTaskKind::Review,
+            Scope::new(Vec::new(), Vec::new(), 1),
+            prompt,
+        )?;
+        let verdict = PlanCriticVerdict::parse(&output.raw_output)?;
+        Ok(PlanCriticSubmission {
+            reviewer: output.execution_identity,
+            verdict,
+            raw_output: output.raw_output,
+            artifact_path: Some(output.artifact_path),
+        })
+    }
+
+    fn revise(&self, input: PlanRevisionInput) -> Result<PlanRevisionSubmission> {
+        let prompt = gear_opencode_plan_revision_prompt(&input)?;
+        let task_id = format!(
+            "planner_revision_{}_{}",
+            input.plan.goal_id, input.plan.revision
+        );
+        let output = self.run(
+            &input.route_decision,
+            &input.plan.goal_id,
+            &input.plan.plan_id,
+            input.plan.revision,
+            &task_id,
+            GearTaskKind::Plan,
+            Scope::new(Vec::new(), Vec::new(), 1),
+            prompt,
+        )?;
+        let draft = gearbox_agent::plan_graph::parse_planner_draft(&output.raw_output)?;
+        Ok(PlanRevisionSubmission {
+            draft,
+            planner: output.execution_identity,
+            raw_output: output.raw_output,
+            artifact_path: Some(output.artifact_path),
+        })
+    }
+}
+
+fn gear_opencode_planner_prompt(input: &PlannerInput) -> Result<String> {
+    Ok(format!(
+        "You are Gear's read-only planner. Return exactly one PlanGraphDraft JSON object with no markdown fence or prose. The draft must contain objective, must_have, must_not_have, topology_lock, tasks, and final_acceptance. Every task must define task_id, title, goal, deliverable, dependencies, parallel_wave, scope, required_capabilities, preferred_phase_profile, must_do, must_not_do, references, test, qa, artifacts, commit_boundary, and completion_predicates. Dependencies must point to earlier waves. TDD tasks must use the same RED and GREEN command. Include happy and failure QA evidence paths. Do not write code.\n\nGoal:\n{}\n\nScope:\n{}\n\nVerification commands:\n{}",
+        input.request,
+        serde_json::to_string_pretty(&input.scope)?,
+        serde_json::to_string_pretty(&input.verification_commands)?,
+    ))
+}
+
+fn gear_opencode_plan_critic_prompt(input: &PlanCriticInput) -> Result<String> {
+    let evidence = serde_json::to_string_pretty(&serde_json::json!({
+        "request": input.request,
+        "plan": input.plan,
+        "planner_receipt": input.planner_receipt,
+        "deterministic_verifier": input.verifier_report,
+        "phase_route_decision": input.route_decision,
+    }))?;
+    Ok(format!(
+        "You are Gear's independent read-only PlanCritic. Return exactly one PlanCriticVerdict JSON object and no markdown fence. It must bind the exact goal, plan, revision, hash, and planner execution. Return exactly seven checks: references, executability, contradictions, scope, tdd, qa, acceptance. Approve only if all checks and deterministic verification pass. Revise must include blocking findings and concrete revision_instructions. Reject is only for a user decision and must set needs_user_reason.\n\nEvidence:\n{evidence}"
+    ))
+}
+
+fn gear_opencode_plan_revision_prompt(input: &PlanRevisionInput) -> Result<String> {
+    let evidence = serde_json::to_string_pretty(&serde_json::json!({
+        "request": input.request,
+        "current_plan": input.plan,
+        "planner_receipt": input.planner_receipt,
+        "critic_receipt": input.critic_receipt,
+        "phase_route_decision": input.route_decision,
+    }))?;
+    Ok(format!(
+        "You are Gear's read-only planner revising a rejected plan. Apply every blocking required_change and revision_instructions without expanding scope. Return exactly one complete PlanGraphDraft JSON object and no markdown fence or prose.\n\nEvidence:\n{evidence}"
+    ))
 }
 
 async fn generate_gear_coordinator_brief(
@@ -4042,6 +4372,33 @@ fn gear_worker_config_from_env(cx: &App) -> WorkerConfig {
             .any(|route| route.worker_command.is_some());
     }
     gear_apply_provider_model_availability(&mut config, gear_available_provider_models(cx));
+    config
+}
+
+fn gear_open_code_phase_worker_config(mut config: WorkerConfig) -> WorkerConfig {
+    if config
+        .worker_routes
+        .iter()
+        .any(|route| route.worker_kind == WorkerKind::OpencodeSession)
+    {
+        return config;
+    }
+    let command = gear_worker_command_for_kind(WorkerKind::OpencodeSession).or_else(|| {
+        matches!(
+            config.worker_kind,
+            WorkerKind::Opencode | WorkerKind::OpencodeSession
+        )
+        .then(|| config.worker_command.clone())
+        .flatten()
+    });
+    if let Some(command) = command {
+        config.worker_routes.push(WorkerRoute {
+            worker_kind: WorkerKind::OpencodeSession,
+            worker_command: Some(command),
+            worker_model: None,
+        });
+        config.require_worker = true;
+    }
     config
 }
 
@@ -7516,6 +7873,133 @@ mod internal_tests {
         assert_eq!(config.worker_kind, WorkerKind::Opencode);
         assert_eq!(config.worker_command.as_deref(), Some("opencode run"));
         assert!(config.require_worker);
+    }
+
+    #[test]
+    fn gear_open_code_phase_config_reuses_the_opencode_command() {
+        let config = gear_worker_config_from_values(
+            Some("opencode"),
+            Some("opencode run"),
+            None,
+            None,
+            Vec::new(),
+            1,
+            1,
+            1,
+            30,
+        );
+        let config = gear_open_code_phase_worker_config(config);
+        let route = config
+            .worker_routes
+            .iter()
+            .find(|route| route.worker_kind == WorkerKind::OpencodeSession)
+            .expect("OpenCode phase mode must install a resident route");
+        assert_eq!(route.worker_command.as_deref(), Some("opencode run"));
+        assert!(config.require_worker);
+    }
+
+    #[test]
+    fn generic_worker_model_does_not_enable_open_code_phase_mode() -> Result<()> {
+        let profiles = gear_opencode_model_profiles_from_values(
+            false,
+            None,
+            None,
+            None,
+            Some("openai/general-worker".to_string()),
+        )?;
+        assert!(profiles.is_none());
+        assert!(!gear_phase_table_uses_opencode(
+            &PhaseRouteTable::legacy_defaults()
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_open_code_phase_mode_can_reuse_the_generic_worker_model() -> Result<()> {
+        let profiles = gear_opencode_model_profiles_from_values(
+            true,
+            None,
+            Some("deepseek/flash".to_string()),
+            None,
+            Some("openai/planner".to_string()),
+        )?
+        .expect("explicit OpenCode phase mode must resolve profiles");
+        assert_eq!(profiles.planner, "openai/planner");
+        assert_eq!(profiles.executor, "deepseek/flash");
+        assert_eq!(profiles.reviewer, "openai/planner");
+        assert!(gear_phase_table_uses_opencode(
+            &PhaseRouteTable::opencode_only(profiles)?
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn gear_open_code_phase_runner_returns_a_real_worker_identity() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let scope = Scope::new(Vec::new(), Vec::new(), 4);
+        let draft = gearbox_agent::plan_graph::deterministic_fallback_draft(
+            "Build an OpenCode plan",
+            &scope,
+            &["echo verify".to_string()],
+        );
+        let output_path = temp_dir.path().join("planner-output.json");
+        std_fs::write(&output_path, serde_json::to_string(&draft)?)?;
+        let command = format!(
+            "sh -c 'cp {} \"$GEARBOX_WORKER_LAST_MESSAGE\"'",
+            output_path.to_string_lossy()
+        );
+        let worker_config = gear_open_code_phase_worker_config(gear_worker_config_from_values(
+            Some("opencode"),
+            Some(&command),
+            None,
+            None,
+            Vec::new(),
+            1,
+            1,
+            1,
+            30,
+        ));
+        let routes = PhaseRouteTable::opencode_only(OpenCodeModelProfiles {
+            planner: "openai/gpt-planner".to_string(),
+            executor: "deepseek/flash".to_string(),
+            reviewer: "openai/gpt-reviewer".to_string(),
+        })?;
+        let decision =
+            routes.resolve(&PhaseProfile::Planner, &LiveModelInventory::default(), None)?;
+        let runner = GearOpenCodePhaseRunner {
+            broker_factory: Arc::new(PhaseBrokerFactory::new(
+                Arc::new(WorkerRegistry::default()),
+                temp_dir.path().join(".gearbox-agent"),
+            )),
+            workspace: temp_dir.path().to_path_buf(),
+            worker_config,
+            cancellation_token: CancellationToken::new(),
+        };
+        let submission = runner.plan(PlannerInput {
+            goal_id: "goal_opencode_runner".to_string(),
+            request: "Build an OpenCode plan".to_string(),
+            scope,
+            verification_commands: vec!["echo verify".to_string()],
+            route_decision: decision,
+        })?;
+
+        assert_eq!(submission.draft, draft);
+        assert_eq!(
+            submission.planner.backend,
+            PhaseExecutionBackend::WorkerSession
+        );
+        assert_eq!(submission.planner.provider_id.as_deref(), Some("openai"));
+        assert_eq!(
+            submission.planner.actual_session_id.as_deref(),
+            Some("planner_goal_opencode_runner_session")
+        );
+        assert!(
+            submission
+                .artifact_path
+                .as_deref()
+                .is_some_and(|path| Path::new(path).is_file())
+        );
+        Ok(())
     }
 
     #[test]
