@@ -4801,14 +4801,22 @@ fn build_approved_plan_graph_inner(
             timestamp(),
         )?;
         let planner_receipt_path = store.write_planner_execution_receipt(&planner_receipt)?;
+        let planner_worker_task_id =
+            worker_task_id_from_artifact_path(planner_artifact_path.as_deref());
+        let planner_worker_evidence_path = phase_worker_evidence_path(
+            store,
+            &goal.id,
+            planner_worker_task_id.as_deref(),
+            planner_artifact_path.as_deref(),
+        )?;
         let planner_route_receipt = phase_route_receipt_for_identity(
             &planner_decision,
             planner_ordinal,
             &goal.id,
             &plan,
             &planner_identity,
-            Some("planner"),
-            planner_artifact_path.as_deref(),
+            planner_worker_task_id.as_deref(),
+            planner_worker_evidence_path.as_deref(),
         )?;
         let planner_route_receipt_path =
             store.write_phase_route_receipt(&goal.id, planner_ordinal, &planner_route_receipt)?;
@@ -4939,6 +4947,14 @@ fn build_approved_plan_graph_inner(
             &submission.raw_output,
         )?;
         let critic_artifact_path = submission.artifact_path.clone();
+        let critic_worker_task_id =
+            worker_task_id_from_artifact_path(critic_artifact_path.as_deref());
+        let critic_worker_evidence_path = phase_worker_evidence_path(
+            store,
+            &goal.id,
+            critic_worker_task_id.as_deref(),
+            critic_artifact_path.as_deref(),
+        )?;
         let critic_receipt = PlanCriticReceipt::seal(
             &plan,
             &planner_receipt,
@@ -4959,8 +4975,8 @@ fn build_approved_plan_graph_inner(
             &goal.id,
             &plan,
             &submission.reviewer,
-            Some("plan_critic"),
-            critic_artifact_path.as_deref(),
+            critic_worker_task_id.as_deref(),
+            critic_worker_evidence_path.as_deref(),
         )?;
         let critic_route_receipt_path =
             store.write_phase_route_receipt(&goal.id, critic_ordinal, &critic_route_receipt)?;
@@ -5047,6 +5063,14 @@ fn build_approved_plan_graph_inner(
                         &oracle_submission.raw_output,
                     )?;
                     let oracle_artifact_path = oracle_submission.artifact_path.clone();
+                    let oracle_worker_task_id =
+                        worker_task_id_from_artifact_path(oracle_artifact_path.as_deref());
+                    let oracle_worker_evidence_path = phase_worker_evidence_path(
+                        store,
+                        &goal.id,
+                        oracle_worker_task_id.as_deref(),
+                        oracle_artifact_path.as_deref(),
+                    )?;
                     let oracle_receipt = PlanCriticReceipt::seal(
                         &plan,
                         &planner_receipt,
@@ -5085,8 +5109,8 @@ fn build_approved_plan_graph_inner(
                         &goal.id,
                         &plan,
                         &oracle_submission.reviewer,
-                        Some("plan_oracle"),
-                        oracle_artifact_path.as_deref(),
+                        oracle_worker_task_id.as_deref(),
+                        oracle_worker_evidence_path.as_deref(),
                     )?;
                     let oracle_route_receipt_path = store.write_phase_route_receipt(
                         &goal.id,
@@ -5495,6 +5519,52 @@ fn phase_route_receipt_for_identity(
         receipt_hash: String::new(),
     }
     .seal()
+}
+
+fn worker_task_id_from_artifact_path(path: Option<&str>) -> Option<String> {
+    let path = std::path::Path::new(path?);
+    path.parent()?
+        .file_name()?
+        .to_str()
+        .map(ToString::to_string)
+}
+
+fn phase_worker_evidence_path(
+    store: &StateStore,
+    goal_id: &str,
+    task_id: Option<&str>,
+    artifact_path: Option<&str>,
+) -> Result<Option<String>> {
+    let (Some(task_id), Some(artifact_path)) = (task_id, artifact_path) else {
+        return Ok(None);
+    };
+    let source = std::path::Path::new(artifact_path)
+        .parent()
+        .context("worker phase artifact is missing its task directory")?
+        .join("task-record.json");
+    if !source.is_file() {
+        bail!(
+            "worker phase task-record evidence is missing at {}",
+            source.display()
+        );
+    }
+    let destination = store
+        .phase_routes_dir(goal_id)
+        .join("worker-evidence")
+        .join(format!("{task_id}-task-record.json"));
+    if source != destination {
+        if let Some(parent) = destination.parent() {
+            std_fs::create_dir_all(parent)?;
+        }
+        std_fs::copy(&source, &destination).with_context(|| {
+            format!(
+                "failed to copy worker task-record evidence from {} to {}",
+                source.display(),
+                destination.display()
+            )
+        })?;
+    }
+    Ok(Some(destination.to_string_lossy().to_string()))
 }
 
 fn worker_phase_for_route_hint(preferred: &PhaseProfile, route_hint: Option<&str>) -> PhaseProfile {

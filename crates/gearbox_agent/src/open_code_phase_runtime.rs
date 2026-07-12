@@ -19,6 +19,9 @@ use crate::runtime::{
     StrategistNextGoalInput, StrategistNextGoalSubmission, StrategistNextGoalVerdict,
 };
 use crate::state::{Scope, StateStore, Task, TaskInputs, TaskOutputs, TaskStatus, id_timestamp};
+use crate::task_manager::{
+    ManagedTaskStatus, ResidencyState, TaskAttempt, TaskAttemptStatus, TaskRecord,
+};
 use crate::tools::CancellationToken;
 use crate::worker_broker::PhaseBrokerFactory;
 use crate::workers::{WorkerConfig, WorkerKind, WorkerStartRequest, WorkerStatus};
@@ -133,6 +136,7 @@ pub struct OpenCodePhaseRunner {
 }
 
 const MAX_PLANNER_SCHEMA_REPAIRS: usize = 2;
+const MAX_INTENT_REPAIRS: usize = 1;
 
 struct OpenCodePhaseOutput {
     raw_output: String,
@@ -212,6 +216,7 @@ impl OpenCodePhaseRunner {
                 execution.result.summary
             );
         }
+        write_phase_task_record(&store, &task, &config, phase_route_hint, &execution)?;
         let raw_output = execution
             .result
             .last_message_path
@@ -243,24 +248,47 @@ impl OpenCodePhaseRunner {
 
     pub fn fold_intent(&self, input: IntentFoldInput) -> Result<IntentFoldSubmission> {
         let prompt = gear_opencode_intent_fold_prompt(&input)?;
-        let task_id = format!("intent_fold_{}", input.goal_id);
-        let output = self.run(
+        let mut output = self.run(
             &input.route_decision,
             &input.goal_id,
             &format!("pending_{}", input.goal_id),
             0,
-            &task_id,
+            &format!("intent_fold_{}", input.goal_id),
             crate::state::TaskKind::Spec,
             input.scope.clone(),
             prompt,
         )?;
-        let verdict = IntentFoldVerdict::parse(&output.raw_output)?;
-        Ok(IntentFoldSubmission {
-            verdict,
-            analyst: output.execution_identity,
-            raw_output: output.raw_output,
-            artifact_path: Some(output.artifact_path),
-        })
+        for repair_attempt in 0..=MAX_INTENT_REPAIRS {
+            let verdict = IntentFoldVerdict::parse(&output.raw_output)?;
+            let requires_repair = verdict.decision
+                == crate::plan_review::IntentFoldDecision::NeedsUser
+                || !verdict.required_questions.is_empty();
+            if !requires_repair || repair_attempt >= MAX_INTENT_REPAIRS {
+                return Ok(IntentFoldSubmission {
+                    verdict,
+                    analyst: output.execution_identity,
+                    raw_output: output.raw_output,
+                    artifact_path: Some(output.artifact_path),
+                });
+            }
+            let repair_prompt =
+                gear_opencode_intent_repair_prompt(&input, &output.raw_output, repair_attempt + 1)?;
+            output = self.run(
+                &input.route_decision,
+                &input.goal_id,
+                &format!("pending_{}", input.goal_id),
+                0,
+                &format!(
+                    "intent_fold_{}_repair_{}",
+                    input.goal_id,
+                    repair_attempt + 1
+                ),
+                crate::state::TaskKind::Spec,
+                input.scope.clone(),
+                repair_prompt,
+            )?;
+        }
+        bail!("intent fold repair loop terminated unexpectedly")
     }
 
     pub fn plan(&self, input: PlannerInput) -> Result<PlannerSubmission> {
@@ -468,6 +496,68 @@ impl OpenCodePhaseRunner {
     }
 }
 
+fn write_phase_task_record(
+    store: &StateStore,
+    task: &Task,
+    config: &WorkerConfig,
+    route_hint: Option<&str>,
+    execution: &crate::worker_broker::PhaseWorkerExecution,
+) -> Result<()> {
+    let route = config.selected_route_for_hint(1, route_hint);
+    let finished_at = crate::state::timestamp();
+    let session_id = Some(execution.session_identity.session_id.clone());
+    let attempt = TaskAttempt {
+        attempt: task.attempt,
+        worker_kind: route.worker_kind.as_str().to_string(),
+        worker_command: route.worker_command.map(ToString::to_string),
+        worker_model: route.worker_model.map(ToString::to_string),
+        worker_category: route.category.as_str().to_string(),
+        route_hint: route_hint.map(ToString::to_string),
+        route_reason: route.route_reason.clone(),
+        status: TaskAttemptStatus::Completed,
+        started_at: finished_at.clone(),
+        finished_at: Some(finished_at.clone()),
+        session_id: session_id.clone(),
+        result_path: Some(execution.result.result_path.clone()),
+        outcome_path: Some(execution.result.outcome_path.clone()),
+        summary: execution.result.summary.clone(),
+        failure_kind: None,
+        retry_reason: None,
+        error: None,
+    };
+    let record = TaskRecord {
+        task_id: task.id.clone(),
+        worker_kind: route.worker_kind.as_str().to_string(),
+        worker_command: route.worker_command.map(ToString::to_string),
+        worker_model: route.worker_model.map(ToString::to_string),
+        worker_category: route.category.as_str().to_string(),
+        route_hint: route_hint.map(ToString::to_string),
+        route_reason: route.route_reason,
+        status: ManagedTaskStatus::Completed,
+        started_at: finished_at.clone(),
+        finished_at: Some(finished_at),
+        residency_state: ResidencyState::PersistedOnly,
+        run_epoch: 0,
+        notified_epoch: -1,
+        notification_failed_epoch: None,
+        killed: false,
+        session_id,
+        parent_session_id: None,
+        root_session_id: None,
+        parent_task_id: task.parent_task_id.clone(),
+        result_path: Some(execution.result.result_path.clone()),
+        outcome_path: Some(execution.result.outcome_path.clone()),
+        summary: execution.result.summary.clone(),
+        failure_kind: None,
+        retry_reason: None,
+        error: None,
+        attempts: vec![attempt],
+    };
+    let json = serde_json::to_string_pretty(&record)?;
+    store.write_worker_file(&task.id, "task-record.json", &format!("{json}\n"))?;
+    Ok(())
+}
+
 fn sha256_hex(value: &str) -> String {
     use sha2::{Digest as _, Sha256};
     format!("{:x}", Sha256::digest(value.as_bytes()))
@@ -535,10 +625,24 @@ fn gear_opencode_planner_repair_prompt(
 
 fn gear_opencode_intent_fold_prompt(input: &IntentFoldInput) -> Result<String> {
     Ok(format!(
-        "You are Gear's Metis-style read-only intent analyst. Do not plan tasks and do not write code. Return exactly one IntentFoldVerdict JSON object with no markdown fence or prose. Required shape: {{\"schema_version\":1,\"goal_id\":\"exact goal id\",\"normalized_objective\":\"clear outcome\",\"assumptions\":[\"explicit inference\"],\"constraints\":[\"binding boundary\"],\"ambiguities\":[\"remaining ambiguity\"],\"required_questions\":[\"only questions that change the solution\"],\"risks\":[{{\"code\":\"stable_code\",\"severity\":\"low|medium|high\",\"description\":\"specific risk\",\"mitigation\":\"specific mitigation\"}}],\"acceptance_signals\":[\"observable result\"],\"decision\":\"ready|needs_user\",\"summary\":\"concise conclusion\"}}. Use ready only when required_questions is empty. Ask no question that repository inspection can answer.\n\nGoal id: {}\nRequest:\n{}\n\nScope:\n{}",
+        "You are Gear's Metis-style read-only intent analyst. Do not plan tasks and do not write code. Return exactly one IntentFoldVerdict JSON object with no markdown fence or prose. Required shape: {{\"schema_version\":1,\"goal_id\":\"exact goal id\",\"normalized_objective\":\"clear outcome\",\"assumptions\":[\"explicit inference\"],\"constraints\":[\"binding boundary\"],\"ambiguities\":[\"remaining ambiguity\"],\"required_questions\":[\"only questions that change the solution\"],\"risks\":[{{\"code\":\"stable_code\",\"severity\":\"low|medium|high\",\"description\":\"specific risk\",\"mitigation\":\"specific mitigation\"}}],\"acceptance_signals\":[\"observable result\"],\"decision\":\"ready|needs_user\",\"summary\":\"concise conclusion\"}}. Use ready when the user has specified the behavior, scope, and acceptance. Gear owns runtime mechanics: evidence is stored under `.gearbox-agent/artifacts/<goal_id>`, verification commands are supplied by Gear, and workspace scope is enforced before dispatch. Do not ask where these artifacts live, how to run commands, or how phases are sequenced. Use needs_user only for a real product or safety decision that repository inspection and the runtime contract cannot resolve.\n\nGoal id: {}\nRequest:\n{}\n\nScope:\n{}",
         input.goal_id,
         input.request,
         serde_json::to_string_pretty(&input.scope)?,
+    ))
+}
+
+fn gear_opencode_intent_repair_prompt(
+    input: &IntentFoldInput,
+    raw_output: &str,
+    attempt: usize,
+) -> Result<String> {
+    Ok(format!(
+        "You are Gear's Metis-style intent analyst on fresh repair turn {attempt}. Return one complete IntentFoldVerdict JSON object only. Re-evaluate the request, preserving real product ambiguities, but do not ask the user about runtime-owned mechanics: Gear stores generated evidence under `.gearbox-agent/artifacts/<goal_id>`, runs verification commands supplied below, and enforces the workspace scope. Ask a question only when the user must choose behavior, scope, destructive action, or acceptance semantics. If those are explicit, return `ready` with empty required_questions. Do not write files.\n\nOriginal request:\n{}\n\nScope:\n{}\n\nVerification commands:\n{}\n\nPrevious verdict:\n{}",
+        input.request,
+        serde_json::to_string_pretty(&input.scope)?,
+        serde_json::to_string_pretty(&Vec::<String>::new())?,
+        raw_output,
     ))
 }
 
@@ -686,6 +790,57 @@ mod tests {
         assert!(runtime.oracle_hook.is_some());
         assert!(runtime.plan_revision_hook.is_some());
         assert!(runtime.strategist_next_goal_hook.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn intent_fold_repairs_runtime_owned_questions_on_a_fresh_turn() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let counter_path = temp_dir.path().join("intent-turn-count");
+        let script_path = temp_dir.path().join("intent-worker.sh");
+        std::fs::write(
+            &script_path,
+            format!(
+                r#"#!/bin/sh
+count=0
+[ -f '{counter}' ] && count=$(cat '{counter}')
+count=$((count + 1))
+printf '%s' "$count" > '{counter}'
+if [ "$count" -eq 1 ]; then printf '%s' '{{"schema_version":1,"goal_id":"intent_goal","normalized_objective":"outcome","required_questions":["where are artifacts?"],"decision":"needs_user","summary":"needs runtime clarification"}}' > "$GEARBOX_WORKER_LAST_MESSAGE"; else printf '%s' '{{"schema_version":1,"goal_id":"intent_goal","normalized_objective":"outcome","acceptance_signals":["verified"],"decision":"ready","summary":"ready"}}' > "$GEARBOX_WORKER_LAST_MESSAGE"; fi
+"#,
+                counter = counter_path.to_string_lossy(),
+            ),
+        )?;
+        let mut config = test_worker_config();
+        config.worker_command = Some(format!("sh {}", script_path.to_string_lossy()));
+        let broker_factory = Arc::new(PhaseBrokerFactory::new(
+            Arc::new(WorkerRegistry::default()),
+            temp_dir.path().join(".gearbox-agent"),
+        ));
+        let routes = PhaseRouteTable::opencode_only(OpenCodeModelProfiles {
+            planner: "openai/gpt-planner".to_string(),
+            executor: "deepseek/flash".to_string(),
+            reviewer: "openai/gpt-reviewer".to_string(),
+        })?;
+        let runner = OpenCodePhaseRunner {
+            broker_factory,
+            workspace: temp_dir.path().to_path_buf(),
+            worker_config: config,
+            cancellation_token: CancellationToken::new(),
+        };
+        let decision =
+            routes.resolve(&PhaseProfile::Planner, &LiveModelInventory::default(), None)?;
+        let submission = runner.fold_intent(IntentFoldInput {
+            goal_id: "intent_goal".to_string(),
+            request: "produce the explicit outcome".to_string(),
+            scope: Scope::new(Vec::new(), Vec::new(), 1),
+            route_decision: decision,
+        })?;
+        assert_eq!(
+            submission.verdict.decision,
+            crate::plan_review::IntentFoldDecision::Ready
+        );
+        assert_eq!(std::fs::read_to_string(counter_path)?, "2");
         Ok(())
     }
 
