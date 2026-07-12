@@ -370,6 +370,7 @@ pub struct PhaseRuntime {
     pub intent_fold_hook: Option<IntentFoldHook>,
     pub planner_hook: Option<PlannerHook>,
     pub plan_critic_hook: Option<PlanCriticHook>,
+    pub oracle_hook: Option<PlanCriticHook>,
     pub plan_revision_hook: Option<PlanRevisionHook>,
     pub strategist_next_goal_hook: Option<StrategistNextGoalHook>,
     pub require_plan_approval: bool,
@@ -396,6 +397,7 @@ impl PhaseRuntime {
             intent_fold_hook: None,
             planner_hook: None,
             plan_critic_hook: None,
+            oracle_hook: None,
             plan_revision_hook: None,
             strategist_next_goal_hook: None,
             require_plan_approval: false,
@@ -4995,6 +4997,7 @@ fn build_approved_plan_graph_inner(
                         budget_context,
                         &oracle_budget_key,
                     )?;
+                    let oracle_hook = phase_runtime.oracle_hook.as_ref().unwrap_or(critic_hook);
                     let oracle_submission_result = run_phase_via_broker(
                         phase_runtime.broker.as_deref(),
                         phase_runtime.broker_factory.as_deref(),
@@ -5005,7 +5008,7 @@ fn build_approved_plan_graph_inner(
                         "plan_oracle",
                         &oracle_identity,
                         || {
-                            critic_hook(PlanCriticInput {
+                            oracle_hook(PlanCriticInput {
                                 request: goal.request.clone(),
                                 plan: plan.clone(),
                                 planner_receipt: planner_receipt.clone(),
@@ -9121,6 +9124,7 @@ mod tests {
             intent_fold_hook: None,
             planner_hook: None,
             plan_critic_hook: critic_hook,
+            oracle_hook: None,
             plan_revision_hook: None,
             strategist_next_goal_hook: None,
             require_plan_approval: true,
@@ -9454,6 +9458,7 @@ mod tests {
             intent_fold_hook: None,
             planner_hook: Some(planner_hook),
             plan_critic_hook: None,
+            oracle_hook: None,
             plan_revision_hook: None,
             strategist_next_goal_hook: Some(strategist_hook),
             require_plan_approval: false,
@@ -9980,6 +9985,7 @@ mod tests {
             intent_fold_hook: Some(intent_fold_hook),
             planner_hook: Some(planner_hook),
             plan_critic_hook: None,
+            oracle_hook: None,
             plan_revision_hook: None,
             strategist_next_goal_hook: None,
             require_plan_approval: false,
@@ -13624,6 +13630,7 @@ mod tests {
             intent_fold_hook: None,
             planner_hook: None,
             plan_critic_hook: Some(critic_hook),
+            oracle_hook: None,
             plan_revision_hook: Some(revision_hook),
             strategist_next_goal_hook: None,
             require_plan_approval: true,
@@ -13758,6 +13765,7 @@ mod tests {
             intent_fold_hook: None,
             planner_hook: None,
             plan_critic_hook: None,
+            oracle_hook: None,
             plan_revision_hook: None,
             strategist_next_goal_hook: None,
             require_plan_approval: false,
@@ -14325,6 +14333,7 @@ mod tests {
             intent_fold_hook: None,
             planner_hook: None,
             plan_critic_hook: None,
+            oracle_hook: None,
             plan_revision_hook: None,
             strategist_next_goal_hook: None,
             require_plan_approval: false,

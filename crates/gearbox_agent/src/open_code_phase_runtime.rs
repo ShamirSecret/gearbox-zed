@@ -81,6 +81,12 @@ impl OpenCodePhaseRuntimeFactory {
             broker_factory: broker_factory.clone(),
             cancellation_token: cancellation_token.clone(),
         };
+        let oracle_runner = OpenCodePhaseRunner {
+            workspace: workspace.clone(),
+            worker_config: worker_config.clone(),
+            broker_factory: broker_factory.clone(),
+            cancellation_token: cancellation_token.clone(),
+        };
         let revision_runner = OpenCodePhaseRunner {
             workspace: workspace.clone(),
             worker_config: worker_config.clone(),
@@ -102,6 +108,7 @@ impl OpenCodePhaseRuntimeFactory {
             intent_fold_hook: Some(Arc::new(move |input| intent_fold_runner.fold_intent(input))),
             planner_hook: Some(Arc::new(move |input| planner_runner.plan(input))),
             plan_critic_hook: Some(Arc::new(move |input| critic_runner.critique(input))),
+            oracle_hook: Some(Arc::new(move |input| oracle_runner.oracle(input))),
             plan_revision_hook: Some(Arc::new(move |input| revision_runner.revise(input))),
             strategist_next_goal_hook: Some(Arc::new(move |input| {
                 strategist_runner.strategize(input)
@@ -318,8 +325,24 @@ impl OpenCodePhaseRunner {
     }
 
     pub fn critique(&self, input: PlanCriticInput) -> Result<PlanCriticSubmission> {
-        let prompt = gear_opencode_plan_critic_prompt(&input)?;
-        let task_id = format!("plan_critic_{}_{}", input.plan.goal_id, input.plan.revision);
+        self.review(input, "plan_critic", gear_opencode_plan_critic_prompt)
+    }
+
+    pub fn oracle(&self, input: PlanCriticInput) -> Result<PlanCriticSubmission> {
+        self.review(input, "plan_oracle", gear_opencode_oracle_prompt)
+    }
+
+    fn review(
+        &self,
+        input: PlanCriticInput,
+        task_prefix: &str,
+        prompt_builder: fn(&PlanCriticInput) -> Result<String>,
+    ) -> Result<PlanCriticSubmission> {
+        let prompt = prompt_builder(&input)?;
+        let task_id = format!(
+            "{task_prefix}_{}_{}",
+            input.plan.goal_id, input.plan.revision
+        );
         let output = self.run(
             &input.route_decision,
             &input.plan.goal_id,
@@ -472,6 +495,19 @@ fn gear_opencode_plan_critic_prompt(input: &PlanCriticInput) -> Result<String> {
     ))
 }
 
+fn gear_opencode_oracle_prompt(input: &PlanCriticInput) -> Result<String> {
+    let evidence = serde_json::to_string_pretty(&serde_json::json!({
+        "request": input.request,
+        "plan": input.plan,
+        "planner_receipt": input.planner_receipt,
+        "deterministic_verifier": input.verifier_report,
+        "phase_route_decision": input.route_decision,
+    }))?;
+    Ok(format!(
+        "You are Gear's independent Oracle, in a fresh read-only session separate from Momus. Re-read the exact plan and inspect every referenced repository path with available read/search tools before deciding. Do not write or edit files and do not trust claims that are not supported by the repository. Return exactly one PlanCriticVerdict JSON object with no markdown fence. Check references, executability, contradictions, scope, tdd, qa, and acceptance. Return at most three actionable blocking findings; approve only when the plan is executable and evidence-backed.\n\nEvidence:\n{evidence}"
+    ))
+}
+
 fn gear_opencode_plan_revision_prompt(input: &PlanRevisionInput) -> Result<String> {
     let evidence = serde_json::to_string_pretty(&serde_json::json!({
         "request": input.request,
@@ -587,6 +623,7 @@ mod tests {
         assert!(runtime.intent_fold_hook.is_some());
         assert!(runtime.planner_hook.is_some());
         assert!(runtime.plan_critic_hook.is_some());
+        assert!(runtime.oracle_hook.is_some());
         assert!(runtime.plan_revision_hook.is_some());
         assert!(runtime.strategist_next_goal_hook.is_some());
         Ok(())
