@@ -361,6 +361,7 @@ pub enum GoalEpochEventKind {
     Started,
     BudgetReserved,
     BudgetSettled,
+    NextGoalSelected,
     PhaseCompleted,
     Settled,
     Aborted,
@@ -617,6 +618,7 @@ pub enum EventKind {
     GoalCompleted,
     GoalBlocked,
     GoalLimited,
+    NextGoalSelected,
 }
 
 #[derive(Clone, Debug)]
@@ -1747,6 +1749,7 @@ fn validate_goal_epoch_transition(
         }
         GoalEpochEventKind::BudgetReserved
         | GoalEpochEventKind::BudgetSettled
+        | GoalEpochEventKind::NextGoalSelected
         | GoalEpochEventKind::PhaseCompleted => {
             if active_epoch.as_deref() != Some(event.epoch_id.as_str()) {
                 bail!("phase completion is not bound to the active goal epoch");

@@ -61,6 +61,9 @@ pub type PlanCriticHook =
     Arc<dyn Fn(PlanCriticInput) -> Result<PlanCriticSubmission> + Send + Sync + 'static>;
 pub type PlanRevisionHook =
     Arc<dyn Fn(PlanRevisionInput) -> Result<PlanRevisionSubmission> + Send + Sync + 'static>;
+pub type StrategistNextGoalHook = Arc<
+    dyn Fn(StrategistNextGoalInput) -> Result<StrategistNextGoalSubmission> + Send + Sync + 'static,
+>;
 pub const DEFAULT_MAX_ITERATIONS: usize = 5;
 pub const DEFAULT_MAX_PROVIDER_UNKNOWN_STREAK: usize = 2;
 pub const DEFAULT_MAX_RUNTIME_MINUTES: usize = 60;
@@ -186,6 +189,173 @@ pub struct PlanRevisionSubmission {
     pub artifact_path: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StrategistNextGoalDecision {
+    Complete,
+    Continue,
+    NeedsUser,
+    Stop,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StrategistNextGoalVerdict {
+    pub schema_version: u32,
+    pub goal_id: String,
+    pub epoch_id: String,
+    pub reviewed_status: GoalStatus,
+    pub decision: StrategistNextGoalDecision,
+    pub next_objective: Option<String>,
+    #[serde(default)]
+    pub acceptance_signals: Vec<String>,
+    #[serde(default)]
+    pub required_questions: Vec<String>,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+    pub rationale: String,
+}
+
+impl StrategistNextGoalVerdict {
+    pub fn parse(raw_output: &str) -> Result<Self> {
+        serde_json::from_str(raw_output.trim())
+            .context("strategist did not return one strict next-goal JSON object")
+    }
+
+    pub fn validate(&self, goal_id: &str, epoch_id: &str, status: &GoalStatus) -> Result<()> {
+        if self.schema_version != 1
+            || self.goal_id != goal_id
+            || self.epoch_id != epoch_id
+            || &self.reviewed_status != status
+        {
+            bail!("strategist verdict has an invalid schema or review binding");
+        }
+        if self.rationale.trim().is_empty() {
+            bail!("strategist verdict requires a rationale");
+        }
+        for value in self
+            .acceptance_signals
+            .iter()
+            .chain(&self.required_questions)
+            .chain(&self.evidence_refs)
+        {
+            if value.trim().is_empty() {
+                bail!("strategist verdict contains an empty evidence or decision value");
+            }
+        }
+        match self.decision {
+            StrategistNextGoalDecision::Continue => {
+                if self
+                    .next_objective
+                    .as_deref()
+                    .is_none_or(|objective| objective.trim().is_empty())
+                    || self.acceptance_signals.is_empty()
+                    || !self.required_questions.is_empty()
+                {
+                    bail!("continue verdict requires an objective and acceptance signals");
+                }
+            }
+            StrategistNextGoalDecision::NeedsUser => {
+                if self.reviewed_status != GoalStatus::NeedsUser
+                    || self.required_questions.is_empty()
+                    || self.next_objective.is_some()
+                {
+                    bail!("needs-user verdict requires questions and no next objective");
+                }
+            }
+            StrategistNextGoalDecision::Complete => {
+                if self.reviewed_status != GoalStatus::Complete
+                    || self.next_objective.is_some()
+                    || !self.required_questions.is_empty()
+                {
+                    bail!("complete strategist verdict requires a completed goal");
+                }
+            }
+            StrategistNextGoalDecision::Stop => {
+                if self.next_objective.is_some() || !self.required_questions.is_empty() {
+                    bail!("terminal strategist verdict cannot carry a next objective or question");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct StrategistNextGoalInput {
+    pub goal_id: String,
+    pub epoch_id: String,
+    pub request: String,
+    pub status: GoalStatus,
+    pub summary: String,
+    pub plan: PlanGraph,
+    pub final_report_path: String,
+    pub budget_ledger: crate::state::GoalBudgetLedger,
+    pub route_decision: PhaseRouteDecision,
+}
+
+#[derive(Clone, Debug)]
+pub struct StrategistNextGoalSubmission {
+    pub verdict: StrategistNextGoalVerdict,
+    pub strategist: PhaseExecutionIdentity,
+    pub raw_output: String,
+    pub artifact_path: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StrategistNextGoalReceipt {
+    pub schema_version: u32,
+    pub verdict: StrategistNextGoalVerdict,
+    pub strategist: PhaseExecutionIdentity,
+    pub raw_output_sha256: String,
+    pub artifact_path: Option<String>,
+    pub created_at: String,
+    pub receipt_hash: String,
+}
+
+impl StrategistNextGoalReceipt {
+    fn seal(submission: StrategistNextGoalSubmission) -> Result<Self> {
+        let mut receipt = Self {
+            schema_version: 1,
+            verdict: submission.verdict,
+            strategist: submission.strategist,
+            raw_output_sha256: format!("{:x}", Sha256::digest(submission.raw_output.as_bytes())),
+            artifact_path: submission.artifact_path,
+            created_at: timestamp(),
+            receipt_hash: String::new(),
+        };
+        receipt.strategist.validate()?;
+        receipt.receipt_hash = receipt.expected_hash()?;
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.schema_version != 1
+            || self.raw_output_sha256.len() != 64
+            || self.receipt_hash != self.expected_hash()?
+        {
+            bail!("strategist receipt integrity validation failed");
+        }
+        self.strategist.validate()?;
+        self.verdict.validate(
+            &self.verdict.goal_id,
+            &self.verdict.epoch_id,
+            &self.verdict.reviewed_status,
+        )?;
+        Ok(())
+    }
+
+    fn expected_hash(&self) -> Result<String> {
+        let mut payload = self.clone();
+        payload.receipt_hash.clear();
+        let bytes =
+            serde_json::to_vec(&payload).context("failed to serialize strategist receipt")?;
+        Ok(format!("{:x}", Sha256::digest(bytes)))
+    }
+}
+
 #[derive(Clone)]
 pub struct PhaseRuntime {
     pub routes: PhaseRouteTable,
@@ -196,6 +366,7 @@ pub struct PhaseRuntime {
     pub planner_hook: Option<PlannerHook>,
     pub plan_critic_hook: Option<PlanCriticHook>,
     pub plan_revision_hook: Option<PlanRevisionHook>,
+    pub strategist_next_goal_hook: Option<StrategistNextGoalHook>,
     pub require_plan_approval: bool,
     pub max_plan_revisions: usize,
     /// Optional worker broker for phase lifecycle management.
@@ -221,6 +392,7 @@ impl PhaseRuntime {
             planner_hook: None,
             plan_critic_hook: None,
             plan_revision_hook: None,
+            strategist_next_goal_hook: None,
             require_plan_approval: false,
             max_plan_revisions: DEFAULT_MAX_PLAN_REVISIONS,
             broker: None,
@@ -2004,6 +2176,29 @@ impl Orchestrator {
             &verification_results,
         );
         let final_report_path = store.write_artifact(&goal_id, "final-report.md", &final_report)?;
+        let mut strategist_prior_execution_ids = Vec::new();
+        if let Some(planner_session_id) = plan_graph
+            .planner
+            .as_ref()
+            .and_then(|planner| planner.session_id.clone())
+        {
+            strategist_prior_execution_ids.push(planner_session_id);
+        }
+        if let Some(executor_execution_id) = last_executor_execution_id.clone() {
+            strategist_prior_execution_ids.push(executor_execution_id);
+        }
+        let _strategist_receipt = run_strategist_next_goal(
+            &mut goal,
+            &epoch_id,
+            &plan_graph,
+            &final_report_path,
+            &store,
+            &session_id,
+            &options.event_sink,
+            &phase_runtime,
+            &goal_run_lease,
+            &strategist_prior_execution_ids,
+        )?;
         complete_task(&mut tasks, "task_006", |task| {
             task.outputs.summary = "Final report artifact created.".to_string();
             task.outputs
@@ -2182,6 +2377,104 @@ fn settle_planning_phase_budget(
         }),
     )?;
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_strategist_next_goal(
+    goal: &mut Goal,
+    epoch_id: &str,
+    plan: &PlanGraph,
+    final_report_path: &std::path::Path,
+    store: &StateStore,
+    session_id: &str,
+    event_sink: &Option<EventSink>,
+    phase_runtime: &PhaseRuntime,
+    lease: &GoalRunLeaseGuard,
+    prior_execution_ids: &[String],
+) -> Result<Option<StrategistNextGoalReceipt>> {
+    let Some(hook) = phase_runtime.strategist_next_goal_hook.as_ref() else {
+        return Ok(None);
+    };
+    let route_decision = phase_runtime.routes.resolve(
+        &PhaseProfile::StrategistNextGoal,
+        &phase_runtime.inventory,
+        phase_runtime.current_model.as_ref(),
+    )?;
+    check_phase_terminal_state(&route_decision)
+        .context("strategist next-goal phase terminal state check failed")?;
+    let phase_key = "strategist-next-goal";
+    let budget_reservation =
+        reserve_planning_phase_budget(goal, store, Some((lease, epoch_id)), phase_key)?;
+    let submission_result = hook(StrategistNextGoalInput {
+        goal_id: goal.id.clone(),
+        epoch_id: epoch_id.to_string(),
+        request: goal.request.clone(),
+        status: goal.status.clone(),
+        summary: goal.summary.clone(),
+        plan: plan.clone(),
+        final_report_path: final_report_path.to_string_lossy().to_string(),
+        budget_ledger: store.read_goal_budget_ledger(&goal.id)?,
+        route_decision: route_decision.clone(),
+    })
+    .context("strategist next-goal hook failed");
+    settle_planning_phase_budget(
+        goal,
+        store,
+        Some((lease, epoch_id)),
+        budget_reservation.as_deref(),
+        phase_key,
+    )?;
+    let submission = submission_result?;
+    let parsed = StrategistNextGoalVerdict::parse(&submission.raw_output)?;
+    if parsed != submission.verdict {
+        bail!("strategist raw output does not match its typed verdict");
+    }
+    submission
+        .verdict
+        .validate(&goal.id, epoch_id, &goal.status)?;
+    validate_phase_execution_identity(&route_decision, &submission.strategist)?;
+    if prior_execution_ids.iter().any(|prior| {
+        prior == &submission.strategist.execution_id
+            || prior == &submission.strategist.phase_session_id
+            || submission.strategist.actual_session_id.as_ref() == Some(prior)
+    }) {
+        bail!("strategist must use a fresh execution identity and session");
+    }
+    let receipt = StrategistNextGoalReceipt::seal(submission)?;
+    let receipt_json = serde_json::to_string_pretty(&receipt)?;
+    let receipt_path = store.write_artifact(
+        &goal.id,
+        "strategist-next-goal-receipt.json",
+        &format!("{receipt_json}\n"),
+    )?;
+    store.append_goal_epoch_event(
+        &goal.id,
+        epoch_id,
+        &format!("{epoch_id}.strategist-next-goal.selected"),
+        GoalEpochEventKind::NextGoalSelected,
+        json!({
+            "decision": receipt.verdict.decision,
+            "next_objective": receipt.verdict.next_objective,
+            "receipt_hash": receipt.receipt_hash,
+            "receipt_path": receipt_path.to_string_lossy(),
+        }),
+    )?;
+    append_event(
+        store,
+        event_sink,
+        event(
+            session_id,
+            Some(&goal.id),
+            None,
+            EventKind::NextGoalSelected,
+            "Strategist next-goal decision recorded",
+            json!({
+                "decision": receipt.verdict.decision,
+                "receipt_path": receipt_path.to_string_lossy(),
+            }),
+        ),
+    )?;
+    Ok(Some(receipt))
 }
 
 fn build_approved_plan_graph(
@@ -6208,6 +6501,7 @@ mod tests {
             planner_hook: None,
             plan_critic_hook: critic_hook,
             plan_revision_hook: None,
+            strategist_next_goal_hook: None,
             require_plan_approval: true,
             max_plan_revisions: 2,
             broker: None,
@@ -6345,6 +6639,35 @@ mod tests {
                 artifact_path: None,
             })
         });
+        let strategist_hook: StrategistNextGoalHook = Arc::new(|input| {
+            let verdict = StrategistNextGoalVerdict {
+                schema_version: 1,
+                goal_id: input.goal_id,
+                epoch_id: input.epoch_id,
+                reviewed_status: input.status,
+                decision: StrategistNextGoalDecision::Continue,
+                next_objective: Some("Add persistence to the task tracker".to_string()),
+                acceptance_signals: vec!["Tasks survive a restart".to_string()],
+                required_questions: Vec::new(),
+                evidence_refs: vec![input.final_report_path],
+                rationale: "The first goal passed and the next bounded improvement is clear"
+                    .to_string(),
+            };
+            Ok(StrategistNextGoalSubmission {
+                raw_output: serde_json::to_string(&verdict)?,
+                verdict,
+                strategist: PhaseExecutionIdentity {
+                    execution_id: "strategist_execution".to_string(),
+                    phase_session_id: "strategist_phase".to_string(),
+                    backend: PhaseExecutionBackend::WorkerSession,
+                    agent_id: Some(WorkerKind::OpencodeSession.as_str().to_string()),
+                    provider_id: Some("openai".to_string()),
+                    model_id: Some("gpt-planner".to_string()),
+                    actual_session_id: Some("strategist_session".to_string()),
+                },
+                artifact_path: None,
+            })
+        });
         let phase_runtime = PhaseRuntime {
             routes: PhaseRouteTable::opencode_only(crate::phase_routing::OpenCodeModelProfiles {
                 planner: "openai/gpt-planner".to_string(),
@@ -6358,6 +6681,7 @@ mod tests {
             planner_hook: Some(planner_hook),
             plan_critic_hook: None,
             plan_revision_hook: None,
+            strategist_next_goal_hook: Some(strategist_hook),
             require_plan_approval: false,
             max_plan_revisions: 2,
             broker: None,
@@ -6409,6 +6733,36 @@ mod tests {
             crate::state::BudgetReservationStatus::Settled
         );
         assert!(goal.coordinator_brief.is_some());
+        goal.status = GoalStatus::Complete;
+        goal.summary = "Initial objective complete".to_string();
+        let final_report_path = store.write_artifact(&goal.id, "final-report.md", "complete\n")?;
+        let strategist = run_strategist_next_goal(
+            &mut goal,
+            epoch_id,
+            &plan,
+            &final_report_path,
+            &store,
+            "session-opencode-planner",
+            &None,
+            &phase_runtime,
+            &lease,
+            &["opencode_planner_session".to_string()],
+        )?
+        .context("strategist receipt should be produced")?;
+        assert_eq!(
+            strategist.verdict.decision,
+            StrategistNextGoalDecision::Continue
+        );
+        assert!(
+            store
+                .artifact_dir(&goal.id)
+                .join("strategist-next-goal-receipt.json")
+                .is_file()
+        );
+        assert_eq!(
+            store.read_goal_budget_ledger(&goal.id)?.reservations.len(),
+            2
+        );
         lease.release()?;
         Ok(())
     }
@@ -6478,6 +6832,7 @@ mod tests {
             planner_hook: Some(planner_hook),
             plan_critic_hook: None,
             plan_revision_hook: None,
+            strategist_next_goal_hook: None,
             require_plan_approval: false,
             max_plan_revisions: 2,
             broker: None,
@@ -10117,6 +10472,7 @@ mod tests {
             planner_hook: None,
             plan_critic_hook: Some(critic_hook),
             plan_revision_hook: Some(revision_hook),
+            strategist_next_goal_hook: None,
             require_plan_approval: true,
             max_plan_revisions: 2,
             broker: Some(broker.clone()),

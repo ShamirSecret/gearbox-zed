@@ -73,6 +73,8 @@ use gearbox_agent::runtime::{
     IntentFoldHook, IntentFoldInput, IntentFoldSubmission, Orchestrator, PhaseRuntime,
     PlanCriticHook, PlanCriticInput, PlanCriticSubmission, PlanRevisionHook, PlanRevisionInput,
     PlanRevisionSubmission, PlannerHook, PlannerInput, PlannerSubmission, RunOptions,
+    StrategistNextGoalHook, StrategistNextGoalInput, StrategistNextGoalSubmission,
+    StrategistNextGoalVerdict,
 };
 use gearbox_agent::state::{
     Budget, ContinuationStatus, CoordinatorModel, EventKind, Scope, StateStore, Task as GearTask,
@@ -2950,6 +2952,12 @@ impl NativeAgentConnection {
                         .context("failed to receive Gear plan revision response")?
                 })
             };
+            let strategist_next_goal_hook = if planner_uses_opencode {
+                let runner = opencode_phase_runner.clone();
+                Some(Arc::new(move |input| runner.strategize(input)) as StrategistNextGoalHook)
+            } else {
+                None
+            };
             drop(plan_critic_tx);
             drop(plan_revision_tx);
 
@@ -2994,6 +3002,7 @@ impl NativeAgentConnection {
                 planner_hook,
                 plan_critic_hook: Some(plan_critic_hook),
                 plan_revision_hook: Some(plan_revision_hook),
+                strategist_next_goal_hook,
                 require_plan_approval: true,
                 max_plan_revisions: gear_max_plan_revisions_from_env(),
                 broker: Some(run_broker),
@@ -3688,6 +3697,45 @@ impl GearOpenCodePhaseRunner {
             artifact_path: Some(output.artifact_path),
         })
     }
+
+    fn strategize(&self, input: StrategistNextGoalInput) -> Result<StrategistNextGoalSubmission> {
+        let prompt = gear_opencode_strategist_prompt(&input)?;
+        let task_id = format!("strategist_{}_{}", input.goal_id, input.epoch_id);
+        let output = self.run(
+            &input.route_decision,
+            &input.goal_id,
+            &input.plan.plan_id,
+            input.plan.revision,
+            &task_id,
+            GearTaskKind::Review,
+            Scope::new(Vec::new(), Vec::new(), 1),
+            prompt,
+        )?;
+        let verdict = StrategistNextGoalVerdict::parse(&output.raw_output)?;
+        Ok(StrategistNextGoalSubmission {
+            verdict,
+            strategist: output.execution_identity,
+            raw_output: output.raw_output,
+            artifact_path: Some(output.artifact_path),
+        })
+    }
+}
+
+fn gear_opencode_strategist_prompt(input: &StrategistNextGoalInput) -> Result<String> {
+    Ok(format!(
+        "You are Gearbox StrategistNextGoal. Review the completed execution epoch and return only one strict JSON object.\n\
+Schema: {{\"schema_version\":1,\"goal_id\":string,\"epoch_id\":string,\"reviewed_status\":\"draft|planning|running|verifying|needs_user|blocked|limited|complete|failed\",\"decision\":\"complete|continue|needs_user|stop\",\"next_objective\":string|null,\"acceptance_signals\":[string],\"required_questions\":[string],\"evidence_refs\":[string],\"rationale\":string}}.\n\
+Use continue only for a bounded next objective consistent with the original request. Do not propose an unbounded loop. Use complete only when reviewed_status is complete.\n\
+Goal: {}\nEpoch: {}\nOriginal request: {}\nStatus: {}\nSummary: {}\nFinal report: {}\nPlan:\n{}\nBudget ledger:\n{}",
+        input.goal_id,
+        input.epoch_id,
+        input.request,
+        input.status.as_str(),
+        input.summary,
+        input.final_report_path,
+        serde_json::to_string_pretty(&input.plan)?,
+        serde_json::to_string_pretty(&input.budget_ledger)?,
+    ))
 }
 
 fn gear_opencode_planner_prompt(input: &PlannerInput) -> Result<String> {
