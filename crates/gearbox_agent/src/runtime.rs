@@ -1,7 +1,6 @@
 use std::{
     collections::VecDeque,
-    env,
-    fs as std_fs,
+    env, fs as std_fs,
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -30,11 +29,11 @@ use crate::plan_review::{
 use crate::product;
 use crate::state::{
     Budget, ContinuationStatus, CoordinatorModel, Event, EventKind, FinalVerificationDimension,
-    FinalVerificationResult, FinalVerificationWaveReceipt, Goal, GoalEpochEventKind,
-    GoalGraphNode, GoalRunLeaseGuard, GoalStatus, ObjectiveEventKind, ObjectiveGraph,
-    ObjectivePolicy, ObjectiveStatus, PlanNodeRunLedger,
-    PlanNodeRunStatus, Scope, Session, SettledBudgetUsage, StateStore, Task, TaskInputs, TaskKind,
-    TaskOutputs, TaskStatus, WorkLineage, event, id_timestamp, timestamp,
+    FinalVerificationResult, FinalVerificationWaveReceipt, Goal, GoalEpochEventKind, GoalGraphNode,
+    GoalRunLeaseGuard, GoalStatus, ObjectiveEpochOutcomeReceipt, ObjectiveEventKind,
+    ObjectiveGraph, ObjectivePolicy, ObjectiveStatus, PlanNodeRunLedger, PlanNodeRunStatus, Scope,
+    Session, SettledBudgetUsage, StateStore, Task, TaskInputs, TaskKind, TaskOutputs, TaskStatus,
+    WorkLineage, event, id_timestamp, timestamp,
 };
 use crate::task_manager::{
     CompletionNotifier, ManagedTaskStatus, NotificationResult, ParentSessionState,
@@ -711,6 +710,13 @@ pub struct ObjectiveRunOutcome {
     pub goal_outcomes: Vec<RunOutcome>,
 }
 
+#[derive(Clone)]
+struct ObjectiveEpochContext {
+    objective_id: String,
+    scope_hash: String,
+    policy_hash: String,
+}
+
 impl ObjectiveRunOutcome {
     pub fn into_last_goal_outcome(self) -> Result<RunOutcome> {
         let objective_status = self.status.clone();
@@ -746,10 +752,7 @@ impl ObjectiveRunOutcome {
             final_report_path,
             events_path: store.events_path(&node.session_id),
             final_verification_wave_path: artifacts_root.join("final-verification-wave.json"),
-            final_verification_wave_hash: node
-                .final_wave_receipt_hash
-                .clone()
-                .unwrap_or_default(),
+            final_verification_wave_hash: node.final_wave_receipt_hash.clone().unwrap_or_default(),
             strategist_receipt: None,
         })
     }
@@ -773,10 +776,7 @@ pub fn objective_policy_from_env() -> Result<Option<ObjectivePolicy>> {
     let Some(raw_enabled) = env::var_os("GEARBOX_GEAR_OBJECTIVE") else {
         return Ok(None);
     };
-    let enabled = raw_enabled
-        .to_string_lossy()
-        .trim()
-        .to_ascii_lowercase();
+    let enabled = raw_enabled.to_string_lossy().trim().to_ascii_lowercase();
     if matches!(enabled.as_str(), "0" | "false" | "off" | "no") {
         return Ok(None);
     }
@@ -787,14 +787,8 @@ pub fn objective_policy_from_env() -> Result<Option<ObjectivePolicy>> {
     let policy = ObjectivePolicy {
         auto_continue: objective_bool_env("GEARBOX_GEAR_AUTO_CONTINUE", defaults.auto_continue)?,
         max_epochs: objective_usize_env("GEARBOX_GEAR_MAX_EPOCHS", defaults.max_epochs)?,
-        max_calls: objective_usize_env(
-            "GEARBOX_GEAR_MAX_OBJECTIVE_CALLS",
-            defaults.max_calls,
-        )?,
-        max_tokens: objective_u64_env(
-            "GEARBOX_GEAR_MAX_OBJECTIVE_TOKENS",
-            defaults.max_tokens,
-        )?,
+        max_calls: objective_usize_env("GEARBOX_GEAR_MAX_OBJECTIVE_CALLS", defaults.max_calls)?,
+        max_tokens: objective_u64_env("GEARBOX_GEAR_MAX_OBJECTIVE_TOKENS", defaults.max_tokens)?,
         max_cost_micros: objective_u64_env(
             "GEARBOX_GEAR_MAX_OBJECTIVE_COST_MICROS",
             defaults.max_cost_micros,
@@ -915,7 +909,7 @@ impl Orchestrator {
         options: RunOptions,
         phase_runtime: PhaseRuntime,
     ) -> Result<RunOutcome> {
-        Self::run_single_goal_with_phase_runtime(options, phase_runtime, None, None)
+        Self::run_single_goal_with_phase_runtime(options, phase_runtime, None, None, None)
     }
 
     pub fn run_objective_with_phase_runtime(
@@ -931,6 +925,7 @@ impl Orchestrator {
         phase_runtime: PhaseRuntime,
         fixed_goal_id: Option<String>,
         fixed_epoch_id: Option<String>,
+        objective_context: Option<ObjectiveEpochContext>,
     ) -> Result<RunOutcome> {
         if options.request.trim().is_empty() {
             bail!("prompt cannot be empty");
@@ -1618,7 +1613,10 @@ impl Orchestrator {
             store.write_tasks(&goal_id, &tasks)?;
             if first_plan_attempt {
                 if let Some(plan_task) = worker_task.inputs.plan_task.as_ref() {
-                    if matches!(plan_task.test.strategy, crate::plan_graph::TestStrategy::Tdd) {
+                    if matches!(
+                        plan_task.test.strategy,
+                        crate::plan_graph::TestStrategy::Tdd
+                    ) {
                         let red_path = run_plan_red_evidence(
                             &workspace,
                             &store,
@@ -1629,8 +1627,7 @@ impl Orchestrator {
                             options.cancellation_token.as_ref(),
                         )?;
                         let node = plan_node_runs.node_mut(&plan_task_id)?;
-                        node.red_evidence_path =
-                            Some(red_path.to_string_lossy().to_string());
+                        node.red_evidence_path = Some(red_path.to_string_lossy().to_string());
                         node.status = PlanNodeRunStatus::RedVerified;
                         node.updated_at = timestamp();
                         plan_node_runs.updated_at = timestamp();
@@ -1925,29 +1922,28 @@ impl Orchestrator {
             let iteration_worker_outcome = managed_worker_run.outcome;
             let iteration_worker_result = managed_worker_run.result;
             let iteration_worker_result_for_risk = iteration_worker_result.clone();
-            let (plan_green_paths, plan_green_passed) =
-                if first_plan_attempt
-                    && iteration_worker_result.status == WorkerStatus::Succeeded
-                {
-                    run_plan_green_evidence(
-                        &workspace,
-                        &store,
-                        &goal_id,
-                        &plan_task_id,
-                        plan_graph.revision,
-                        plan_graph
-                            .task(&plan_task_id)
-                            .context("missing PlanGraph task for GREEN evidence")?,
-                        options.cancellation_token.as_ref(),
-                    )?
-                } else {
-                    (
-                        Vec::new(),
-                        iteration_worker_result.status == WorkerStatus::Succeeded
-                            || (iteration_worker_result.status == WorkerStatus::Skipped
-                                && !options.worker.require_worker),
-                    )
-                };
+            let (plan_green_paths, plan_green_passed) = if first_plan_attempt
+                && iteration_worker_result.status == WorkerStatus::Succeeded
+            {
+                run_plan_green_evidence(
+                    &workspace,
+                    &store,
+                    &goal_id,
+                    &plan_task_id,
+                    plan_graph.revision,
+                    plan_graph
+                        .task(&plan_task_id)
+                        .context("missing PlanGraph task for GREEN evidence")?,
+                    options.cancellation_token.as_ref(),
+                )?
+            } else {
+                (
+                    Vec::new(),
+                    iteration_worker_result.status == WorkerStatus::Succeeded
+                        || (iteration_worker_result.status == WorkerStatus::Skipped
+                            && !options.worker.require_worker),
+                )
+            };
             {
                 let node = plan_node_runs.node_mut(&plan_task_id)?;
                 if !plan_green_paths.is_empty() {
@@ -2622,10 +2618,7 @@ impl Orchestrator {
         let final_wave_path = store.write_artifact(
             &goal_id,
             "final-verification-wave.json",
-            &format!(
-                "{}\n",
-                serde_json::to_string_pretty(&final_wave_receipt)?
-            ),
+            &format!("{}\n", serde_json::to_string_pretty(&final_wave_receipt)?),
         )?;
         store.append_goal_epoch_event(
             &goal_id,
@@ -2642,12 +2635,12 @@ impl Orchestrator {
         let final_report = format!(
             "{}\n\n{}",
             product::final_report(
-            &goal,
-            &tasks,
-            &worker_result,
-            &after_diff,
-            &scope_check,
-            &verification_results,
+                &goal,
+                &tasks,
+                &worker_result,
+                &after_diff,
+                &scope_check,
+                &verification_results,
             ),
             final_verification_wave_markdown(&final_wave_receipt),
         );
@@ -2755,6 +2748,51 @@ impl Orchestrator {
             }),
         )?;
         #[cfg(test)]
+        if test_seams::should_crash_at(test_seams::ObjectiveCrashPoint::BeforeOutcomeReceipt) {
+            bail!("test seam: simulated crash before objective outcome receipt");
+        }
+        if let Some(objective_context) = objective_context {
+            let budget_ledger = store.read_goal_budget_ledger(&goal_id)?;
+            let strategist_receipt_path = strategist_receipt.as_ref().map(|_| {
+                store
+                    .artifact_dir(&goal_id)
+                    .join("strategist-next-goal-receipt.json")
+                    .to_string_lossy()
+                    .to_string()
+            });
+            let strategist_receipt_hash = strategist_receipt
+                .as_ref()
+                .map(|receipt| receipt.receipt_hash.clone());
+            let strategist_decision = strategist_receipt
+                .as_ref()
+                .map(|receipt| format!("{:?}", receipt.verdict.decision));
+            let outcome_receipt = ObjectiveEpochOutcomeReceipt::seal(
+                &objective_context.objective_id,
+                &goal_id,
+                &epoch_id,
+                &session_id,
+                hash_text(&goal.request),
+                objective_context.scope_hash,
+                objective_context.policy_hash,
+                goal.status.clone(),
+                final_wave_path.to_string_lossy().to_string(),
+                final_wave_receipt.receipt_hash.clone(),
+                final_report_path.to_string_lossy().to_string(),
+                sha256_file(&final_report_path)?,
+                budget_ledger.ledger_hash,
+                strategist_receipt_path,
+                strategist_receipt_hash,
+                strategist_decision,
+            )?;
+            store.write_objective_epoch_outcome(&outcome_receipt)?;
+            #[cfg(test)]
+            if test_seams::should_crash_at(
+                test_seams::ObjectiveCrashPoint::AfterOutcomeReceiptBeforeGraph,
+            ) {
+                bail!("test seam: simulated crash after outcome receipt before graph commit");
+            }
+        }
+        #[cfg(test)]
         test_seams::goal_settled(&goal_id, &epoch_id);
         goal_run_lease.release()?;
         #[cfg(test)]
@@ -2789,7 +2827,10 @@ fn run_objective_controller(
         )
     })?;
     if !workspace.is_dir() {
-        bail!("objective workspace is not a directory: {}", workspace.display());
+        bail!(
+            "objective workspace is not a directory: {}",
+            workspace.display()
+        );
     }
     if options.request.trim().is_empty() {
         bail!("objective request cannot be empty");
@@ -2806,8 +2847,8 @@ fn run_objective_controller(
         );
     }
     let objective_id = objective_id_for(&root_session_id, &workspace, &options.request)?;
-    let lease_seconds = u64::try_from(options.max_runtime_minutes.max(1).saturating_mul(60))
-        .unwrap_or(u64::MAX);
+    let lease_seconds =
+        u64::try_from(options.max_runtime_minutes.max(1).saturating_mul(60)).unwrap_or(u64::MAX);
     let objective_lease = store.acquire_objective_lease(
         &objective_id,
         &root_session_id,
@@ -2851,7 +2892,15 @@ fn run_objective_controller(
         graph
     };
 
-    reconcile_objective_frontier(&store, &objective_id, &root_session_id, &mut graph)?;
+    reconcile_objective_frontier(
+        &store,
+        &objective_id,
+        &root_session_id,
+        &mut graph,
+        Some(&objective_lease),
+        &policy,
+        &options.budget.clone().unwrap_or_default(),
+    )?;
     if graph.status.is_terminal() {
         objective_lease.release()?;
         return Ok(ObjectiveRunOutcome {
@@ -2908,29 +2957,144 @@ fn run_objective_controller(
         options.request = active_node.request.clone();
         options.session_id = Some(active_node.session_id.clone());
         options.continuation = true;
-        let outcome = Orchestrator::run_single_goal_with_phase_runtime(
-            options.clone(),
-            phase_runtime.clone(),
-            Some(active_node.goal_id.clone()),
-            Some(active_node.epoch_id.clone()),
+        let epoch_reservation_id = format!("epoch:{}", active_node.epoch_id);
+        ensure_objective_epoch_reservation(
+            &store,
+            &objective_lease,
+            &graph,
+            &active_node,
+            &policy,
+            &options.budget.clone().unwrap_or_default(),
+            &epoch_reservation_id,
         )?;
+        let persisted_outcome = store.read_objective_epoch_outcome(
+            &objective_id,
+            &active_node.goal_id,
+            &active_node.epoch_id,
+        )?;
+        let outcome = if let Some(receipt) = persisted_outcome {
+            if receipt.request_hash != hash_text(&active_node.request)
+                || receipt.scope_hash != graph.scope_hash
+                || receipt.policy_hash != graph.policy_hash
+            {
+                bail!("objective epoch outcome does not match the active objective binding");
+            }
+            run_outcome_from_objective_receipt(&store, receipt)?
+        } else {
+            Orchestrator::run_single_goal_with_phase_runtime(
+                options.clone(),
+                phase_runtime.clone(),
+                Some(active_node.goal_id.clone()),
+                Some(active_node.epoch_id.clone()),
+                Some(ObjectiveEpochContext {
+                    objective_id: objective_id.clone(),
+                    scope_hash: graph.scope_hash.clone(),
+                    policy_hash: graph.policy_hash.clone(),
+                }),
+            )?
+        };
+        let reservation_id = epoch_reservation_id;
+        if store.objective_budget_ledger_path(&objective_id).exists() {
+            #[cfg(test)]
+            if active_node.parent_goal_id.is_some()
+                && test_seams::should_crash_at(
+                    test_seams::ObjectiveCrashPoint::AfterChildOutcomeBeforeObjectiveSettled,
+                )
+            {
+                bail!(
+                    "test seam: simulated crash after child outcome before objective budget settlement"
+                );
+            }
+            let (
+                actual_calls,
+                actual_tokens,
+                actual_cost_micros,
+                actual_unknown_calls,
+                actual_premium_calls,
+                cache_hits,
+                duration_ms,
+                fallback_reasons,
+            ) = objective_goal_budget_usage(&store, &outcome.goal_id)?;
+            let settled = store.settle_objective_epoch(
+                &objective_lease,
+                &reservation_id,
+                actual_calls,
+                actual_tokens,
+                actual_cost_micros,
+                actual_unknown_calls,
+                actual_premium_calls,
+                cache_hits,
+                duration_ms,
+                fallback_reasons,
+            )?;
+            store.append_objective_event(
+                &objective_id,
+                &format!("budget-settled:{reservation_id}"),
+                ObjectiveEventKind::ObjectiveBudgetSettled,
+                json!({
+                    "reservation_id": reservation_id,
+                    "goal_id": outcome.goal_id,
+                    "epoch_id": outcome.epoch_id,
+                    "status": "settled",
+                    "actual_calls": settled.actual_calls,
+                    "actual_tokens": settled.actual_tokens,
+                    "actual_cost_micros": settled.actual_cost_micros,
+                    "actual_unknown_calls": settled.actual_unknown_calls,
+                    "actual_premium_calls": settled.actual_premium_calls,
+                }),
+            )?;
+        }
         #[cfg(test)]
         if test_seams::should_intercept_settled_to_graph_commit() {
-            bail!("test seam: simulated crash after goal settled but before objective graph commit");
+            bail!(
+                "test seam: simulated crash after goal settled but before objective graph commit"
+            );
         }
         let strategist_receipt = outcome.strategist_receipt.clone();
         let strategist_receipt_hash = strategist_receipt
             .as_ref()
             .map(|receipt| receipt.receipt_hash.clone());
-        graph.update_active_node(
+        let outcome_report_path = outcome.final_report_path.to_string_lossy().to_string();
+        let already_committed = graph
+            .nodes
+            .iter()
+            .find(|node| node.goal_id == outcome.goal_id)
+            .is_some_and(|node| {
+                node.status.is_terminal()
+                    && node.final_wave_receipt_hash.as_deref()
+                        == Some(outcome.final_verification_wave_hash.as_str())
+                    && node.final_report_path.as_deref() == Some(outcome_report_path.as_str())
+            });
+        if !already_committed {
+            graph.update_active_node(
+                &outcome.goal_id,
+                outcome.status.clone(),
+                Some(outcome.final_verification_wave_hash.clone()),
+                Some(outcome_report_path.clone()),
+                strategist_receipt_hash,
+                Some(format!("goal status: {}", outcome.status.as_str())),
+            )?;
+            store.write_objective_graph(&graph)?;
+        }
+        if let Some(receipt) = store.read_objective_epoch_outcome(
+            &objective_id,
             &outcome.goal_id,
-            outcome.status.clone(),
-            Some(outcome.final_verification_wave_hash.clone()),
-            Some(outcome.final_report_path.to_string_lossy().to_string()),
-            strategist_receipt_hash,
-            Some(format!("goal status: {}", outcome.status.as_str())),
-        )?;
-        store.write_objective_graph(&graph)?;
+            &outcome.epoch_id,
+        )? {
+            store.append_objective_event(
+                &objective_id,
+                &format!("goal-outcome:{}:{}", outcome.goal_id, outcome.epoch_id),
+                ObjectiveEventKind::GoalOutcomeRecorded,
+                json!({
+                    "goal_id": outcome.goal_id,
+                    "epoch_id": outcome.epoch_id,
+                    "receipt_hash": receipt.receipt_hash,
+                    "status": outcome.status.as_str(),
+                    "final_report_path": outcome.final_report_path.to_string_lossy(),
+                    "final_verification_wave_hash": outcome.final_verification_wave_hash,
+                }),
+            )?;
+        }
         #[cfg(test)]
         test_seams::objective_graph_commit(&objective_id, &graph);
         goal_outcomes.push(outcome.clone());
@@ -3026,7 +3190,8 @@ fn run_objective_controller(
                 #[cfg(test)]
                 test_seams::continue_event(&objective_id, &receipt.receipt_hash);
                 if store.continuation_is_stopped_for_session(&root_session_id)? {
-                    let reason = "objective continuation was stopped by the user before child dispatch";
+                    let reason =
+                        "objective continuation was stopped by the user before child dispatch";
                     graph.set_terminal(ObjectiveStatus::Stopped, reason.to_string())?;
                     store.write_objective_graph(&graph)?;
                     append_objective_terminal_event(
@@ -3064,8 +3229,7 @@ fn run_objective_controller(
                     )?;
                     break;
                 }
-                let (calls, tokens, cost, unknown_calls) =
-                    objective_budget_totals(&store, &graph)?;
+                let (calls, tokens, cost, unknown_calls) = objective_budget_totals(&store, &graph)?;
                 if calls >= policy.max_calls
                     || tokens >= policy.max_tokens
                     || (policy.max_cost_micros != u64::MAX && cost >= policy.max_cost_micros)
@@ -3086,10 +3250,7 @@ fn run_objective_controller(
                     break;
                 }
                 if policy.cooldown_seconds > 0
-                    && cooldown_remaining_seconds(
-                        &graph.updated_at,
-                        policy.cooldown_seconds,
-                    )? > 0
+                    && cooldown_remaining_seconds(&graph.updated_at, policy.cooldown_seconds)? > 0
                 {
                     let reason = format!(
                         "objective cooldown of {} seconds has not elapsed",
@@ -3142,14 +3303,59 @@ fn run_objective_controller(
                 let child_goal_id = format!("goal_{objective_id}_{child_index:03}");
                 let child_epoch_id = format!("epoch_{objective_id}_{child_index:03}");
                 let child_session_id = format!("{root_session_id}.epoch{child_index}");
+                let child_budget = options.budget.clone().unwrap_or_default();
+                let reserved_calls = child_budget
+                    .max_calls_per_epoch
+                    .min(policy.max_calls.saturating_sub(calls));
+                let reserved_tokens = child_budget
+                    .max_tokens_per_epoch
+                    .min(policy.max_tokens.saturating_sub(tokens));
+                let reserved_cost_micros = if policy.max_cost_micros == u64::MAX {
+                    u64::MAX
+                } else {
+                    policy.max_cost_micros.saturating_sub(cost)
+                };
+                let reserved_unknown_calls = child_budget
+                    .max_usage_unknown_calls
+                    .min(policy.max_unknown_usage_calls.saturating_sub(unknown_calls));
+                let reservation_id = format!("epoch:{child_epoch_id}");
+                store.reserve_objective_epoch(
+                    &objective_lease,
+                    &reservation_id,
+                    &child_goal_id,
+                    &child_epoch_id,
+                    &policy,
+                    reserved_calls,
+                    reserved_tokens,
+                    reserved_cost_micros,
+                    reserved_unknown_calls,
+                    child_budget.max_premium_worker_calls,
+                )?;
+                store.append_objective_event(
+                    &objective_id,
+                    &format!("child-dispatch-reserved:{child_epoch_id}"),
+                    ObjectiveEventKind::ChildDispatchReserved,
+                    json!({
+                        "reservation_id": reservation_id,
+                        "goal_id": child_goal_id,
+                        "epoch_id": child_epoch_id,
+                        "reserved_calls": reserved_calls,
+                        "reserved_tokens": reserved_tokens,
+                        "reserved_cost_micros": reserved_cost_micros,
+                        "reserved_unknown_calls": reserved_unknown_calls,
+                    }),
+                )?;
+                #[cfg(test)]
+                if test_seams::should_crash_at(
+                    test_seams::ObjectiveCrashPoint::AfterChildReservationBeforeEdge,
+                ) {
+                    bail!("test seam: simulated crash after child reservation before graph edge");
+                }
                 let child_node = objective_goal_node(
                     &child_goal_id,
                     &child_epoch_id,
                     &child_session_id,
-                    &objective_child_request(
-                        &next_objective,
-                        &receipt.verdict.acceptance_signals,
-                    ),
+                    &objective_child_request(&next_objective, &receipt.verdict.acceptance_signals),
                     receipt.verdict.acceptance_signals.clone(),
                     Some(outcome.goal_id.clone()),
                     Some(outcome.epoch_id.clone()),
@@ -3158,7 +3364,10 @@ fn run_objective_controller(
                     None,
                     next_hash,
                 )?;
-                graph.attach_child(child_node)?;
+                if let Err(error) = graph.attach_child(child_node) {
+                    store.release_objective_epoch(&objective_lease, &reservation_id)?;
+                    return Err(error);
+                }
                 store.write_objective_graph(&graph)?;
                 #[cfg(test)]
                 test_seams::child_attach(&objective_id, &child_goal_id);
@@ -3181,6 +3390,12 @@ fn run_objective_controller(
                     ObjectiveEventKind::FrontierAdvanced,
                     json!({ "active_goal_id": child_goal_id }),
                 )?;
+                #[cfg(test)]
+                if test_seams::should_crash_at(
+                    test_seams::ObjectiveCrashPoint::AfterChildEdgeBeforeStarted,
+                ) {
+                    bail!("test seam: simulated crash after child edge before child started");
+                }
             }
         }
     }
@@ -3204,6 +3419,9 @@ fn reconcile_objective_frontier(
     objective_id: &str,
     root_session_id: &str,
     graph: &mut ObjectiveGraph,
+    objective_lease: Option<&crate::state::ObjectiveLeaseGuard>,
+    policy: &ObjectivePolicy,
+    budget: &Budget,
 ) -> Result<()> {
     let mut events = store.read_objective_events(objective_id)?;
     if events.is_empty() {
@@ -3233,6 +3451,117 @@ fn reconcile_objective_frontier(
                     "parent_goal_id": node.parent_goal_id,
                     "parent_epoch_id": node.parent_epoch_id,
                     "parent_strategist_receipt_hash": node.parent_strategist_receipt_hash,
+                }),
+            )?;
+            events = store.read_objective_events(objective_id)?;
+        }
+    }
+
+    for node in graph.nodes.clone() {
+        let receipt = match store.read_objective_epoch_outcome(
+            objective_id,
+            &node.goal_id,
+            &node.epoch_id,
+        )? {
+            Some(receipt) => receipt,
+            None => {
+                let Some(receipt) =
+                    recover_settled_epoch_outcome_receipt(store, objective_id, graph, &node)?
+                else {
+                    continue;
+                };
+                store.write_objective_epoch_outcome(&receipt)?;
+                receipt
+            }
+        };
+        if receipt.request_hash != hash_text(&node.request)
+            || receipt.scope_hash != graph.scope_hash
+            || receipt.policy_hash != graph.policy_hash
+        {
+            bail!("objective epoch outcome does not match the graph binding");
+        }
+        if let Some(objective_lease) = objective_lease
+            && store.objective_budget_ledger_path(objective_id).exists()
+        {
+            let (
+                actual_calls,
+                actual_tokens,
+                actual_cost_micros,
+                actual_unknown_calls,
+                actual_premium_calls,
+                cache_hits,
+                duration_ms,
+                fallback_reasons,
+            ) = objective_goal_budget_usage(store, &node.goal_id)?;
+            let reservation_id = format!("epoch:{}", node.epoch_id);
+            let settled = store.settle_objective_epoch(
+                objective_lease,
+                &reservation_id,
+                actual_calls,
+                actual_tokens,
+                actual_cost_micros,
+                actual_unknown_calls,
+                actual_premium_calls,
+                cache_hits,
+                duration_ms,
+                fallback_reasons,
+            )?;
+            store.append_objective_event(
+                objective_id,
+                &format!("budget-settled:{reservation_id}"),
+                ObjectiveEventKind::ObjectiveBudgetSettled,
+                json!({
+                    "reservation_id": reservation_id,
+                    "goal_id": node.goal_id,
+                    "epoch_id": node.epoch_id,
+                    "status": "settled",
+                    "actual_calls": settled.actual_calls,
+                    "actual_tokens": settled.actual_tokens,
+                    "actual_cost_micros": settled.actual_cost_micros,
+                    "actual_unknown_calls": settled.actual_unknown_calls,
+                    "actual_premium_calls": settled.actual_premium_calls,
+                }),
+            )?;
+            events = store.read_objective_events(objective_id)?;
+        }
+        let outcome = run_outcome_from_objective_receipt(store, receipt.clone())?;
+        let outcome_report_path = outcome.final_report_path.to_string_lossy().to_string();
+        if graph.active_goal_id.as_deref() == Some(node.goal_id.as_str()) {
+            graph.update_active_node(
+                &node.goal_id,
+                outcome.status.clone(),
+                Some(outcome.final_verification_wave_hash.clone()),
+                Some(outcome_report_path.clone()),
+                outcome
+                    .strategist_receipt
+                    .as_ref()
+                    .map(|strategist| strategist.receipt_hash.clone()),
+                Some("recovered from objective epoch outcome receipt".to_string()),
+            )?;
+            store.write_objective_graph(graph)?;
+        } else if node.status.is_terminal()
+            && (node.final_wave_receipt_hash.as_deref()
+                != Some(outcome.final_verification_wave_hash.as_str())
+                || node.final_report_path.as_deref() != Some(outcome_report_path.as_str()))
+        {
+            bail!("objective graph terminal node disagrees with its epoch outcome receipt");
+        }
+        let outcome_event_key = format!("goal-outcome:{}:{}", node.goal_id, node.epoch_id);
+        if events
+            .iter()
+            .all(|event| event.idempotency_key != outcome_event_key)
+        {
+            store.append_objective_event(
+                objective_id,
+                &outcome_event_key,
+                ObjectiveEventKind::GoalOutcomeRecorded,
+                json!({
+                    "goal_id": node.goal_id,
+                    "epoch_id": node.epoch_id,
+                    "receipt_hash": receipt.receipt_hash,
+                    "status": outcome.status.as_str(),
+                    "final_report_path": outcome.final_report_path.to_string_lossy(),
+                    "final_verification_wave_hash": outcome.final_verification_wave_hash,
                 }),
             )?;
             events = store.read_objective_events(objective_id)?;
@@ -3273,11 +3602,118 @@ fn reconcile_objective_frontier(
         return Ok(());
     }
 
-    let Some(continue_event) = events
+    if let Some(node) = graph.nodes.last().cloned()
+        && let Some(outcome) =
+            store.read_objective_epoch_outcome(objective_id, &node.goal_id, &node.epoch_id)?
+        && let Some(strategist_path) = outcome.strategist_receipt_path.as_deref()
+    {
+        let strategist: StrategistNextGoalReceipt =
+            serde_json::from_str(&std_fs::read_to_string(strategist_path).with_context(|| {
+                format!("failed to read terminal strategist receipt {strategist_path}")
+            })?)
+            .context("failed to parse terminal strategist receipt")?;
+        let terminal = match strategist.verdict.decision {
+            StrategistNextGoalDecision::Complete => Some((
+                ObjectiveStatus::Complete,
+                "recovered strategist marked the objective complete".to_string(),
+            )),
+            StrategistNextGoalDecision::NeedsUser => Some((
+                ObjectiveStatus::NeedsUser,
+                strategist.verdict.required_questions.join("; "),
+            )),
+            StrategistNextGoalDecision::Stop => Some((
+                ObjectiveStatus::Stopped,
+                strategist.verdict.rationale.clone(),
+            )),
+            StrategistNextGoalDecision::Continue => None,
+        };
+        if let Some((status, reason)) = terminal {
+            graph.set_terminal(status.clone(), reason.clone())?;
+            store.write_objective_graph(graph)?;
+            append_objective_terminal_event(store, objective_id, &status, &reason, &node.goal_id)?;
+            return Ok(());
+        }
+    }
+
+    let mut continue_event = events
         .iter()
         .rev()
         .find(|event| event.kind == ObjectiveEventKind::StrategistContinueAccepted)
-    else {
+        .cloned();
+    if continue_event.is_none()
+        && let Some(node) = graph.nodes.last().cloned()
+        && let Some(outcome) =
+            store.read_objective_epoch_outcome(objective_id, &node.goal_id, &node.epoch_id)?
+        && let Some(strategist_path) = outcome.strategist_receipt_path.as_deref()
+    {
+        let strategist: StrategistNextGoalReceipt =
+            serde_json::from_str(&std_fs::read_to_string(strategist_path).with_context(|| {
+                format!("failed to read recovered strategist receipt {strategist_path}")
+            })?)
+            .context("failed to parse recovered strategist receipt")?;
+        match strategist.verdict.decision {
+            StrategistNextGoalDecision::Continue => {
+                store.append_objective_event(
+                    objective_id,
+                    &format!("continue:{}", strategist.receipt_hash),
+                    ObjectiveEventKind::StrategistContinueAccepted,
+                    json!({
+                        "parent_goal_id": node.goal_id,
+                        "parent_epoch_id": node.epoch_id,
+                        "receipt_hash": strategist.receipt_hash,
+                        "next_objective": strategist.verdict.next_objective,
+                        "acceptance_signals": strategist.verdict.acceptance_signals,
+                    }),
+                )?;
+                events = store.read_objective_events(objective_id)?;
+                continue_event = events
+                    .iter()
+                    .rev()
+                    .find(|event| event.kind == ObjectiveEventKind::StrategistContinueAccepted)
+                    .cloned();
+            }
+            StrategistNextGoalDecision::Complete => {
+                let reason = "recovered strategist marked the objective complete";
+                graph.set_terminal(ObjectiveStatus::Complete, reason.to_string())?;
+                store.write_objective_graph(graph)?;
+                append_objective_terminal_event(
+                    store,
+                    objective_id,
+                    &ObjectiveStatus::Complete,
+                    reason,
+                    &node.goal_id,
+                )?;
+                return Ok(());
+            }
+            StrategistNextGoalDecision::NeedsUser => {
+                let reason = strategist.verdict.required_questions.join("; ");
+                graph.set_terminal(ObjectiveStatus::NeedsUser, reason.clone())?;
+                store.write_objective_graph(graph)?;
+                append_objective_terminal_event(
+                    store,
+                    objective_id,
+                    &ObjectiveStatus::NeedsUser,
+                    &reason,
+                    &node.goal_id,
+                )?;
+                return Ok(());
+            }
+            StrategistNextGoalDecision::Stop => {
+                let reason = strategist.verdict.rationale.clone();
+                graph.set_terminal(ObjectiveStatus::Stopped, reason.clone())?;
+                store.write_objective_graph(graph)?;
+                append_objective_terminal_event(
+                    store,
+                    objective_id,
+                    &ObjectiveStatus::Stopped,
+                    &reason,
+                    &node.goal_id,
+                )?;
+                return Ok(());
+            }
+        }
+    }
+    let Some(continue_event) = continue_event else {
         let reason = "objective frontier was completed without a durable strategist continuation";
         graph.set_terminal(ObjectiveStatus::Blocked, reason.to_string())?;
         store.write_objective_graph(graph)?;
@@ -3345,11 +3781,7 @@ fn reconcile_objective_frontier(
     let child_goal_id = format!("goal_{objective_id}_{child_index:03}");
     let child_epoch_id = format!("epoch_{objective_id}_{child_index:03}");
     let child_session_id = format!("{root_session_id}.epoch{child_index}");
-    if graph
-        .nodes
-        .iter()
-        .any(|node| node.goal_id == child_goal_id)
-    {
+    if graph.nodes.iter().any(|node| node.goal_id == child_goal_id) {
         bail!("objective recovery found a duplicate child goal id");
     }
     let child_node = objective_goal_node(
@@ -3364,6 +3796,52 @@ fn reconcile_objective_frontier(
         GoalStatus::Planning,
         None,
         hash_text(&normalize_objective(next_objective)),
+    )?;
+    let objective_lease = objective_lease
+        .context("objective recovery requires a live objective lease before child reservation")?;
+    let (calls, tokens, cost, unknown_calls) = objective_budget_totals(store, graph)?;
+    let reserved_calls = budget
+        .max_calls_per_epoch
+        .min(policy.max_calls.saturating_sub(calls));
+    let reserved_tokens = budget
+        .max_tokens_per_epoch
+        .min(policy.max_tokens.saturating_sub(tokens));
+    let reserved_cost_micros = if policy.max_cost_micros == u64::MAX {
+        budget.max_cost_micros_per_epoch
+    } else {
+        budget
+            .max_cost_micros_per_epoch
+            .min(policy.max_cost_micros.saturating_sub(cost))
+    };
+    let reserved_unknown_calls = budget
+        .max_usage_unknown_calls
+        .min(policy.max_unknown_usage_calls.saturating_sub(unknown_calls));
+    let reservation_id = format!("epoch:{child_epoch_id}");
+    store.reserve_objective_epoch(
+        objective_lease,
+        &reservation_id,
+        &child_goal_id,
+        &child_epoch_id,
+        policy,
+        reserved_calls,
+        reserved_tokens,
+        reserved_cost_micros,
+        reserved_unknown_calls,
+        budget.max_premium_worker_calls,
+    )?;
+    store.append_objective_event(
+        objective_id,
+        &format!("child-dispatch-reserved:{child_epoch_id}"),
+        ObjectiveEventKind::ChildDispatchReserved,
+        json!({
+            "reservation_id": reservation_id,
+            "goal_id": child_goal_id,
+            "epoch_id": child_epoch_id,
+            "reserved_calls": reserved_calls,
+            "reserved_tokens": reserved_tokens,
+            "reserved_cost_micros": reserved_cost_micros,
+            "reserved_unknown_calls": reserved_unknown_calls,
+        }),
     )?;
     graph.attach_child(child_node)?;
     store.write_objective_graph(graph)?;
@@ -3399,6 +3877,157 @@ fn objective_child_request(next_objective: &str, acceptance_signals: &[String]) 
             .collect::<Vec<_>>()
             .join("\n")
     )
+}
+
+fn sha256_file(path: &std::path::Path) -> Result<String> {
+    let bytes = std_fs::read(path)
+        .with_context(|| format!("failed to read hash-bound artifact {}", path.display()))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn recover_settled_epoch_outcome_receipt(
+    store: &StateStore,
+    objective_id: &str,
+    graph: &ObjectiveGraph,
+    node: &GoalGraphNode,
+) -> Result<Option<ObjectiveEpochOutcomeReceipt>> {
+    let settled_event = store
+        .read_goal_epoch_events(&node.goal_id)?
+        .into_iter()
+        .rev()
+        .find(|event| event.epoch_id == node.epoch_id && event.kind == GoalEpochEventKind::Settled);
+    let Some(settled_event) = settled_event else {
+        return Ok(None);
+    };
+    let status: GoalStatus = settled_event
+        .payload
+        .get("status")
+        .cloned()
+        .context("settled goal epoch is missing status")
+        .and_then(|value| {
+            serde_json::from_value(value).context("settled goal status is invalid")
+        })?;
+    let final_report_path = settled_event
+        .payload
+        .get("final_report_path")
+        .and_then(Value::as_str)
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
+        .context("settled goal epoch is missing final report path")?;
+    let final_wave_path = store
+        .artifact_dir(&node.goal_id)
+        .join("final-verification-wave.json");
+    if !final_wave_path.is_file() || !final_report_path.is_file() {
+        return Ok(None);
+    }
+    let final_wave: FinalVerificationWaveReceipt =
+        serde_json::from_str(&std_fs::read_to_string(&final_wave_path).with_context(|| {
+            format!(
+                "failed to read recovered final wave {}",
+                final_wave_path.display()
+            )
+        })?)
+        .context("failed to parse recovered final wave")?;
+    let strategist_path = store
+        .artifact_dir(&node.goal_id)
+        .join("strategist-next-goal-receipt.json");
+    let strategist = if strategist_path.is_file() {
+        Some(
+            serde_json::from_str::<StrategistNextGoalReceipt>(
+                &std_fs::read_to_string(&strategist_path).with_context(|| {
+                    format!(
+                        "failed to read recovered strategist receipt {}",
+                        strategist_path.display()
+                    )
+                })?,
+            )
+            .context("failed to parse recovered strategist receipt")?,
+        )
+    } else {
+        None
+    };
+    let budget_ledger = store.read_goal_budget_ledger(&node.goal_id)?;
+    Ok(Some(ObjectiveEpochOutcomeReceipt::seal(
+        objective_id,
+        &node.goal_id,
+        &node.epoch_id,
+        &node.session_id,
+        hash_text(&node.request),
+        graph.scope_hash.clone(),
+        graph.policy_hash.clone(),
+        status,
+        final_wave_path.to_string_lossy().to_string(),
+        final_wave.receipt_hash,
+        final_report_path.to_string_lossy().to_string(),
+        sha256_file(&final_report_path)?,
+        budget_ledger.ledger_hash,
+        strategist
+            .as_ref()
+            .map(|_| strategist_path.to_string_lossy().to_string()),
+        strategist
+            .as_ref()
+            .map(|receipt| receipt.receipt_hash.clone()),
+        strategist
+            .as_ref()
+            .map(|receipt| format!("{:?}", receipt.verdict.decision)),
+    )?))
+}
+
+fn run_outcome_from_objective_receipt(
+    store: &StateStore,
+    receipt: ObjectiveEpochOutcomeReceipt,
+) -> Result<RunOutcome> {
+    receipt.validate(&receipt.objective_id, &receipt.goal_id, &receipt.epoch_id)?;
+    let final_report_path = PathBuf::from(&receipt.final_report_path);
+    if sha256_file(&final_report_path)? != receipt.final_report_hash {
+        bail!("objective epoch outcome final report hash does not match the artifact");
+    }
+    let final_wave_path = PathBuf::from(&receipt.final_wave_path);
+    let final_wave: FinalVerificationWaveReceipt =
+        serde_json::from_str(&std_fs::read_to_string(&final_wave_path).with_context(|| {
+            format!(
+                "failed to read objective epoch final wave {}",
+                final_wave_path.display()
+            )
+        })?)
+        .context("failed to parse objective epoch final wave")?;
+    if final_wave.receipt_hash != receipt.final_wave_hash {
+        bail!("objective epoch outcome final wave hash does not match the artifact");
+    }
+    let budget_ledger = store.read_goal_budget_ledger(&receipt.goal_id)?;
+    if budget_ledger.ledger_hash != receipt.goal_budget_ledger_hash {
+        bail!("objective epoch outcome budget ledger hash does not match the artifact");
+    }
+    let strategist_receipt = match (
+        receipt.strategist_receipt_path.as_deref(),
+        receipt.strategist_receipt_hash.as_deref(),
+    ) {
+        (Some(path), Some(expected_hash)) => {
+            let strategist: StrategistNextGoalReceipt = serde_json::from_str(
+                &std_fs::read_to_string(path)
+                    .with_context(|| format!("failed to read strategist receipt {}", path))?,
+            )
+            .context("failed to parse strategist receipt from objective outcome")?;
+            if strategist.receipt_hash != expected_hash {
+                bail!("objective epoch outcome strategist receipt hash does not match");
+            }
+            Some(strategist)
+        }
+        (None, None) => None,
+        _ => bail!("objective epoch outcome has an incomplete strategist receipt"),
+    };
+    Ok(RunOutcome {
+        goal_id: receipt.goal_id.clone(),
+        epoch_id: receipt.epoch_id.clone(),
+        session_id: receipt.session_id.clone(),
+        status: receipt.status,
+        artifacts_root: store.artifact_dir(&receipt.goal_id),
+        final_report_path,
+        events_path: store.events_path(&receipt.session_id),
+        final_verification_wave_path: final_wave_path,
+        final_verification_wave_hash: receipt.final_wave_hash,
+        strategist_receipt,
+    })
 }
 
 fn objective_goal_node(
@@ -3439,7 +4068,11 @@ fn objective_goal_node(
     Ok(node)
 }
 
-fn objective_id_for(root_session_id: &str, workspace: &std::path::Path, request: &str) -> Result<String> {
+fn objective_id_for(
+    root_session_id: &str,
+    workspace: &std::path::Path,
+    request: &str,
+) -> Result<String> {
     let seed = format!(
         "{}\n{}\n{}",
         root_session_id,
@@ -3450,7 +4083,11 @@ fn objective_id_for(root_session_id: &str, workspace: &std::path::Path, request:
 }
 
 fn normalize_objective(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_lowercase()
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
 }
 
 fn hash_text(value: &str) -> String {
@@ -3469,10 +4106,9 @@ fn objective_status_for_goal(status: &GoalStatus) -> ObjectiveStatus {
         GoalStatus::Limited => ObjectiveStatus::Limited,
         GoalStatus::Failed => ObjectiveStatus::Failed,
         GoalStatus::Complete => ObjectiveStatus::Complete,
-        GoalStatus::Draft
-        | GoalStatus::Planning
-        | GoalStatus::Running
-        | GoalStatus::Verifying => ObjectiveStatus::Failed,
+        GoalStatus::Draft | GoalStatus::Planning | GoalStatus::Running | GoalStatus::Verifying => {
+            ObjectiveStatus::Failed
+        }
     }
 }
 
@@ -3517,11 +4153,63 @@ fn objective_budget_totals(
     store: &StateStore,
     graph: &ObjectiveGraph,
 ) -> Result<(usize, u64, u64, usize)> {
+    let objective_ledger_path = store.objective_budget_ledger_path(&graph.objective_id);
+    if objective_ledger_path.exists() {
+        let objective_ledger =
+            store.read_objective_budget_ledger(&graph.objective_id, &graph.policy_hash)?;
+        let mut objective_totals = (0usize, 0u64, 0u64, 0usize);
+        for reservation in objective_ledger.reservations {
+            if reservation.status != crate::state::ObjectiveBudgetReservationStatus::Settled {
+                continue;
+            }
+            objective_totals.0 = objective_totals.0.saturating_add(
+                reservation
+                    .actual_calls
+                    .unwrap_or(reservation.reserved_calls),
+            );
+            objective_totals.1 = objective_totals.1.saturating_add(
+                reservation
+                    .actual_tokens
+                    .unwrap_or(reservation.reserved_tokens),
+            );
+            objective_totals.2 = objective_totals
+                .2
+                .saturating_add(reservation.actual_cost_micros.unwrap_or(0));
+            objective_totals.3 = objective_totals.3.saturating_add(
+                reservation
+                    .actual_unknown_calls
+                    .unwrap_or(reservation.reserved_unknown_calls),
+            );
+        }
+        let goal_totals = objective_budget_totals_from_goal_ledgers(store, graph)?;
+        if objective_totals.0 != goal_totals.0
+            || objective_totals.2 != goal_totals.2
+            || objective_totals.3 != goal_totals.3
+            || (objective_totals.1 != goal_totals.1 && objective_totals.3 == 0)
+        {
+            bail!(
+                "objective budget ledger disagrees with goal budget ledgers: objective={objective_totals:?}, goal={goal_totals:?}"
+            );
+        }
+        return Ok(objective_totals);
+    }
+    objective_budget_totals_from_goal_ledgers(store, graph)
+}
+
+fn objective_budget_totals_from_goal_ledgers(
+    store: &StateStore,
+    graph: &ObjectiveGraph,
+) -> Result<(usize, u64, u64, usize)> {
     let mut calls = 0usize;
     let mut tokens = 0u64;
     let mut cost = 0u64;
     let mut unknown_calls = 0usize;
     for node in &graph.nodes {
+        if graph.active_goal_id.as_deref() == Some(node.goal_id.as_str())
+            && !node.status.is_terminal()
+        {
+            continue;
+        }
         let ledger = store.read_goal_budget_ledger(&node.goal_id)?;
         for reservation in ledger.reservations {
             if reservation.status == crate::state::BudgetReservationStatus::Released {
@@ -3529,7 +4217,8 @@ fn objective_budget_totals(
             }
             calls = calls.saturating_add(1);
             if let Some(usage) = reservation.usage {
-                tokens = tokens.saturating_add(usage.total_tokens().unwrap_or(reservation.reserved_tokens));
+                tokens = tokens
+                    .saturating_add(usage.total_tokens().unwrap_or(reservation.reserved_tokens));
                 if let Some(actual_cost) = usage.cost_micros {
                     cost = cost.saturating_add(actual_cost);
                 }
@@ -3541,6 +4230,120 @@ fn objective_budget_totals(
         }
     }
     Ok((calls, tokens, cost, unknown_calls))
+}
+
+fn ensure_objective_epoch_reservation(
+    store: &StateStore,
+    lease: &crate::state::ObjectiveLeaseGuard,
+    graph: &ObjectiveGraph,
+    active_node: &GoalGraphNode,
+    policy: &ObjectivePolicy,
+    budget: &Budget,
+    reservation_id: &str,
+) -> Result<()> {
+    let (calls, tokens, cost, unknown_calls) = objective_budget_totals(store, graph)?;
+    let reserved_calls = budget
+        .max_calls_per_epoch
+        .min(policy.max_calls.saturating_sub(calls));
+    let reserved_tokens = budget
+        .max_tokens_per_epoch
+        .min(policy.max_tokens.saturating_sub(tokens));
+    let reserved_cost_micros = if policy.max_cost_micros == u64::MAX {
+        budget.max_cost_micros_per_epoch
+    } else {
+        budget
+            .max_cost_micros_per_epoch
+            .min(policy.max_cost_micros.saturating_sub(cost))
+    };
+    let reserved_unknown_calls = budget
+        .max_usage_unknown_calls
+        .min(policy.max_unknown_usage_calls.saturating_sub(unknown_calls));
+    store.reserve_objective_epoch(
+        lease,
+        reservation_id,
+        &active_node.goal_id,
+        &active_node.epoch_id,
+        policy,
+        reserved_calls,
+        reserved_tokens,
+        reserved_cost_micros,
+        reserved_unknown_calls,
+        budget.max_premium_worker_calls,
+    )?;
+    Ok(())
+}
+
+fn objective_goal_budget_usage(
+    store: &StateStore,
+    goal_id: &str,
+) -> Result<(
+    usize,
+    Option<u64>,
+    Option<u64>,
+    usize,
+    usize,
+    usize,
+    Option<u64>,
+    Vec<String>,
+)> {
+    let ledger = store.read_goal_budget_ledger(goal_id)?;
+    let mut calls = 0usize;
+    let mut tokens = 0u64;
+    let mut tokens_known = true;
+    let mut cost = 0u64;
+    let mut cost_known = true;
+    let mut unknown_calls = 0usize;
+    let mut premium_calls = 0usize;
+    let mut cache_hits = 0usize;
+    let mut duration_ms = 0u64;
+    let mut has_duration = false;
+    let mut fallback_reasons = Vec::new();
+    for reservation in ledger.reservations {
+        if reservation.status != crate::state::BudgetReservationStatus::Settled {
+            continue;
+        }
+        calls = calls.saturating_add(1);
+        premium_calls = premium_calls.saturating_add(usize::from(reservation.premium));
+        let Some(usage) = reservation.usage else {
+            unknown_calls = unknown_calls.saturating_add(1);
+            tokens_known = false;
+            cost_known = false;
+            continue;
+        };
+        if usage.is_unknown() {
+            unknown_calls = unknown_calls.saturating_add(1);
+        }
+        if let Some(value) = usage.total_tokens() {
+            tokens = tokens.saturating_add(value);
+        } else {
+            tokens_known = false;
+        }
+        if let Some(value) = usage.cost_micros {
+            cost = cost.saturating_add(value);
+        } else {
+            cost_known = false;
+        }
+        cache_hits = cache_hits.saturating_add(usize::from(usage.cache_hit == Some(true)));
+        if let Some(value) = usage.duration_ms {
+            duration_ms = duration_ms.saturating_add(value);
+            has_duration = true;
+        }
+        if let Some(reason) = usage.unavailable_reason {
+            if !reason.trim().is_empty() {
+                fallback_reasons.push(reason);
+            }
+        }
+    }
+    Ok((
+        calls,
+        tokens_known.then_some(tokens),
+        cost_known.then_some(cost),
+        unknown_calls,
+        premium_calls,
+        cache_hits,
+        has_duration.then_some(duration_ms),
+        fallback_reasons,
+    ))
 }
 
 fn cooldown_remaining_seconds(updated_at: &str, cooldown_seconds: u64) -> Result<u64> {
@@ -4178,10 +4981,7 @@ fn build_approved_plan_graph_inner(
                     )?;
                     let oracle_identity = PhaseExecutionIdentity {
                         execution_id: format!("plan_oracle:{}:{}", goal.id, plan.plan_id),
-                        phase_session_id: format!(
-                            "plan_oracle:{}:{}",
-                            goal.id, plan.revision
-                        ),
+                        phase_session_id: format!("plan_oracle:{}:{}", goal.id, plan.revision),
                         backend: PhaseExecutionBackend::DeterministicRules,
                         agent_id: None,
                         provider_id: None,
@@ -4250,9 +5050,9 @@ fn build_approved_plan_graph_inner(
                         oracle_submission.reviewer.clone(),
                         oracle_submission.verdict,
                         &oracle_submission.raw_output,
-                        oracle_artifact_path.clone().or_else(|| {
-                            Some(oracle_raw_path.to_string_lossy().to_string())
-                        }),
+                        oracle_artifact_path
+                            .clone()
+                            .or_else(|| Some(oracle_raw_path.to_string_lossy().to_string())),
                         timestamp(),
                     )?;
                     let oracle_receipt_path = store.write_plan_review_text(
@@ -5152,7 +5952,10 @@ fn run_plan_green_evidence(
     plan_task: &crate::plan_graph::PlanTaskContract,
     cancellation_token: Option<&CancellationToken>,
 ) -> Result<(Vec<std::path::PathBuf>, bool)> {
-    if matches!(plan_task.test.strategy, crate::plan_graph::TestStrategy::None) {
+    if matches!(
+        plan_task.test.strategy,
+        crate::plan_graph::TestStrategy::None
+    ) {
         let reason = plan_task
             .test
             .no_test_reason
@@ -5200,9 +6003,7 @@ fn run_plan_green_evidence(
     Ok((paths, passed))
 }
 
-fn final_verification_wave_markdown(
-    receipt: &FinalVerificationWaveReceipt,
-) -> String {
+fn final_verification_wave_markdown(receipt: &FinalVerificationWaveReceipt) -> String {
     let mut markdown = format!(
         "## Final Verification Wave\n\nReceipt hash: {}\n\nPassed: {}\n\n",
         receipt.receipt_hash, receipt.passed
@@ -5278,8 +6079,7 @@ fn build_final_verification_wave(
             dimension: FinalVerificationDimension::PlanCompliance,
             passed: all_nodes_completed
                 && node_evidence.len() >= node_runs.nodes.len()
-                && (node_runs.nodes.len() == 1
-                    || node_reviewer_ids.len() >= node_runs.nodes.len()),
+                && (node_runs.nodes.len() == 1 || node_reviewer_ids.len() >= node_runs.nodes.len()),
             summary: "Every PlanGraph node has terminal execution, GREEN, and review evidence."
                 .to_string(),
             evidence_paths: node_evidence.clone(),
@@ -8049,6 +8849,15 @@ mod test_seams {
 
     use crate::state::ObjectiveGraph;
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum ObjectiveCrashPoint {
+        BeforeOutcomeReceipt,
+        AfterOutcomeReceiptBeforeGraph,
+        AfterChildReservationBeforeEdge,
+        AfterChildEdgeBeforeStarted,
+        AfterChildOutcomeBeforeObjectiveSettled,
+    }
+
     pub struct ObjectiveControllerTestSeam {
         pub on_goal_settled: Option<Arc<dyn Fn(&str, &str) + Send + Sync>>,
         pub on_goal_lease_released: Option<Arc<dyn Fn(&str, &str) + Send + Sync>>,
@@ -8057,6 +8866,7 @@ mod test_seams {
         pub on_child_attach: Option<Arc<dyn Fn(&str, &str) + Send + Sync>>,
         pub intercept_settled_to_graph_commit: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
         pub worker_dispatch_count: Arc<AtomicUsize>,
+        pub crash_point: Option<ObjectiveCrashPoint>,
     }
 
     thread_local! {
@@ -8148,6 +8958,14 @@ mod test_seams {
                 seam.worker_dispatch_count.fetch_add(1, Ordering::SeqCst);
             }
         });
+    }
+
+    pub fn should_crash_at(point: ObjectiveCrashPoint) -> bool {
+        with_seam(|seam| {
+            seam.as_ref()
+                .and_then(|seam| seam.crash_point)
+                .is_some_and(|crash_point| crash_point == point)
+        })
     }
 }
 
@@ -8324,12 +9142,65 @@ mod tests {
         config
     }
 
+    fn crash_matrix_phase_runtime() -> PhaseRuntime {
+        let critic_hook: PlanCriticHook =
+            Arc::new(|input| plan_critic_submission(&input, 1, PlanCriticDecision::Approve));
+        let mut phase_runtime = phase_runtime_for_test(Some(critic_hook));
+        phase_runtime.planner_hook = Some(Arc::new(|input: PlannerInput| {
+            let draft = deterministic_fallback_draft(
+                &input.request,
+                &input.scope,
+                &input.verification_commands,
+            );
+            Ok(PlannerSubmission {
+                raw_output: serde_json::to_string(&draft)?,
+                draft,
+                planner: phase_identity("crash_matrix_planner"),
+                artifact_path: None,
+            })
+        }));
+        phase_runtime.strategist_next_goal_hook = Some({
+            Arc::new(move |input: StrategistNextGoalInput| {
+                let is_child = input.request.contains("Run the recovered child");
+                let decision = if is_child {
+                    StrategistNextGoalDecision::Complete
+                } else {
+                    StrategistNextGoalDecision::Continue
+                };
+                let verdict = StrategistNextGoalVerdict {
+                    schema_version: 1,
+                    goal_id: input.goal_id,
+                    epoch_id: input.epoch_id,
+                    reviewed_status: input.status,
+                    decision,
+                    next_objective: (!is_child).then(|| "Run the recovered child".to_string()),
+                    acceptance_signals: (!is_child)
+                        .then(|| vec!["The child survives restart".to_string()])
+                        .unwrap_or_default(),
+                    required_questions: Vec::new(),
+                    evidence_refs: vec![input.final_report_path],
+                    rationale: "Crash matrix deterministic strategist".to_string(),
+                };
+                Ok(StrategistNextGoalSubmission {
+                    raw_output: serde_json::to_string(&verdict)?,
+                    verdict,
+                    strategist: phase_identity(if is_child {
+                        "crash_matrix_strategist_child"
+                    } else {
+                        "crash_matrix_strategist_parent"
+                    }),
+                    artifact_path: None,
+                })
+            }) as StrategistNextGoalHook
+        });
+        phase_runtime
+    }
+
     #[test]
     fn strategist_continue_production_repro() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
-        let critic_hook: PlanCriticHook = Arc::new(|input| {
-            plan_critic_submission(&input, 1, PlanCriticDecision::Approve)
-        });
+        let critic_hook: PlanCriticHook =
+            Arc::new(|input| plan_critic_submission(&input, 1, PlanCriticDecision::Approve));
         let mut phase_runtime = phase_runtime_for_test(Some(critic_hook));
         phase_runtime.planner_hook = Some(Arc::new(|input: PlannerInput| {
             let draft = deterministic_fallback_draft(
@@ -8344,26 +9215,27 @@ mod tests {
                 artifact_path: None,
             })
         }));
-        phase_runtime.strategist_next_goal_hook = Some(Arc::new(|input: StrategistNextGoalInput| {
-            let verdict = StrategistNextGoalVerdict {
-                schema_version: 1,
-                goal_id: input.goal_id,
-                epoch_id: input.epoch_id,
-                reviewed_status: input.status,
-                decision: StrategistNextGoalDecision::Continue,
-                next_objective: Some("Create the successor objective".to_string()),
-                acceptance_signals: vec!["The successor has a durable edge".to_string()],
-                required_questions: Vec::new(),
-                evidence_refs: vec![input.final_report_path],
-                rationale: "The first epoch passed and has a bounded successor".to_string(),
-            };
-            Ok(StrategistNextGoalSubmission {
-                raw_output: serde_json::to_string(&verdict)?,
-                verdict,
-                strategist: phase_identity("repro_strategist"),
-                artifact_path: None,
-            })
-        }));
+        phase_runtime.strategist_next_goal_hook =
+            Some(Arc::new(|input: StrategistNextGoalInput| {
+                let verdict = StrategistNextGoalVerdict {
+                    schema_version: 1,
+                    goal_id: input.goal_id,
+                    epoch_id: input.epoch_id,
+                    reviewed_status: input.status,
+                    decision: StrategistNextGoalDecision::Continue,
+                    next_objective: Some("Create the successor objective".to_string()),
+                    acceptance_signals: vec!["The successor has a durable edge".to_string()],
+                    required_questions: Vec::new(),
+                    evidence_refs: vec![input.final_report_path],
+                    rationale: "The first epoch passed and has a bounded successor".to_string(),
+                };
+                Ok(StrategistNextGoalSubmission {
+                    raw_output: serde_json::to_string(&verdict)?,
+                    verdict,
+                    strategist: phase_identity("repro_strategist"),
+                    artifact_path: None,
+                })
+            }));
         let outcome = Orchestrator::run_with_phase_runtime(
             RunOptions {
                 request: "Reproduce a discarded Continue receipt".to_string(),
@@ -8401,9 +9273,11 @@ mod tests {
         );
         let store = StateStore::new(temp_dir.path());
         let epoch_events = store.read_goal_epoch_events(&outcome.goal_id)?;
-        assert!(epoch_events
-            .iter()
-            .any(|event| event.kind == GoalEpochEventKind::NextGoalSelected));
+        assert!(
+            epoch_events
+                .iter()
+                .any(|event| event.kind == GoalEpochEventKind::NextGoalSelected)
+        );
         assert_eq!(fs::read_dir(store.goals_dir())?.count(), 1);
         assert_eq!(fs::read_dir(store.objectives_dir())?.count(), 0);
         Ok(())
@@ -8783,7 +9657,8 @@ mod tests {
             outcome.goal_outcomes[1].session_id
         );
         let store = StateStore::new(temp_dir.path());
-        let graph: ObjectiveGraph = serde_json::from_str(&fs::read_to_string(&outcome.graph_path)?)?;
+        let graph: ObjectiveGraph =
+            serde_json::from_str(&fs::read_to_string(&outcome.graph_path)?)?;
         graph.validate()?;
         assert_eq!(graph.nodes.len(), 2);
         assert_eq!(
@@ -8799,6 +9674,22 @@ mod tests {
             2
         );
         assert_eq!(strategist_calls.load(Ordering::SeqCst), 2);
+        let objective_id = objective_id_for(
+            "objective-root-session",
+            temp_dir.path(),
+            "Build a restart-safe task tracker",
+        )?;
+        let objective_policy = ObjectivePolicy {
+            auto_continue: true,
+            max_epochs: 2,
+            ..ObjectivePolicy::default()
+        };
+        let objective_ledger =
+            store.read_objective_budget_ledger(&objective_id, &objective_policy.hash()?)?;
+        assert_eq!(objective_ledger.reservations.len(), 2);
+        assert!(objective_ledger.reservations.iter().all(|reservation| {
+            reservation.status == crate::state::ObjectiveBudgetReservationStatus::Settled
+        }));
         Ok(())
     }
 
@@ -8821,26 +9712,27 @@ mod tests {
                 artifact_path: None,
             })
         }));
-        phase_runtime.strategist_next_goal_hook = Some(Arc::new(|input: StrategistNextGoalInput| {
-            let verdict = StrategistNextGoalVerdict {
-                schema_version: 1,
-                goal_id: input.goal_id,
-                epoch_id: input.epoch_id,
-                reviewed_status: input.status,
-                decision: StrategistNextGoalDecision::Continue,
-                next_objective: Some("Repeat the same bounded task".to_string()),
-                acceptance_signals: vec!["A stable observation exists".to_string()],
-                required_questions: Vec::new(),
-                evidence_refs: vec![input.final_report_path],
-                rationale: "Continue is intentionally blocked by the epoch policy".to_string(),
-            };
-            Ok(StrategistNextGoalSubmission {
-                raw_output: serde_json::to_string(&verdict)?,
-                verdict,
-                strategist: phase_identity("limited_strategist"),
-                artifact_path: None,
-            })
-        }));
+        phase_runtime.strategist_next_goal_hook =
+            Some(Arc::new(|input: StrategistNextGoalInput| {
+                let verdict = StrategistNextGoalVerdict {
+                    schema_version: 1,
+                    goal_id: input.goal_id,
+                    epoch_id: input.epoch_id,
+                    reviewed_status: input.status,
+                    decision: StrategistNextGoalDecision::Continue,
+                    next_objective: Some("Repeat the same bounded task".to_string()),
+                    acceptance_signals: vec!["A stable observation exists".to_string()],
+                    required_questions: Vec::new(),
+                    evidence_refs: vec![input.final_report_path],
+                    rationale: "Continue is intentionally blocked by the epoch policy".to_string(),
+                };
+                Ok(StrategistNextGoalSubmission {
+                    raw_output: serde_json::to_string(&verdict)?,
+                    verdict,
+                    strategist: phase_identity("limited_strategist"),
+                    artifact_path: None,
+                })
+            }));
         let outcome = Orchestrator::run_objective_with_phase_runtime(
             RunOptions {
                 request: "Build a bounded artifact".to_string(),
@@ -8875,7 +9767,8 @@ mod tests {
         )?;
         assert_eq!(outcome.status, ObjectiveStatus::Limited);
         assert_eq!(outcome.goal_outcomes.len(), 1);
-        let graph: ObjectiveGraph = serde_json::from_str(&fs::read_to_string(&outcome.graph_path)?)?;
+        let graph: ObjectiveGraph =
+            serde_json::from_str(&fs::read_to_string(&outcome.graph_path)?)?;
         assert_eq!(graph.nodes.len(), 1);
         assert!(graph.active_goal_id.is_none());
         Ok(())
@@ -8921,7 +9814,7 @@ mod tests {
             objective_id,
             "goal-attached:goal-recovery-000",
             ObjectiveEventKind::GoalAttached,
-            json!({ "goal_id": "goal-recovery-000" }),
+            json!({ "goal_id": "goal-recovery-000", "epoch_id": "epoch-recovery-000" }),
         )?;
         graph.update_active_node(
             "goal-recovery-000",
@@ -8945,11 +9838,38 @@ mod tests {
             }),
         )?;
 
-        reconcile_objective_frontier(&store, objective_id, root_session_id, &mut graph)?;
+        let objective_lease = store.acquire_objective_lease(
+            objective_id,
+            root_session_id,
+            Duration::from_secs(60),
+        )?;
+        reconcile_objective_frontier(
+            &store,
+            objective_id,
+            root_session_id,
+            &mut graph,
+            Some(&objective_lease),
+            &ObjectivePolicy::rolling_default(),
+            &Budget::default(),
+        )?;
+        objective_lease.release()?;
         assert_eq!(graph.nodes.len(), 2);
-        assert_eq!(graph.active_goal_id.as_deref(), Some("goal_objective-recovery_001"));
-        assert_eq!(graph.nodes[1].parent_strategist_receipt_hash.as_deref(), Some("strategist-recovery"));
-        assert_eq!(store.read_objective_events(objective_id)?.iter().filter(|event| event.kind == ObjectiveEventKind::GoalAttached).count(), 2);
+        assert_eq!(
+            graph.active_goal_id.as_deref(),
+            Some("goal_objective-recovery_001")
+        );
+        assert_eq!(
+            graph.nodes[1].parent_strategist_receipt_hash.as_deref(),
+            Some("strategist-recovery")
+        );
+        assert_eq!(
+            store
+                .read_objective_events(objective_id)?
+                .iter()
+                .filter(|event| event.kind == ObjectiveEventKind::GoalAttached)
+                .count(),
+            2
+        );
         Ok(())
     }
 
@@ -12863,9 +13783,8 @@ mod tests {
         let store = StateStore::new(temp_dir.path());
         store.initialize()?;
 
-        let critic_hook: PlanCriticHook = Arc::new(|input| {
-            plan_critic_submission(&input, 1, PlanCriticDecision::Approve)
-        });
+        let critic_hook: PlanCriticHook =
+            Arc::new(|input| plan_critic_submission(&input, 1, PlanCriticDecision::Approve));
         let mut phase_runtime = phase_runtime_for_test(Some(critic_hook));
         phase_runtime.planner_hook = Some(Arc::new(|input: PlannerInput| {
             let draft = deterministic_fallback_draft(
@@ -12880,32 +13799,34 @@ mod tests {
                 artifact_path: None,
             })
         }));
-        phase_runtime.strategist_next_goal_hook = Some(Arc::new(|input: StrategistNextGoalInput| {
-            let verdict = StrategistNextGoalVerdict {
-                schema_version: 1,
-                goal_id: input.goal_id,
-                epoch_id: input.epoch_id,
-                reviewed_status: input.status,
-                decision: StrategistNextGoalDecision::Continue,
-                next_objective: Some("Create the successor objective".to_string()),
-                acceptance_signals: vec!["The successor has a durable edge".to_string()],
-                required_questions: Vec::new(),
-                evidence_refs: vec![input.final_report_path],
-                rationale: "The first epoch passed and has a bounded successor".to_string(),
-            };
-            Ok(StrategistNextGoalSubmission {
-                raw_output: serde_json::to_string(&verdict)?,
-                verdict,
-                strategist: phase_identity("repro_strategist"),
-                artifact_path: None,
-            })
-        }));
+        phase_runtime.strategist_next_goal_hook =
+            Some(Arc::new(|input: StrategistNextGoalInput| {
+                let verdict = StrategistNextGoalVerdict {
+                    schema_version: 1,
+                    goal_id: input.goal_id,
+                    epoch_id: input.epoch_id,
+                    reviewed_status: input.status,
+                    decision: StrategistNextGoalDecision::Continue,
+                    next_objective: Some("Create the successor objective".to_string()),
+                    acceptance_signals: vec!["The successor has a durable edge".to_string()],
+                    required_questions: Vec::new(),
+                    evidence_refs: vec![input.final_report_path],
+                    rationale: "The first epoch passed and has a bounded successor".to_string(),
+                };
+                Ok(StrategistNextGoalSubmission {
+                    raw_output: serde_json::to_string(&verdict)?,
+                    verdict,
+                    strategist: phase_identity("repro_strategist"),
+                    artifact_path: None,
+                })
+            }));
 
         let intercept_flag = Arc::new(Mutex::new(true));
         let write_order = Arc::new(Mutex::new(Vec::new()));
         let write_order_clone_a = write_order.clone();
         let write_order_clone_b = write_order.clone();
         let intercept_flag_clone = intercept_flag.clone();
+        let worker_dispatch_count = Arc::new(AtomicUsize::new(0));
 
         test_seams::install(test_seams::ObjectiveControllerTestSeam {
             on_goal_settled: Some(Arc::new(move |goal_id, epoch_id| {
@@ -12929,7 +13850,8 @@ mod tests {
             intercept_settled_to_graph_commit: Some(Arc::new(move || {
                 *intercept_flag_clone.lock().unwrap()
             })),
-            worker_dispatch_count: Arc::new(AtomicUsize::new(0)),
+            worker_dispatch_count: worker_dispatch_count.clone(),
+            crash_point: None,
             on_continue_event: None,
             on_child_attach: None,
         });
@@ -12979,7 +13901,8 @@ mod tests {
         );
         let error_msg = result.unwrap_err().to_string();
         assert!(
-            error_msg.contains("simulated crash after goal settled but before objective graph commit"),
+            error_msg
+                .contains("simulated crash after goal settled but before objective graph commit"),
             "error must describe the crash gap: {error_msg}"
         );
 
@@ -13001,27 +13924,55 @@ mod tests {
 
         let goal_epoch_events = store.read_goal_epoch_events(&active_node.goal_id)?;
         assert!(
-            goal_epoch_events.iter().any(|e| e.kind == GoalEpochEventKind::Settled),
+            goal_epoch_events
+                .iter()
+                .any(|e| e.kind == GoalEpochEventKind::Settled),
             "goal epoch must have Settled event proving the goal did complete"
         );
 
-        let worker_dispatches = test_seams::with_seam(|seam| {
-            seam.as_ref()
-                .map(|s| s.worker_dispatch_count.load(Ordering::SeqCst))
-                .unwrap_or(0)
-        });
+        let worker_dispatches = worker_dispatch_count.load(Ordering::SeqCst);
         assert!(
             worker_dispatches > 0,
             "worker must have been dispatched during the goal run"
         );
 
-        test_seams::reset();
+        *intercept_flag.lock().unwrap() = false;
 
-        let mut graph = store.read_objective_graph(&objective_id)?.context("graph must exist")?;
-        reconcile_objective_frontier(&store, &objective_id, "crash-repro-session", &mut graph)?;
+        let mut graph = store
+            .read_objective_graph(&objective_id)?
+            .context("graph must exist")?;
+        let objective_lease = store.acquire_objective_lease(
+            &objective_id,
+            "crash-repro-session",
+            Duration::from_secs(60),
+        )?;
+        reconcile_objective_frontier(
+            &store,
+            &objective_id,
+            "crash-repro-session",
+            &mut graph,
+            Some(&objective_lease),
+            &ObjectivePolicy {
+                auto_continue: true,
+                max_epochs: 3,
+                max_calls: 96,
+                max_tokens: 12_288_000,
+                max_cost_micros: 10_000_000,
+                max_unknown_usage_calls: 32,
+                max_consecutive_no_progress: 2,
+                max_consecutive_failures: 3,
+                cooldown_seconds: 0,
+            },
+            &Budget::default(),
+        )?;
+        objective_lease.release()?;
+        assert!(
+            graph.nodes[0].status == GoalStatus::Complete,
+            "reconcile must commit the settled parent from the outcome receipt"
+        );
         assert!(
             graph.active_goal_id.is_some(),
-            "reconcile must leave active frontier because graph was never updated to terminal"
+            "reconcile must advance to the single recovered child frontier"
         );
 
         let resumed_result = Orchestrator::run_objective_with_phase_runtime(
@@ -13064,18 +14015,128 @@ mod tests {
         );
 
         assert!(
-            resumed_result.is_err(),
-            "resumed controller must fail because it tries to re-enter a settled goal"
+            resumed_result.is_ok(),
+            "resumed controller must reuse the settled parent and continue from the child: {:?}",
+            resumed_result.err()
         );
-        let resumed_err = resumed_result.unwrap_err().to_string();
+        let resumed = resumed_result?;
         assert!(
-            resumed_err.contains("cannot start epoch")
-                || resumed_err.contains("active epoch")
-                || resumed_err.contains("phase completion is not bound to the active goal epoch")
-                || resumed_err.contains("idempotency key conflicts with an existing event"),
-            "resumed run must fail due to epoch state conflict, got: {resumed_err}"
+            matches!(
+                resumed.status,
+                ObjectiveStatus::Limited | ObjectiveStatus::Complete
+            ),
+            "resumed controller must reach a bounded terminal state, got {:?}",
+            resumed.status
+        );
+        assert!(
+            worker_dispatch_count.load(Ordering::SeqCst) > worker_dispatches,
+            "recovery must make forward progress from the settled parent"
         );
 
+        test_seams::reset();
+
+        Ok(())
+    }
+
+    #[test]
+    fn objective_crash_window_matrix_recovers_exactly_once() -> Result<()> {
+        let crash_points = [
+            test_seams::ObjectiveCrashPoint::BeforeOutcomeReceipt,
+            test_seams::ObjectiveCrashPoint::AfterOutcomeReceiptBeforeGraph,
+            test_seams::ObjectiveCrashPoint::AfterChildReservationBeforeEdge,
+            test_seams::ObjectiveCrashPoint::AfterChildEdgeBeforeStarted,
+            test_seams::ObjectiveCrashPoint::AfterChildOutcomeBeforeObjectiveSettled,
+        ];
+        let policy = ObjectivePolicy {
+            auto_continue: true,
+            max_epochs: 2,
+            max_calls: 96,
+            max_tokens: 12_288_000,
+            max_cost_micros: 10_000_000,
+            max_unknown_usage_calls: 32,
+            max_consecutive_no_progress: 2,
+            max_consecutive_failures: 3,
+            cooldown_seconds: 0,
+        };
+        for (index, crash_point) in crash_points.into_iter().enumerate() {
+            test_seams::reset();
+            let temp_dir = tempfile::tempdir()?;
+            let worker_dispatch_count = Arc::new(AtomicUsize::new(0));
+            test_seams::install(test_seams::ObjectiveControllerTestSeam {
+                on_goal_settled: None,
+                on_goal_lease_released: None,
+                on_objective_graph_commit: None,
+                on_continue_event: None,
+                on_child_attach: None,
+                intercept_settled_to_graph_commit: None,
+                worker_dispatch_count: worker_dispatch_count.clone(),
+                crash_point: Some(crash_point),
+            });
+            let run = |runtime: PhaseRuntime| {
+                Orchestrator::run_objective_with_phase_runtime(
+                    RunOptions {
+                        request: "Crash matrix objective".to_string(),
+                        workspace: temp_dir.path().to_path_buf(),
+                        verification_commands: vec!["echo verify-ok".to_string()],
+                        worker: objective_worker_for_test(),
+                        allowed_paths: Vec::new(),
+                        forbidden_paths: vec![".git".to_string()],
+                        max_files_changed: 10,
+                        install_dependencies: false,
+                        event_sink: None,
+                        cancellation_token: None,
+                        max_iterations: 2,
+                        max_provider_unknown_streak: DEFAULT_MAX_PROVIDER_UNKNOWN_STREAK,
+                        max_child_depth: usize::MAX,
+                        max_runtime_minutes: 1,
+                        budget: None,
+                        coordinator_model: None,
+                        coordinator_brief: None,
+                        coordinator_review_hook: None,
+                        task_manager_control: None,
+                        task_manager: None,
+                        session_id: Some("crash-matrix-session".to_string()),
+                        continuation: true,
+                    },
+                    runtime,
+                    policy.clone(),
+                )
+            };
+            let initial = run(crash_matrix_phase_runtime());
+            assert!(
+                initial.is_err(),
+                "crash point {crash_point:?} must terminate the first controller"
+            );
+            test_seams::with_seam(|seam| {
+                if let Some(seam) = seam.as_mut() {
+                    seam.crash_point = None;
+                }
+            });
+            let resumed = run(crash_matrix_phase_runtime())?;
+            assert_eq!(resumed.status, ObjectiveStatus::Complete);
+            let store = StateStore::new(temp_dir.path());
+            let graph = store
+                .read_objective_graph(&resumed.objective_id)?
+                .context("crash matrix graph must be recoverable")?;
+            assert_eq!(
+                graph.nodes.len(),
+                2,
+                "crash point {index} created duplicate goals"
+            );
+            assert!(graph.nodes.iter().all(|node| node.status.is_terminal()));
+            let ledger =
+                store.read_objective_budget_ledger(&resumed.objective_id, &policy.hash()?)?;
+            assert_eq!(ledger.reservations.len(), 2);
+            assert!(ledger.reservations.iter().all(|reservation| {
+                reservation.status == crate::state::ObjectiveBudgetReservationStatus::Settled
+            }));
+            assert_eq!(
+                worker_dispatch_count.load(Ordering::SeqCst),
+                4,
+                "crash point {crash_point:?} reran the wrong goal"
+            );
+        }
+        test_seams::reset();
         Ok(())
     }
 
@@ -13086,9 +14147,8 @@ mod tests {
         let store = StateStore::new(temp_dir.path());
         store.initialize()?;
 
-        let critic_hook: PlanCriticHook = Arc::new(|input| {
-            plan_critic_submission(&input, 1, PlanCriticDecision::Approve)
-        });
+        let critic_hook: PlanCriticHook =
+            Arc::new(|input| plan_critic_submission(&input, 1, PlanCriticDecision::Approve));
         let mut phase_runtime = phase_runtime_for_test(Some(critic_hook));
         phase_runtime.planner_hook = Some(Arc::new(|input: PlannerInput| {
             let draft = deterministic_fallback_draft(
@@ -13103,26 +14163,27 @@ mod tests {
                 artifact_path: None,
             })
         }));
-        phase_runtime.strategist_next_goal_hook = Some(Arc::new(|input: StrategistNextGoalInput| {
-            let verdict = StrategistNextGoalVerdict {
-                schema_version: 1,
-                goal_id: input.goal_id,
-                epoch_id: input.epoch_id,
-                reviewed_status: input.status,
-                decision: StrategistNextGoalDecision::Continue,
-                next_objective: Some("Create the successor objective".to_string()),
-                acceptance_signals: vec!["The successor has a durable edge".to_string()],
-                required_questions: Vec::new(),
-                evidence_refs: vec![input.final_report_path],
-                rationale: "The first epoch passed and has a bounded successor".to_string(),
-            };
-            Ok(StrategistNextGoalSubmission {
-                raw_output: serde_json::to_string(&verdict)?,
-                verdict,
-                strategist: phase_identity("repro_strategist"),
-                artifact_path: None,
-            })
-        }));
+        phase_runtime.strategist_next_goal_hook =
+            Some(Arc::new(|input: StrategistNextGoalInput| {
+                let verdict = StrategistNextGoalVerdict {
+                    schema_version: 1,
+                    goal_id: input.goal_id,
+                    epoch_id: input.epoch_id,
+                    reviewed_status: input.status,
+                    decision: StrategistNextGoalDecision::Continue,
+                    next_objective: Some("Create the successor objective".to_string()),
+                    acceptance_signals: vec!["The successor has a durable edge".to_string()],
+                    required_questions: Vec::new(),
+                    evidence_refs: vec![input.final_report_path],
+                    rationale: "The first epoch passed and has a bounded successor".to_string(),
+                };
+                Ok(StrategistNextGoalSubmission {
+                    raw_output: serde_json::to_string(&verdict)?,
+                    verdict,
+                    strategist: phase_identity("repro_strategist"),
+                    artifact_path: None,
+                })
+            }));
 
         let dispatch_count = Arc::new(AtomicUsize::new(0));
         let dispatch_count_clone = dispatch_count.clone();
@@ -13136,6 +14197,7 @@ mod tests {
             })),
             intercept_settled_to_graph_commit: None,
             worker_dispatch_count: Arc::new(AtomicUsize::new(0)),
+            crash_point: None,
         });
 
         let outcome = Orchestrator::run_objective_with_phase_runtime(
@@ -13196,10 +14258,19 @@ mod tests {
         )?;
 
         let objectives_dir = store.objectives_dir();
-        let reservation_ledger_path = objectives_dir.join(format!("{objective_id}.reservations.json"));
+        let reservation_ledger_path =
+            objectives_dir.join(format!("{objective_id}.reservations.json"));
         assert!(
-            !reservation_ledger_path.exists(),
-            "no objective-wide reservation ledger must exist before child dispatch: {reservation_ledger_path:?}"
+            reservation_ledger_path.exists(),
+            "objective-wide reservation ledger must exist before child dispatch: {reservation_ledger_path:?}"
+        );
+        let reservation_ledger: crate::state::ObjectiveBudgetLedger =
+            serde_json::from_str(&std::fs::read_to_string(&reservation_ledger_path)?)?;
+        assert!(
+            reservation_ledger.reservations.iter().any(|reservation| {
+                reservation.status == crate::state::ObjectiveBudgetReservationStatus::Settled
+            }),
+            "child epoch reservation must settle into the objective ledger"
         );
 
         let graph = store

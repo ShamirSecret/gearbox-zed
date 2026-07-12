@@ -6,21 +6,16 @@ use anyhow::{Context as _, Result, bail};
 use crate::phase_routing::{
     LiveModelInventory, OpenCodeModelProfiles, PhaseBackend, PhaseRouteDecision, PhaseRouteTable,
 };
-use crate::plan_graph::{parse_planner_draft, PhaseProfile};
-use crate::plan_review::{
-    IntentFoldVerdict, PhaseExecutionIdentity, PlanCriticVerdict,
-};
+#[cfg(test)]
+use crate::plan_graph::PhaseProfile;
+use crate::plan_graph::parse_planner_draft;
+use crate::plan_review::{IntentFoldVerdict, PhaseExecutionIdentity, PlanCriticVerdict};
 use crate::runtime::{
-    IntentFoldInput, IntentFoldSubmission,
-    PlannerInput, PlannerSubmission,
-    PlanCriticInput, PlanCriticSubmission,
-    PlanRevisionInput, PlanRevisionSubmission,
-    PhaseRuntime, StrategistNextGoalInput, StrategistNextGoalSubmission,
-    StrategistNextGoalVerdict,
+    IntentFoldInput, IntentFoldSubmission, PhaseRuntime, PlanCriticInput, PlanCriticSubmission,
+    PlanRevisionInput, PlanRevisionSubmission, PlannerInput, PlannerSubmission,
+    StrategistNextGoalInput, StrategistNextGoalSubmission, StrategistNextGoalVerdict,
 };
-use crate::state::{
-    Scope, StateStore, Task, TaskInputs, TaskOutputs, TaskStatus, id_timestamp,
-};
+use crate::state::{Scope, StateStore, Task, TaskInputs, TaskOutputs, TaskStatus, id_timestamp};
 use crate::tools::CancellationToken;
 use crate::worker_broker::PhaseBrokerFactory;
 use crate::workers::{WorkerConfig, WorkerKind, WorkerStartRequest, WorkerStatus};
@@ -102,9 +97,7 @@ impl OpenCodePhaseRuntimeFactory {
             inventory: self.inventory,
             current_model: None,
             planner: None,
-            intent_fold_hook: Some(Arc::new(move |input| {
-                intent_fold_runner.fold_intent(input)
-            })),
+            intent_fold_hook: Some(Arc::new(move |input| intent_fold_runner.fold_intent(input))),
             planner_hook: Some(Arc::new(move |input| planner_runner.plan(input))),
             plan_critic_hook: Some(Arc::new(move |input| critic_runner.critique(input))),
             plan_revision_hook: Some(Arc::new(move |input| revision_runner.revise(input))),
@@ -322,7 +315,10 @@ impl OpenCodePhaseRunner {
         })
     }
 
-    pub fn strategize(&self, input: StrategistNextGoalInput) -> Result<StrategistNextGoalSubmission> {
+    pub fn strategize(
+        &self,
+        input: StrategistNextGoalInput,
+    ) -> Result<StrategistNextGoalSubmission> {
         let prompt = gear_opencode_strategist_prompt(&input)?;
         let task_id = format!("strategist_{}_{}", input.goal_id, input.epoch_id);
         let output = self.run(
@@ -583,18 +579,15 @@ mod tests {
 
         // Two invocations must have independent execution identities.
         assert_ne!(
-            first.planner.execution_id,
-            second.planner.execution_id,
+            first.planner.execution_id, second.planner.execution_id,
             "consecutive planner calls must not share execution_id"
         );
         assert_ne!(
-            first.planner.phase_session_id,
-            second.planner.phase_session_id,
+            first.planner.phase_session_id, second.planner.phase_session_id,
             "consecutive planner calls must not share phase_session_id"
         );
         assert_ne!(
-            first.planner.actual_session_id,
-            second.planner.actual_session_id,
+            first.planner.actual_session_id, second.planner.actual_session_id,
             "consecutive planner calls must not share actual_session_id"
         );
 

@@ -234,11 +234,7 @@ impl GoalStatus {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            Self::NeedsUser
-                | Self::Blocked
-                | Self::Limited
-                | Self::Complete
-                | Self::Failed
+            Self::NeedsUser | Self::Blocked | Self::Limited | Self::Complete | Self::Failed
         )
     }
 
@@ -507,7 +503,10 @@ impl PlanNodeRunLedger {
 
     pub fn validate(&self) -> Result<()> {
         if self.schema_version != PLAN_NODE_RUN_LEDGER_SCHEMA_VERSION {
-            bail!("unsupported PlanNodeRunLedger schema version {}", self.schema_version);
+            bail!(
+                "unsupported PlanNodeRunLedger schema version {}",
+                self.schema_version
+            );
         }
         if self.nodes.is_empty() {
             bail!("PlanNodeRunLedger must contain at least one node");
@@ -673,9 +672,12 @@ impl FinalVerificationWaveReceipt {
             FinalVerificationDimension::ScopeFidelity,
         ];
         if self.dimensions.len() != required.len()
-            || required
-                .iter()
-                .any(|dimension| !self.dimensions.iter().any(|result| &result.dimension == dimension))
+            || required.iter().any(|dimension| {
+                !self
+                    .dimensions
+                    .iter()
+                    .any(|result| &result.dimension == dimension)
+            })
         {
             bail!("final verification wave must contain exactly four dimensions");
         }
@@ -751,6 +753,7 @@ pub struct GoalEpochEvent {
 
 pub const OBJECTIVE_GRAPH_SCHEMA_VERSION: u32 = 1;
 pub const OBJECTIVE_EVENT_SCHEMA_VERSION: u32 = 1;
+pub const OBJECTIVE_EPOCH_OUTCOME_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -884,7 +887,11 @@ impl GoalGraphNode {
         if self.request_hash != expected_request_hash {
             bail!("goal graph node request hash does not match its request");
         }
-        match (&self.parent_goal_id, &self.parent_epoch_id, &self.parent_strategist_receipt_hash) {
+        match (
+            &self.parent_goal_id,
+            &self.parent_epoch_id,
+            &self.parent_strategist_receipt_hash,
+        ) {
             (None, None, None) => {}
             (Some(_), Some(_), Some(hash)) if !hash.trim().is_empty() => {}
             _ => bail!("objective child must bind its parent epoch and strategist receipt"),
@@ -973,7 +980,10 @@ impl ObjectiveGraph {
             if let Some(parent_goal_id) = node.parent_goal_id.as_deref()
                 && !goal_ids.contains(parent_goal_id)
             {
-                bail!("objective graph node {} references a missing parent", node.goal_id);
+                bail!(
+                    "objective graph node {} references a missing parent",
+                    node.goal_id
+                );
             }
             if !node.status.is_terminal() {
                 if active_goal.replace(node.goal_id.as_str()).is_some() {
@@ -1030,7 +1040,11 @@ impl ObjectiveGraph {
         if self.active_goal_id.is_some() {
             bail!("objective graph already has an active frontier");
         }
-        if self.nodes.iter().any(|candidate| candidate.goal_id == node.goal_id) {
+        if self
+            .nodes
+            .iter()
+            .any(|candidate| candidate.goal_id == node.goal_id)
+        {
             bail!("objective child goal already exists");
         }
         self.nodes.push(node);
@@ -1119,12 +1133,244 @@ impl ObjectiveGraph {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectiveEpochOutcomeReceipt {
+    pub schema_version: u32,
+    pub objective_id: String,
+    pub goal_id: String,
+    pub epoch_id: String,
+    pub session_id: String,
+    pub request_hash: String,
+    pub scope_hash: String,
+    pub policy_hash: String,
+    pub status: GoalStatus,
+    pub final_wave_path: String,
+    pub final_wave_hash: String,
+    pub final_report_path: String,
+    pub final_report_hash: String,
+    pub goal_budget_ledger_hash: String,
+    pub strategist_receipt_path: Option<String>,
+    pub strategist_receipt_hash: Option<String>,
+    pub strategist_decision: Option<String>,
+    pub settled_at: String,
+    pub receipt_hash: String,
+}
+
+impl ObjectiveEpochOutcomeReceipt {
+    pub fn seal(
+        objective_id: &str,
+        goal_id: &str,
+        epoch_id: &str,
+        session_id: &str,
+        request_hash: String,
+        scope_hash: String,
+        policy_hash: String,
+        status: GoalStatus,
+        final_wave_path: String,
+        final_wave_hash: String,
+        final_report_path: String,
+        final_report_hash: String,
+        goal_budget_ledger_hash: String,
+        strategist_receipt_path: Option<String>,
+        strategist_receipt_hash: Option<String>,
+        strategist_decision: Option<String>,
+    ) -> Result<Self> {
+        let mut receipt = Self {
+            schema_version: OBJECTIVE_EPOCH_OUTCOME_SCHEMA_VERSION,
+            objective_id: objective_id.to_string(),
+            goal_id: goal_id.to_string(),
+            epoch_id: epoch_id.to_string(),
+            session_id: session_id.to_string(),
+            request_hash,
+            scope_hash,
+            policy_hash,
+            status,
+            final_wave_path,
+            final_wave_hash,
+            final_report_path,
+            final_report_hash,
+            goal_budget_ledger_hash,
+            strategist_receipt_path,
+            strategist_receipt_hash,
+            strategist_decision,
+            settled_at: timestamp(),
+            receipt_hash: String::new(),
+        };
+        receipt.receipt_hash = receipt.expected_hash()?;
+        receipt.validate(objective_id, goal_id, epoch_id)?;
+        Ok(receipt)
+    }
+
+    pub fn validate(&self, objective_id: &str, goal_id: &str, epoch_id: &str) -> Result<()> {
+        if self.schema_version != OBJECTIVE_EPOCH_OUTCOME_SCHEMA_VERSION
+            || self.objective_id != objective_id
+            || self.goal_id != goal_id
+            || self.epoch_id != epoch_id
+            || !self.status.is_terminal()
+            || self.receipt_hash != self.expected_hash()?
+        {
+            bail!("objective epoch outcome binding or hash is invalid");
+        }
+        for (field, value) in [
+            ("session_id", self.session_id.as_str()),
+            ("request_hash", self.request_hash.as_str()),
+            ("scope_hash", self.scope_hash.as_str()),
+            ("policy_hash", self.policy_hash.as_str()),
+            ("final_wave_path", self.final_wave_path.as_str()),
+            ("final_wave_hash", self.final_wave_hash.as_str()),
+            ("final_report_path", self.final_report_path.as_str()),
+            ("final_report_hash", self.final_report_hash.as_str()),
+            (
+                "goal_budget_ledger_hash",
+                self.goal_budget_ledger_hash.as_str(),
+            ),
+            ("settled_at", self.settled_at.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                bail!("objective epoch outcome requires non-empty {field}");
+            }
+        }
+        match (
+            self.strategist_receipt_path.as_deref(),
+            self.strategist_receipt_hash.as_deref(),
+            self.strategist_decision.as_deref(),
+        ) {
+            (None, None, None) => {}
+            (Some(path), Some(hash), Some(decision))
+                if !path.trim().is_empty()
+                    && !hash.trim().is_empty()
+                    && !decision.trim().is_empty() => {}
+            _ => bail!("objective epoch outcome has an incomplete strategist binding"),
+        }
+        Ok(())
+    }
+
+    fn expected_hash(&self) -> Result<String> {
+        let mut payload = self.clone();
+        payload.receipt_hash.clear();
+        let bytes =
+            serde_json::to_vec(&payload).context("failed to serialize objective epoch outcome")?;
+        Ok(format!("{:x}", Sha256::digest(bytes)))
+    }
+}
+
+pub const OBJECTIVE_BUDGET_LEDGER_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectiveBudgetReservationStatus {
+    Reserved,
+    Settled,
+    Released,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectiveBudgetReservation {
+    pub reservation_id: String,
+    pub objective_id: String,
+    pub goal_id: String,
+    pub epoch_id: String,
+    pub policy_hash: String,
+    pub reserved_calls: usize,
+    pub reserved_tokens: u64,
+    pub reserved_cost_micros: u64,
+    pub reserved_unknown_calls: usize,
+    pub reserved_premium_calls: usize,
+    pub status: ObjectiveBudgetReservationStatus,
+    pub actual_calls: Option<usize>,
+    pub actual_tokens: Option<u64>,
+    pub actual_cost_micros: Option<u64>,
+    pub actual_unknown_calls: Option<usize>,
+    pub actual_premium_calls: Option<usize>,
+    pub cache_hits: Option<usize>,
+    pub duration_ms: Option<u64>,
+    pub fallback_reasons: Vec<String>,
+    pub created_at: String,
+    pub settled_at: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectiveBudgetLedger {
+    pub schema_version: u32,
+    pub objective_id: String,
+    pub policy_hash: String,
+    pub reservations: Vec<ObjectiveBudgetReservation>,
+    pub updated_at: String,
+    pub ledger_hash: String,
+}
+
+impl ObjectiveBudgetLedger {
+    fn seal(mut self) -> Result<Self> {
+        self.ledger_hash.clear();
+        self.ledger_hash = self.expected_hash()?;
+        Ok(self)
+    }
+
+    fn validate(&self, objective_id: &str, policy_hash: &str) -> Result<()> {
+        if self.schema_version != OBJECTIVE_BUDGET_LEDGER_SCHEMA_VERSION
+            || self.objective_id != objective_id
+            || self.policy_hash != policy_hash
+            || self.ledger_hash != self.expected_hash()?
+        {
+            bail!("objective budget ledger binding or hash is invalid");
+        }
+        let mut reservation_ids = HashSet::new();
+        for reservation in &self.reservations {
+            if reservation.objective_id != objective_id
+                || reservation.policy_hash != policy_hash
+                || reservation.reservation_id.trim().is_empty()
+                || reservation.goal_id.trim().is_empty()
+                || reservation.epoch_id.trim().is_empty()
+                || !reservation_ids.insert(reservation.reservation_id.as_str())
+            {
+                bail!("objective budget ledger contains an invalid reservation binding");
+            }
+            match reservation.status {
+                ObjectiveBudgetReservationStatus::Reserved
+                    if reservation.actual_calls.is_some()
+                        || reservation.actual_tokens.is_some()
+                        || reservation.actual_cost_micros.is_some()
+                        || reservation.settled_at.is_some() =>
+                {
+                    bail!("reserved objective budget cannot contain settlement fields");
+                }
+                ObjectiveBudgetReservationStatus::Settled
+                    if reservation.actual_calls.is_none() || reservation.settled_at.is_none() =>
+                {
+                    bail!("settled objective budget requires actual calls and settled_at");
+                }
+                ObjectiveBudgetReservationStatus::Released if reservation.settled_at.is_none() => {
+                    bail!("released objective budget requires settled_at");
+                }
+                ObjectiveBudgetReservationStatus::Reserved
+                | ObjectiveBudgetReservationStatus::Settled
+                | ObjectiveBudgetReservationStatus::Released => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn expected_hash(&self) -> Result<String> {
+        let mut payload = self.clone();
+        payload.ledger_hash.clear();
+        let bytes =
+            serde_json::to_vec(&payload).context("failed to serialize objective budget ledger")?;
+        Ok(format!("{:x}", Sha256::digest(bytes)))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ObjectiveEventKind {
     Started,
     GoalAttached,
+    GoalOutcomeRecorded,
     StrategistContinueAccepted,
+    ChildDispatchReserved,
+    ObjectiveBudgetSettled,
     FrontierAdvanced,
     NeedsUser,
     Stopped,
@@ -1243,15 +1489,21 @@ fn validate_objective_event_transition(
     terminated: &mut bool,
     event: &ObjectiveEvent,
 ) -> Result<()> {
+    validate_objective_event_payload(event)?;
     match event.kind {
         ObjectiveEventKind::Started => {
             if *active || *terminated {
-                bail!("objective cannot start while another objective lifecycle is active or terminal");
+                bail!(
+                    "objective cannot start while another objective lifecycle is active or terminal"
+                );
             }
             *active = true;
         }
         ObjectiveEventKind::GoalAttached
+        | ObjectiveEventKind::GoalOutcomeRecorded
         | ObjectiveEventKind::StrategistContinueAccepted
+        | ObjectiveEventKind::ChildDispatchReserved
+        | ObjectiveEventKind::ObjectiveBudgetSettled
         | ObjectiveEventKind::FrontierAdvanced => {
             if !*active {
                 bail!("objective event requires an active objective");
@@ -1270,6 +1522,59 @@ fn validate_objective_event_transition(
             *active = false;
             *terminated = true;
         }
+    }
+    Ok(())
+}
+
+fn validate_objective_event_payload(event: &ObjectiveEvent) -> Result<()> {
+    let required_non_empty = |field: &str| -> Result<()> {
+        if event
+            .payload
+            .get(field)
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            bail!(
+                "objective event {:?} requires non-empty {field}",
+                event.kind
+            );
+        }
+        Ok(())
+    };
+    match event.kind {
+        ObjectiveEventKind::Started => {}
+        ObjectiveEventKind::GoalAttached => {
+            required_non_empty("goal_id")?;
+            required_non_empty("epoch_id")?;
+        }
+        ObjectiveEventKind::GoalOutcomeRecorded => {
+            required_non_empty("goal_id")?;
+            required_non_empty("epoch_id")?;
+            required_non_empty("receipt_hash")?;
+        }
+        ObjectiveEventKind::StrategistContinueAccepted => {
+            required_non_empty("parent_goal_id")?;
+            required_non_empty("parent_epoch_id")?;
+            required_non_empty("receipt_hash")?;
+            required_non_empty("next_objective")?;
+        }
+        ObjectiveEventKind::ChildDispatchReserved => {
+            required_non_empty("reservation_id")?;
+            required_non_empty("goal_id")?;
+            required_non_empty("epoch_id")?;
+        }
+        ObjectiveEventKind::ObjectiveBudgetSettled => {
+            required_non_empty("reservation_id")?;
+            required_non_empty("status")?;
+        }
+        ObjectiveEventKind::FrontierAdvanced => required_non_empty("active_goal_id")?,
+        ObjectiveEventKind::NeedsUser
+        | ObjectiveEventKind::Stopped
+        | ObjectiveEventKind::Limited
+        | ObjectiveEventKind::Blocked
+        | ObjectiveEventKind::Completed
+        | ObjectiveEventKind::Failed
+        | ObjectiveEventKind::Aborted => {}
     }
     Ok(())
 }
@@ -1612,6 +1917,272 @@ impl StateStore {
             .join(format!("{objective_id}.lease.json"))
     }
 
+    pub fn objective_epoch_outcome_path(
+        &self,
+        objective_id: &str,
+        goal_id: &str,
+        epoch_id: &str,
+    ) -> PathBuf {
+        self.objectives_dir()
+            .join(format!("{objective_id}.{goal_id}.{epoch_id}.outcome.json"))
+    }
+
+    pub fn objective_budget_ledger_path(&self, objective_id: &str) -> PathBuf {
+        self.objectives_dir()
+            .join(format!("{objective_id}.reservations.json"))
+    }
+
+    pub fn read_objective_budget_ledger(
+        &self,
+        objective_id: &str,
+        policy_hash: &str,
+    ) -> Result<ObjectiveBudgetLedger> {
+        let path = self.objective_budget_ledger_path(objective_id);
+        if !path.exists() {
+            return ObjectiveBudgetLedger {
+                schema_version: OBJECTIVE_BUDGET_LEDGER_SCHEMA_VERSION,
+                objective_id: objective_id.to_string(),
+                policy_hash: policy_hash.to_string(),
+                reservations: Vec::new(),
+                updated_at: timestamp(),
+                ledger_hash: String::new(),
+            }
+            .seal();
+        }
+        let ledger: ObjectiveBudgetLedger = read_json_file(&path)?;
+        ledger.validate(objective_id, policy_hash)?;
+        Ok(ledger)
+    }
+
+    fn write_objective_budget_ledger(&self, ledger: ObjectiveBudgetLedger) -> Result<PathBuf> {
+        let objective_id = ledger.objective_id.clone();
+        let policy_hash = ledger.policy_hash.clone();
+        let ledger = ledger.seal()?;
+        ledger.validate(&objective_id, &policy_hash)?;
+        let path = self.objective_budget_ledger_path(&objective_id);
+        write_json_atomic(&path, &ledger)?;
+        Ok(path)
+    }
+
+    pub fn reserve_objective_epoch(
+        &self,
+        lease: &ObjectiveLeaseGuard,
+        reservation_id: &str,
+        goal_id: &str,
+        epoch_id: &str,
+        policy: &ObjectivePolicy,
+        reserved_calls: usize,
+        reserved_tokens: u64,
+        reserved_cost_micros: u64,
+        reserved_unknown_calls: usize,
+        reserved_premium_calls: usize,
+    ) -> Result<ObjectiveBudgetReservation> {
+        if lease.lease.objective_id.trim().is_empty()
+            || reservation_id.trim().is_empty()
+            || goal_id.trim().is_empty()
+            || epoch_id.trim().is_empty()
+        {
+            bail!("objective budget reservation requires non-empty bindings");
+        }
+        let policy_hash = policy.hash()?;
+        let mut ledger =
+            self.read_objective_budget_ledger(&lease.lease.objective_id, &policy_hash)?;
+        if let Some(existing) = ledger
+            .reservations
+            .iter()
+            .find(|reservation| reservation.reservation_id == reservation_id)
+        {
+            if existing.goal_id == goal_id && existing.epoch_id == epoch_id {
+                return Ok(existing.clone());
+            }
+            bail!("objective budget reservation id conflicts with an existing reservation");
+        }
+        let mut calls = 0usize;
+        let mut tokens = 0u64;
+        let mut cost = 0u64;
+        let mut unknown_calls = 0usize;
+        let mut premium_calls = 0usize;
+        for reservation in &ledger.reservations {
+            match reservation.status {
+                ObjectiveBudgetReservationStatus::Reserved => {
+                    calls = calls.saturating_add(reservation.reserved_calls);
+                    tokens = tokens.saturating_add(reservation.reserved_tokens);
+                    cost = cost.saturating_add(reservation.reserved_cost_micros);
+                    unknown_calls =
+                        unknown_calls.saturating_add(reservation.reserved_unknown_calls);
+                    premium_calls =
+                        premium_calls.saturating_add(reservation.reserved_premium_calls);
+                }
+                ObjectiveBudgetReservationStatus::Settled => {
+                    calls = calls.saturating_add(reservation.actual_calls.unwrap_or(0));
+                    tokens = tokens.saturating_add(reservation.actual_tokens.unwrap_or(0));
+                    cost = cost.saturating_add(reservation.actual_cost_micros.unwrap_or(0));
+                    unknown_calls =
+                        unknown_calls.saturating_add(reservation.actual_unknown_calls.unwrap_or(0));
+                    premium_calls =
+                        premium_calls.saturating_add(reservation.actual_premium_calls.unwrap_or(0));
+                }
+                ObjectiveBudgetReservationStatus::Released => {}
+            }
+        }
+        if calls.saturating_add(reserved_calls) > policy.max_calls
+            || tokens.saturating_add(reserved_tokens) > policy.max_tokens
+            || (policy.max_cost_micros != u64::MAX
+                && cost.saturating_add(reserved_cost_micros) > policy.max_cost_micros)
+            || unknown_calls.saturating_add(reserved_unknown_calls) > policy.max_unknown_usage_calls
+        {
+            bail!("objective budget exhausted before epoch reservation");
+        }
+        let reservation = ObjectiveBudgetReservation {
+            reservation_id: reservation_id.to_string(),
+            objective_id: lease.lease.objective_id.clone(),
+            goal_id: goal_id.to_string(),
+            epoch_id: epoch_id.to_string(),
+            policy_hash,
+            reserved_calls,
+            reserved_tokens,
+            reserved_cost_micros,
+            reserved_unknown_calls,
+            reserved_premium_calls,
+            status: ObjectiveBudgetReservationStatus::Reserved,
+            actual_calls: None,
+            actual_tokens: None,
+            actual_cost_micros: None,
+            actual_unknown_calls: None,
+            actual_premium_calls: None,
+            cache_hits: None,
+            duration_ms: None,
+            fallback_reasons: Vec::new(),
+            created_at: timestamp(),
+            settled_at: None,
+        };
+        ledger.reservations.push(reservation.clone());
+        ledger.updated_at = timestamp();
+        self.write_objective_budget_ledger(ledger)?;
+        Ok(reservation)
+    }
+
+    pub fn settle_objective_epoch(
+        &self,
+        lease: &ObjectiveLeaseGuard,
+        reservation_id: &str,
+        actual_calls: usize,
+        actual_tokens: Option<u64>,
+        actual_cost_micros: Option<u64>,
+        actual_unknown_calls: usize,
+        actual_premium_calls: usize,
+        cache_hits: usize,
+        duration_ms: Option<u64>,
+        fallback_reasons: Vec<String>,
+    ) -> Result<ObjectiveBudgetReservation> {
+        let policy_hash = {
+            let ledger_path = self.objective_budget_ledger_path(&lease.lease.objective_id);
+            let ledger: ObjectiveBudgetLedger = read_json_file(&ledger_path)?;
+            ledger.policy_hash
+        };
+        let mut ledger =
+            self.read_objective_budget_ledger(&lease.lease.objective_id, &policy_hash)?;
+        let reservation = ledger
+            .reservations
+            .iter_mut()
+            .find(|reservation| reservation.reservation_id == reservation_id)
+            .context("objective budget settlement references an unknown reservation")?;
+        if reservation.status == ObjectiveBudgetReservationStatus::Settled {
+            if reservation.actual_calls == Some(actual_calls)
+                && reservation.actual_tokens == actual_tokens
+                && reservation.actual_cost_micros == actual_cost_micros
+                && reservation.actual_unknown_calls == Some(actual_unknown_calls)
+                && reservation.actual_premium_calls == Some(actual_premium_calls)
+            {
+                return Ok(reservation.clone());
+            }
+            bail!("objective budget reservation was already settled with different usage");
+        }
+        if reservation.status != ObjectiveBudgetReservationStatus::Reserved {
+            bail!("only a reserved objective budget can be settled");
+        }
+        if actual_calls > reservation.reserved_calls
+            || actual_tokens.is_some_and(|value| value > reservation.reserved_tokens)
+            || actual_cost_micros.is_some_and(|value| value > reservation.reserved_cost_micros)
+            || actual_unknown_calls > reservation.reserved_unknown_calls
+            || actual_premium_calls > reservation.reserved_premium_calls
+        {
+            bail!("objective budget settlement exceeds its reservation");
+        }
+        reservation.status = ObjectiveBudgetReservationStatus::Settled;
+        reservation.actual_calls = Some(actual_calls);
+        reservation.actual_tokens = actual_tokens;
+        reservation.actual_cost_micros = actual_cost_micros;
+        reservation.actual_unknown_calls = Some(actual_unknown_calls);
+        reservation.actual_premium_calls = Some(actual_premium_calls);
+        reservation.cache_hits = Some(cache_hits);
+        reservation.duration_ms = duration_ms;
+        reservation.fallback_reasons = fallback_reasons;
+        reservation.settled_at = Some(timestamp());
+        let settled = reservation.clone();
+        ledger.updated_at = timestamp();
+        self.write_objective_budget_ledger(ledger)?;
+        Ok(settled)
+    }
+
+    pub fn release_objective_epoch(
+        &self,
+        lease: &ObjectiveLeaseGuard,
+        reservation_id: &str,
+    ) -> Result<ObjectiveBudgetReservation> {
+        let ledger_path = self.objective_budget_ledger_path(&lease.lease.objective_id);
+        let ledger: ObjectiveBudgetLedger = read_json_file(&ledger_path)?;
+        let policy_hash = ledger.policy_hash;
+        let mut ledger =
+            self.read_objective_budget_ledger(&lease.lease.objective_id, &policy_hash)?;
+        let reservation = ledger
+            .reservations
+            .iter_mut()
+            .find(|reservation| reservation.reservation_id == reservation_id)
+            .context("objective budget release references an unknown reservation")?;
+        if reservation.status == ObjectiveBudgetReservationStatus::Released {
+            return Ok(reservation.clone());
+        }
+        if reservation.status != ObjectiveBudgetReservationStatus::Reserved {
+            bail!("only a reserved objective budget can be released");
+        }
+        reservation.status = ObjectiveBudgetReservationStatus::Released;
+        reservation.settled_at = Some(timestamp());
+        let released = reservation.clone();
+        ledger.updated_at = timestamp();
+        self.write_objective_budget_ledger(ledger)?;
+        Ok(released)
+    }
+
+    pub fn write_objective_epoch_outcome(
+        &self,
+        receipt: &ObjectiveEpochOutcomeReceipt,
+    ) -> Result<PathBuf> {
+        receipt.validate(&receipt.objective_id, &receipt.goal_id, &receipt.epoch_id)?;
+        let path = self.objective_epoch_outcome_path(
+            &receipt.objective_id,
+            &receipt.goal_id,
+            &receipt.epoch_id,
+        );
+        write_json_atomic(&path, receipt)?;
+        Ok(path)
+    }
+
+    pub fn read_objective_epoch_outcome(
+        &self,
+        objective_id: &str,
+        goal_id: &str,
+        epoch_id: &str,
+    ) -> Result<Option<ObjectiveEpochOutcomeReceipt>> {
+        let path = self.objective_epoch_outcome_path(objective_id, goal_id, epoch_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let receipt: ObjectiveEpochOutcomeReceipt = read_json_file(&path)?;
+        receipt.validate(objective_id, goal_id, epoch_id)?;
+        Ok(Some(receipt))
+    }
+
     pub fn write_objective_graph(&self, graph: &ObjectiveGraph) -> Result<PathBuf> {
         graph.validate()?;
         let path = self.objective_graph_path(&graph.objective_id);
@@ -1723,8 +2294,8 @@ impl StateStore {
         if duration.is_zero() {
             bail!("objective lease duration must be greater than zero");
         }
-        let duration = Duration::from_std(duration)
-            .context("objective lease duration is too large")?;
+        let duration =
+            Duration::from_std(duration).context("objective lease duration is too large")?;
         let path = self.objective_lease_path(objective_id);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -1743,9 +2314,7 @@ impl StateStore {
                 .as_ref()
                 .map(|lease| lease.owner_session_id.as_str())
                 .unwrap_or("unknown");
-            bail!(
-                "objective {objective_id} is already leased by session {owner}: {error}"
-            );
+            bail!("objective {objective_id} is already leased by session {owner}: {error}");
         }
         let now = Local::now();
         let lease = ObjectiveLease {
@@ -2494,13 +3063,14 @@ impl StateStore {
     pub fn read_goal_budget_ledger(&self, goal_id: &str) -> Result<GoalBudgetLedger> {
         let path = self.goal_budget_ledger_path(goal_id);
         if !path.exists() {
-            return Ok(GoalBudgetLedger {
+            return GoalBudgetLedger {
                 schema_version: 1,
                 goal_id: goal_id.to_string(),
                 reservations: Vec::new(),
                 updated_at: timestamp(),
                 ledger_hash: String::new(),
-            });
+            }
+            .seal();
         }
         let ledger: GoalBudgetLedger = read_json_file(&path)?;
         ledger.validate(goal_id)?;
@@ -3097,18 +3667,20 @@ mod epoch_tests {
             None,
         ))?;
         assert_eq!(graph.active_goal_id.as_deref(), Some("goal-1"));
-        assert!(graph
-            .attach_child(graph_node(
-                "goal-2",
-                "epoch-2",
-                "session-child",
-                "Add persistence",
-                GoalStatus::Planning,
-                Some("goal-1".to_string()),
-                Some("epoch-1".to_string()),
-                Some("strategist-1".to_string()),
-            ))
-            .is_err());
+        assert!(
+            graph
+                .attach_child(graph_node(
+                    "goal-2",
+                    "epoch-2",
+                    "session-child",
+                    "Add persistence",
+                    GoalStatus::Planning,
+                    Some("goal-1".to_string()),
+                    Some("epoch-1".to_string()),
+                    Some("strategist-1".to_string()),
+                ))
+                .is_err()
+        );
 
         graph.update_active_node(
             "goal-1",
@@ -3129,18 +3701,20 @@ mod epoch_tests {
             Some("strategist-1".to_string()),
         ))?;
         assert_eq!(graph.active_goal_id.as_deref(), Some("goal-2"));
-        assert!(graph
-            .attach_child(graph_node(
-                "goal-3",
-                "epoch-3",
-                "session-child-2",
-                "Add tests",
-                GoalStatus::Planning,
-                Some("goal-1".to_string()),
-                Some("epoch-1".to_string()),
-                Some("strategist-1".to_string()),
-            ))
-            .is_err());
+        assert!(
+            graph
+                .attach_child(graph_node(
+                    "goal-3",
+                    "epoch-3",
+                    "session-child-2",
+                    "Add tests",
+                    GoalStatus::Planning,
+                    Some("goal-1".to_string()),
+                    Some("epoch-1".to_string()),
+                    Some("strategist-1".to_string()),
+                ))
+                .is_err()
+        );
 
         let mut tampered = graph.clone();
         tampered.nodes[0].request = "rewritten request".to_string();
@@ -3163,13 +3737,13 @@ mod epoch_tests {
             "objective-1",
             "goal-attached:goal-1",
             ObjectiveEventKind::GoalAttached,
-            json!({ "goal_id": "goal-1" }),
+            json!({ "goal_id": "goal-1", "epoch_id": "epoch-1" }),
         )?;
         let replay = store.append_objective_event(
             "objective-1",
             "goal-attached:goal-1",
             ObjectiveEventKind::GoalAttached,
-            json!({ "goal_id": "goal-1" }),
+            json!({ "goal_id": "goal-1", "epoch_id": "epoch-1" }),
         )?;
         assert_eq!(attached.event_hash, replay.event_hash);
         let completed = store.append_objective_event(
@@ -3180,19 +3754,117 @@ mod epoch_tests {
         )?;
         assert_eq!(started.sequence, 0);
         assert_eq!(completed.previous_hash, attached.event_hash);
-        assert!(store
-            .append_objective_event(
-                "objective-1",
-                "objective-1.restart",
-                ObjectiveEventKind::Started,
-                json!({}),
-            )
-            .is_err());
+        assert!(
+            store
+                .append_objective_event(
+                    "objective-1",
+                    "objective-1.restart",
+                    ObjectiveEventKind::Started,
+                    json!({}),
+                )
+                .is_err()
+        );
 
         let path = store.objective_events_path("objective-1");
         let contents = fs::read_to_string(&path)?;
         fs::write(&path, contents.replace("goal-1", "goal-rewritten"))?;
         assert!(store.read_objective_events("objective-1").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn objective_epoch_outcome_receipt_is_hash_bound_and_recoverable() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let receipt = ObjectiveEpochOutcomeReceipt::seal(
+            "objective-1",
+            "goal-1",
+            "epoch-1",
+            "session-1",
+            "request-hash".to_string(),
+            "scope-hash".to_string(),
+            "policy-hash".to_string(),
+            GoalStatus::Complete,
+            "/tmp/final-wave.json".to_string(),
+            "wave-hash".to_string(),
+            "/tmp/final-report.md".to_string(),
+            "report-hash".to_string(),
+            "budget-hash".to_string(),
+            Some("/tmp/strategist.json".to_string()),
+            Some("strategist-hash".to_string()),
+            Some("Continue".to_string()),
+        )?;
+        let path = store.write_objective_epoch_outcome(&receipt)?;
+        assert!(path.is_file());
+        let recovered = store
+            .read_objective_epoch_outcome("objective-1", "goal-1", "epoch-1")?
+            .context("outcome receipt should be recoverable")?;
+        assert_eq!(recovered.receipt_hash, receipt.receipt_hash);
+        let mut tampered = serde_json::to_value(&receipt)?;
+        tampered["final_report_hash"] = json!("rewritten");
+        fs::write(&path, serde_json::to_vec_pretty(&tampered)?)?;
+        assert!(
+            store
+                .read_objective_epoch_outcome("objective-1", "goal-1", "epoch-1")
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn objective_budget_ledger_reservation_is_idempotent_and_settled() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let policy = ObjectivePolicy::default();
+        let lease = store.acquire_objective_lease(
+            "objective-1",
+            "session-1",
+            std::time::Duration::from_secs(60),
+        )?;
+        let first = store.reserve_objective_epoch(
+            &lease,
+            "epoch:epoch-1",
+            "goal-1",
+            "epoch-1",
+            &policy,
+            4,
+            100,
+            100,
+            1,
+            1,
+        )?;
+        let replay = store.reserve_objective_epoch(
+            &lease,
+            "epoch:epoch-1",
+            "goal-1",
+            "epoch-1",
+            &policy,
+            4,
+            100,
+            100,
+            1,
+            1,
+        )?;
+        assert_eq!(first.reservation_id, replay.reservation_id);
+        let settled = store.settle_objective_epoch(
+            &lease,
+            "epoch:epoch-1",
+            2,
+            Some(40),
+            Some(20),
+            0,
+            0,
+            1,
+            Some(25),
+            vec!["model fallback unavailable".to_string()],
+        )?;
+        assert_eq!(settled.status, ObjectiveBudgetReservationStatus::Settled);
+        let ledger = store.read_objective_budget_ledger("objective-1", &policy.hash()?)?;
+        assert_eq!(ledger.reservations.len(), 1);
+        assert_eq!(ledger.reservations[0].actual_cost_micros, Some(20));
+        lease.release()?;
         Ok(())
     }
 
@@ -3207,13 +3879,15 @@ mod epoch_tests {
             std::time::Duration::from_secs(60),
         )?;
         assert_eq!(first.lease().owner_session_id, "session-1");
-        assert!(store
-            .acquire_objective_lease(
-                "objective-1",
-                "session-2",
-                std::time::Duration::from_secs(60),
-            )
-            .is_err());
+        assert!(
+            store
+                .acquire_objective_lease(
+                    "objective-1",
+                    "session-2",
+                    std::time::Duration::from_secs(60),
+                )
+                .is_err()
+        );
         first.release()?;
         let second = store.acquire_objective_lease(
             "objective-1",
