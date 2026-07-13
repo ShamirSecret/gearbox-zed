@@ -10,18 +10,21 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 use crate::state::{
     CoordinatorModel, PromptDispatchDecision, PromptDispatchGate, PromptDispatchGateStatus,
-    PromptSettleEvent, StateStore, Task, TaskKind, timestamp,
+    PromptSettleEvent, StateStore, Task, TaskKind, WorkerFanoutDenialReceipt, timestamp,
 };
 use crate::tools::CancellationToken;
 use crate::worker_broker::WorkerBroker;
 use crate::workers::{
     WorkerConfig, WorkerEvent, WorkerKind, WorkerOutcome, WorkerRegistry, WorkerResult,
     WorkerSessionHandle, WorkerStartRequest, WorkerStatus, WorkerSubscription,
+    category_requires_worker_evidence, discard_resident_session_for_model_switch,
     provider_session_id_for_task, route_identity_key, seed_provider_session_for_task,
-    worker_model_is_unavailable,
+    validate_worker_evidence_receipt, worker_kind_supports_evidence_contract,
+    worker_model_is_unavailable, write_result_and_outcome_with_outcome,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,6 +156,8 @@ pub enum SendOutcome {
     Queued(OutcomeContext),
     /// Worker completed/failed and will be revived
     Revive(OutcomeContext),
+    /// Dispatch was attempted, but the provider response was ambiguous.
+    PossiblyAccepted(OutcomeContext),
     /// Worker is in terminal state
     NotContinuable(OutcomeContext),
     /// No task found
@@ -171,7 +176,10 @@ pub enum SendOutcome {
 
 impl SendOutcome {
     pub fn is_accepted(&self) -> bool {
-        matches!(self, Self::Sent(_) | Self::Queued(_) | Self::Revive(_))
+        matches!(
+            self,
+            Self::Sent(_) | Self::Queued(_) | Self::Revive(_) | Self::PossiblyAccepted(_)
+        )
     }
 
     pub fn reason(&self) -> Option<String> {
@@ -182,6 +190,10 @@ impl SendOutcome {
             }
             Self::Noop(_) => Some("no managed task is active".to_string()),
             Self::Sent(_) | Self::Queued(_) | Self::Revive(_) => None,
+            Self::PossiblyAccepted(_) => Some(
+                "follow-up dispatch may have been accepted before an ambiguous provider response"
+                    .to_string(),
+            ),
         }
     }
 }
@@ -192,6 +204,8 @@ pub enum SteerOutcome {
     Steered(OutcomeContext),
     /// Worker will be revived with steer
     Revive(OutcomeContext),
+    /// Dispatch was attempted, but the provider response was ambiguous.
+    PossiblyAccepted(OutcomeContext),
     /// Queued for pending worker
     Queued(OutcomeContext),
     /// Terminal state
@@ -212,7 +226,10 @@ pub enum SteerOutcome {
 
 impl SteerOutcome {
     pub fn is_accepted(&self) -> bool {
-        matches!(self, Self::Steered(_) | Self::Queued(_) | Self::Revive(_))
+        matches!(
+            self,
+            Self::Steered(_) | Self::Queued(_) | Self::Revive(_) | Self::PossiblyAccepted(_)
+        )
     }
 
     pub fn reason(&self) -> Option<String> {
@@ -223,6 +240,10 @@ impl SteerOutcome {
             }
             Self::Noop(_) => Some("no managed task is active".to_string()),
             Self::Steered(_) | Self::Queued(_) | Self::Revive(_) => None,
+            Self::PossiblyAccepted(_) => Some(
+                "steer dispatch may have been accepted before an ambiguous provider response"
+                    .to_string(),
+            ),
         }
     }
 }
@@ -240,6 +261,10 @@ pub enum TaskFailureKind {
     NoFallbackRoute,
     RepeatedFailureLimit,
 }
+
+const WORKER_EVIDENCE_RETRY_PREFIX: &str = "worker evidence gate:";
+const MAX_WORKER_EVIDENCE_ATTEMPTS: usize = 3;
+const WORKER_EVIDENCE_REPAIR_PROMPT: &str = "Gear evidence gate repair: inspect the work you just performed, run the relevant verification, write a non-empty regular receipt file under .gearbox-agent/evidence/, and end the worker response with EVIDENCE_RECORDED: <path>. Do not claim completion until that receipt exists.";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskAttempt {
@@ -367,6 +392,8 @@ pub struct TaskSnapshot {
     pub result_path: Option<PathBuf>,
     pub outcome_path: Option<PathBuf>,
     pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_reason: Option<String>,
     #[serde(default)]
     pub summary_head: String,
     #[serde(default)]
@@ -511,6 +538,155 @@ struct ConcurrencyManager {
 #[derive(Clone, Debug)]
 struct TaskRuntimePolicy {
     stale_task_timeout: Duration,
+    tool_call_circuit_breaker: ToolCallCircuitBreakerPolicy,
+}
+
+const DEFAULT_MAX_TOOL_CALLS: usize = 4000;
+const DEFAULT_TOOL_CALL_CONSECUTIVE_THRESHOLD: usize = 20;
+
+#[derive(Clone, Debug)]
+struct ToolCallCircuitBreakerPolicy {
+    enabled: bool,
+    max_tool_calls: usize,
+    consecutive_threshold: usize,
+}
+
+impl Default for ToolCallCircuitBreakerPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_tool_calls: DEFAULT_MAX_TOOL_CALLS,
+            consecutive_threshold: DEFAULT_TOOL_CALL_CONSECUTIVE_THRESHOLD,
+        }
+    }
+}
+
+impl ToolCallCircuitBreakerPolicy {
+    fn from_environment() -> Self {
+        let default = Self::default();
+        Self {
+            enabled: tool_circuit_breaker_flag_from_environment(
+                "GEARBOX_GEAR_TOOL_CIRCUIT_BREAKER",
+                default.enabled,
+            ),
+            max_tool_calls: tool_circuit_breaker_limit_from_environment(
+                "GEARBOX_GEAR_MAX_TOOL_CALLS",
+                default.max_tool_calls,
+            ),
+            consecutive_threshold: tool_circuit_breaker_limit_from_environment(
+                "GEARBOX_GEAR_TOOL_LOOP_THRESHOLD",
+                default.consecutive_threshold,
+            ),
+        }
+    }
+}
+
+fn tool_circuit_breaker_flag_from_environment(name: &str, default: bool) -> bool {
+    match std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("0" | "false" | "off" | "no") => false,
+        Some("1" | "true" | "on" | "yes") => true,
+        _ => default,
+    }
+}
+
+fn tool_circuit_breaker_limit_from_environment(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+#[derive(Clone, Debug, Default)]
+struct ToolCallCircuitState {
+    total_calls: usize,
+    last_signature: Option<String>,
+    consecutive_calls: usize,
+    trigger_reason: Option<String>,
+}
+
+fn tool_call_signature(tool_name: &str, arguments: &str) -> String {
+    let normalized_arguments = normalize_tool_call_arguments(arguments);
+    let mut hasher = Sha256::new();
+    hasher.update(tool_name.as_bytes());
+    hasher.update([0]);
+    hasher.update(normalized_arguments.as_bytes());
+    format!("{tool_name}:{:x}", hasher.finalize())
+}
+
+fn normalize_tool_call_arguments(arguments: &str) -> String {
+    let trimmed = arguments.trim();
+    if trimmed.is_empty() {
+        return "__unknown-input__".to_string();
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return trimmed.to_string();
+    };
+    let value = sort_tool_call_json_value(value);
+    match serde_json::to_string(&value) {
+        Ok(serialized) => serialized,
+        Err(_) => trimmed.to_string(),
+    }
+}
+
+fn sort_tool_call_json_value(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(object) => {
+            let mut entries = object.into_iter().collect::<Vec<_>>();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            serde_json::Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key, sort_tool_call_json_value(value)))
+                    .collect(),
+            )
+        }
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(sort_tool_call_json_value).collect())
+        }
+        value => value,
+    }
+}
+
+fn record_tool_call_for_circuit_breaker(
+    state: &Arc<Mutex<ToolCallCircuitState>>,
+    policy: &ToolCallCircuitBreakerPolicy,
+    tool_name: &str,
+    arguments: &str,
+) {
+    if !policy.enabled {
+        return;
+    }
+    let signature = tool_call_signature(tool_name, arguments);
+    let Ok(mut state) = state.lock() else {
+        eprintln!("failed to update Gear tool-call circuit state for `{tool_name}`");
+        return;
+    };
+    if state.trigger_reason.is_some() {
+        return;
+    }
+    state.total_calls = state.total_calls.saturating_add(1);
+    state.consecutive_calls = if state.last_signature.as_deref() == Some(signature.as_str()) {
+        state.consecutive_calls.saturating_add(1)
+    } else {
+        1
+    };
+    state.last_signature = Some(signature);
+    if state.consecutive_calls >= policy.consecutive_threshold {
+        state.trigger_reason = Some(format!(
+            "Tool-call circuit breaker triggered: subagent called {tool_name} {} consecutive times (threshold: {}). This usually indicates an infinite loop. The task was automatically cancelled to prevent excessive token usage.",
+            state.consecutive_calls, policy.consecutive_threshold
+        ));
+    } else if state.total_calls >= policy.max_tool_calls {
+        state.trigger_reason = Some(format!(
+            "Tool-call circuit breaker triggered: subagent exceeded maximum tool call limit ({}). This usually indicates an infinite loop. The task was automatically cancelled to prevent excessive token usage.",
+            policy.max_tool_calls
+        ));
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -533,6 +709,7 @@ impl Default for TaskRuntimePolicy {
     fn default() -> Self {
         Self {
             stale_task_timeout: Duration::from_secs(30),
+            tool_call_circuit_breaker: ToolCallCircuitBreakerPolicy::from_environment(),
         }
     }
 }
@@ -543,6 +720,7 @@ impl TaskRuntimePolicy {
             stale_task_timeout: Duration::from_secs(
                 config.stale_task_timeout_secs.max(1) as u64 + 1,
             ),
+            tool_call_circuit_breaker: ToolCallCircuitBreakerPolicy::from_environment(),
         }
     }
 }
@@ -683,6 +861,13 @@ struct PendingRevive {
     caller_session_id: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReviveDispatchOutcome {
+    NotStarted,
+    Started,
+    PossiblyAccepted,
+}
+
 struct FinishedTaskMessage {
     task_id: String,
     running_task: RunningTask,
@@ -777,6 +962,39 @@ fn continuation_hint_for_record(record: &TaskRecord) -> String {
     }
 }
 
+fn summary_head_for_record(record: &TaskRecord) -> String {
+    let summary_head = record
+        .summary
+        .lines()
+        .next()
+        .unwrap_or(record.summary.as_str());
+
+    match fallback_model_chain_for_record(record) {
+        Some(model_chain) => format!("{summary_head}；模型回退链：{model_chain}"),
+        None => summary_head.to_string(),
+    }
+}
+
+fn fallback_model_chain_for_record(record: &TaskRecord) -> Option<String> {
+    let mut models = Vec::new();
+    for model in record.attempts.iter().filter_map(|attempt| {
+        attempt
+            .worker_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+    }) {
+        if models
+            .last()
+            .map_or(true, |previous: &String| previous != model)
+        {
+            models.push(model.to_string());
+        }
+    }
+
+    (models.len() >= 2).then(|| models.join(" -> "))
+}
+
 #[derive(Clone)]
 struct CurrentManagedTask {
     task_id: String,
@@ -806,11 +1024,19 @@ enum PromptDispatchGateResult {
 }
 
 #[derive(Clone, Debug)]
+struct QueuedMessageGate {
+    store: StateStore,
+    gate_id: String,
+}
+
+#[derive(Clone, Debug)]
 struct QueuedMessage {
     kind: QueuedMessageKind,
     message: String,
     caller_session_id: Option<String>,
     created_at: String,
+    delivery_attempts: usize,
+    gate: Option<QueuedMessageGate>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -822,12 +1048,97 @@ enum FallbackDecision {
     },
 }
 
+fn prompt_dispatch_error_is_possibly_accepted(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    [
+        "unexpected eof",
+        "json parse error",
+        "unexpected end of json input",
+        "timed out",
+    ]
+    .iter()
+    .any(|signal| message.contains(signal))
+}
+
+fn prompt_dispatch_error_status(error: &anyhow::Error) -> PromptDispatchGateStatus {
+    if prompt_dispatch_error_is_possibly_accepted(error) {
+        PromptDispatchGateStatus::PossiblyAccepted
+    } else {
+        PromptDispatchGateStatus::Failed
+    }
+}
+
+fn prompt_dispatch_error_reason(operation: &str, status: &PromptDispatchGateStatus) -> String {
+    if matches!(status, PromptDispatchGateStatus::PossiblyAccepted) {
+        format!("{operation} dispatch may have been accepted before an ambiguous provider response")
+    } else {
+        format!("{operation} dispatch failed")
+    }
+}
+
+const MAX_PENDING_MESSAGE_DELIVERY_ATTEMPTS: usize = 3;
+
 const WAIT_FOR_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 // ── Phase 6: Lifecycle constants ──
 const RESIDENCY_MAX_CHILDREN: usize = 8;
 const TTL_MS: u64 = 24 * 60 * 60 * 1000; // 24 hours
 const ARCHIVE_CAP: usize = 100;
+
+fn deliver_queued_message(
+    handle: &Arc<dyn WorkerSessionHandle>,
+    queued_message: &QueuedMessage,
+) -> Result<()> {
+    match queued_message.kind {
+        QueuedMessageKind::FollowUp => handle.send_follow_up(queued_message.message.clone()),
+        QueuedMessageKind::Steer => handle.steer(queued_message.message.clone()),
+    }
+}
+
+fn queued_message_operation(kind: &QueuedMessageKind) -> &'static str {
+    match kind {
+        QueuedMessageKind::FollowUp => "queued follow-up",
+        QueuedMessageKind::Steer => "queued steer",
+    }
+}
+
+fn read_queued_message_gate(binding: &QueuedMessageGate) -> Result<PromptDispatchGate> {
+    let path = binding.store.prompt_dispatch_gate_path(&binding.gate_id);
+    let json = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read prompt dispatch gate {}", path.display()))?;
+    let gate: PromptDispatchGate = serde_json::from_str(&json)
+        .with_context(|| format!("failed to parse prompt dispatch gate {}", path.display()))?;
+    gate.validate()?;
+    Ok(gate)
+}
+
+fn settle_queued_message_gate(
+    queued_message: &QueuedMessage,
+    status: PromptDispatchGateStatus,
+    reason: Option<String>,
+) -> Result<()> {
+    let Some(binding) = queued_message.gate.as_ref() else {
+        return Ok(());
+    };
+    let gate = read_queued_message_gate(binding)?;
+    binding
+        .store
+        .settle_prompt_dispatch_gate(&gate, status, None, reason)?;
+    Ok(())
+}
+
+fn settle_queued_message_gate_best_effort(
+    queued_message: &QueuedMessage,
+    status: PromptDispatchGateStatus,
+    reason: Option<String>,
+) {
+    if let Err(error) = settle_queued_message_gate(queued_message, status, reason) {
+        eprintln!(
+            "failed to settle queued Gear prompt gate for message created at {}: {error:#}",
+            queued_message.created_at
+        );
+    }
+}
 
 fn default_notified_epoch() -> i64 {
     -1
@@ -915,6 +1226,7 @@ impl TaskManagerControl {
         kind: QueuedMessageKind,
         message: String,
         caller_session_id: Option<String>,
+        gate_context: Option<(StateStore, PromptDispatchGate)>,
     ) -> Result<()> {
         self.pending_messages
             .lock()
@@ -926,8 +1238,23 @@ impl TaskManagerControl {
                 message,
                 caller_session_id,
                 created_at: timestamp(),
+                delivery_attempts: 0,
+                gate: gate_context.map(|(store, gate)| QueuedMessageGate {
+                    store,
+                    gate_id: gate.gate_id,
+                }),
             });
         Ok(())
+    }
+
+    fn pending_message_task_ids(&self) -> Result<Vec<String>> {
+        Ok(self
+            .pending_messages
+            .lock()
+            .map_err(|_| anyhow::anyhow!("task manager control mutex poisoned"))?
+            .keys()
+            .cloned()
+            .collect())
     }
 
     fn take_pending_messages(&self, task_id: &str) -> Result<VecDeque<QueuedMessage>> {
@@ -1164,7 +1491,13 @@ impl TaskManagerControl {
         let current_task_id = current_task.task_id.clone();
         match current_task.status {
             ManagedTaskStatus::Pending => {
-                self.queue_pending_message(task_id, QueuedMessageKind::FollowUp, prompt, None)?;
+                self.queue_pending_message(
+                    task_id,
+                    QueuedMessageKind::FollowUp,
+                    prompt,
+                    None,
+                    gate_context.clone(),
+                )?;
                 Self::settle_prompt_dispatch_gate(
                     &gate_context,
                     PromptDispatchGateStatus::Held,
@@ -1183,11 +1516,21 @@ impl TaskManagerControl {
                     .clone();
                 drop(current_task_guard);
                 if let Err(error) = handle.send_follow_up(prompt) {
-                    let _ = Self::settle_prompt_dispatch_gate(
+                    let status = prompt_dispatch_error_status(&error);
+                    let reason = prompt_dispatch_error_reason("GUI follow-up", &status);
+                    let settlement = Self::settle_prompt_dispatch_gate(
                         &gate_context,
-                        PromptDispatchGateStatus::Failed,
-                        Some(format!("GUI follow-up dispatch failed: {error:#}")),
+                        status.clone(),
+                        Some(reason),
                     );
+                    if matches!(status, PromptDispatchGateStatus::PossiblyAccepted) {
+                        settlement?;
+                        return Ok(SendOutcome::PossiblyAccepted(OutcomeContext {
+                            task_id: Some(current_task_id),
+                            ..OutcomeContext::default()
+                        }));
+                    }
+                    let _ = settlement;
                     return Err(error);
                 }
                 Self::settle_prompt_dispatch_gate(
@@ -1238,7 +1581,13 @@ impl TaskManagerControl {
         let current_task_id = current_task.task_id.clone();
         match current_task.status {
             ManagedTaskStatus::Pending => {
-                self.queue_pending_message(task_id, QueuedMessageKind::Steer, prompt, None)?;
+                self.queue_pending_message(
+                    task_id,
+                    QueuedMessageKind::Steer,
+                    prompt,
+                    None,
+                    gate_context.clone(),
+                )?;
                 Self::settle_prompt_dispatch_gate(
                     &gate_context,
                     PromptDispatchGateStatus::Held,
@@ -1257,11 +1606,21 @@ impl TaskManagerControl {
                     .clone();
                 drop(current_task_guard);
                 if let Err(error) = handle.steer(prompt) {
-                    let _ = Self::settle_prompt_dispatch_gate(
+                    let status = prompt_dispatch_error_status(&error);
+                    let reason = prompt_dispatch_error_reason("GUI steer", &status);
+                    let settlement = Self::settle_prompt_dispatch_gate(
                         &gate_context,
-                        PromptDispatchGateStatus::Failed,
-                        Some(format!("GUI steer dispatch failed: {error:#}")),
+                        status.clone(),
+                        Some(reason),
                     );
+                    if matches!(status, PromptDispatchGateStatus::PossiblyAccepted) {
+                        settlement?;
+                        return Ok(SteerOutcome::PossiblyAccepted(OutcomeContext {
+                            task_id: Some(current_task_id),
+                            ..OutcomeContext::default()
+                        }));
+                    }
+                    let _ = settlement;
                     return Err(error);
                 }
                 Self::settle_prompt_dispatch_gate(
@@ -1360,7 +1719,10 @@ pub struct TaskManager {
     goal_unavailable_worker_models: HashMap<String, HashMap<String, Instant>>,
     goal_provider_sessions: HashMap<String, String>,
     goal_epoch_context: Option<GoalEpochContext>,
+    activity_heartbeats: HashMap<String, Arc<Mutex<Instant>>>,
+    tool_call_circuit_states: HashMap<String, Arc<Mutex<ToolCallCircuitState>>>,
     artifacts_root: Option<PathBuf>,
+    worker_fanout_limit: usize,
     finished_task_tx: Sender<FinishedTaskMessage>,
     finished_task_rx: Receiver<FinishedTaskMessage>,
     lifecycle_events: Option<Arc<Mutex<Vec<String>>>>,
@@ -1369,6 +1731,15 @@ pub struct TaskManager {
 pub type SharedTaskManager = Arc<Mutex<TaskManager>>;
 
 const GOAL_WORKER_MODEL_COOLDOWN: Duration = Duration::from_secs(60);
+const DEFAULT_WORKER_FANOUT_LIMIT: usize = 60;
+
+fn worker_fanout_limit_from_environment() -> usize {
+    std::env::var("GEARBOX_GEAR_WORKER_FANOUT_LIMIT")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|limit| *limit > 0)
+        .unwrap_or(DEFAULT_WORKER_FANOUT_LIMIT)
+}
 
 pub struct TaskManagerTickLoop {
     stop: Arc<AtomicBool>,
@@ -1463,7 +1834,10 @@ impl Default for TaskManager {
             goal_unavailable_worker_models: HashMap::new(),
             goal_provider_sessions: HashMap::new(),
             goal_epoch_context: None,
+            activity_heartbeats: HashMap::new(),
+            tool_call_circuit_states: HashMap::new(),
             artifacts_root: None,
+            worker_fanout_limit: worker_fanout_limit_from_environment(),
             finished_task_tx,
             finished_task_rx,
             lifecycle_events: None,
@@ -1550,11 +1924,15 @@ impl TaskManager {
                 bail!("goal epoch context {field} cannot be empty");
             }
         }
-        if self
-            .goal_epoch_context
-            .as_ref()
-            .is_some_and(|current| current.goal_id != context.goal_id)
-        {
+        // The runtime may receive a shared manager without an earlier
+        // set_session_scope call, so make the context itself the session
+        // boundary for goal-scoped routing caches.
+        if self.session_scope.as_deref() != Some(context.session_id.as_str()) {
+            self.set_session_scope(context.session_id.clone());
+        }
+        if self.goal_epoch_context.as_ref().is_some_and(|current| {
+            current.session_id != context.session_id || current.goal_id != context.goal_id
+        }) {
             self.goal_unavailable_worker_models.clear();
             self.goal_provider_sessions.clear();
         }
@@ -1576,6 +1954,46 @@ impl TaskManager {
 
     pub fn set_artifacts_root(&mut self, artifacts_root: PathBuf) {
         self.artifacts_root = Some(artifacts_root);
+    }
+
+    pub fn set_worker_fanout_limit(&mut self, limit: usize) {
+        self.worker_fanout_limit = limit.max(1);
+    }
+
+    pub fn worker_fanout_limit(&self) -> usize {
+        self.worker_fanout_limit
+    }
+
+    fn consume_worker_fanout_budget(
+        &self,
+        store: &StateStore,
+        task_id: &str,
+    ) -> Result<Option<String>> {
+        let Some(session_id) = self.session_scope.as_deref() else {
+            return Ok(None);
+        };
+        let mut counter = store.read_worker_fanout_counter(session_id)?;
+        counter.count = counter.count.saturating_add(1);
+        counter.updated_at = timestamp();
+        store.write_worker_fanout_counter(&counter)?;
+        if counter.count <= self.worker_fanout_limit {
+            return Ok(None);
+        }
+
+        let reason = format!(
+            "Worker fan-out cap reached ({}/{}) for session `{session_id}`. Consolidate work into existing workers or raise GEARBOX_GEAR_WORKER_FANOUT_LIMIT if this volume is intentional.",
+            counter.count, self.worker_fanout_limit
+        );
+        store.write_worker_fanout_denial(&WorkerFanoutDenialReceipt {
+            schema_version: crate::state::WORKER_FANOUT_COUNTER_SCHEMA_VERSION,
+            session_id: session_id.to_string(),
+            task_id: task_id.to_string(),
+            count: counter.count,
+            limit: self.worker_fanout_limit,
+            reason: reason.clone(),
+            created_at: timestamp(),
+        })?;
+        Ok(Some(reason))
     }
 
     fn append_task_command_event(
@@ -1649,6 +2067,7 @@ impl TaskManager {
     pub fn apply_worker_config(&mut self, config: &WorkerConfig) {
         self.concurrency = ConcurrencyManager::from_worker_config(config);
         self.runtime_policy = TaskRuntimePolicy::from_worker_config(config);
+        self.worker_fanout_limit = worker_fanout_limit_from_environment();
     }
 
     pub fn recover_orphaned_records(&mut self, store: &StateStore) -> Result<usize> {
@@ -1742,6 +2161,7 @@ impl TaskManager {
         let route_hint = queued_task.route_hint.clone();
         let route_reason = selected_route.route_reason;
         let store = queued_task.store.clone();
+        let fanout_denial = self.consume_worker_fanout_budget(&store, &task_id)?;
         let started_at = timestamp();
         let record = TaskRecord {
             task_id: task_id.clone(),
@@ -1806,15 +2226,73 @@ impl TaskManager {
             0,
         )?;
 
+        if let Some(reason) = fanout_denial {
+            let (result, outcome) =
+                write_worker_fanout_denied_artifacts(&store, &task_id, &reason)?;
+            let transition = {
+                let record = self
+                    .records
+                    .get_mut(&task_id)
+                    .context("missing task manager record for fan-out denial")?;
+                let transition = transition_task_record(
+                    record,
+                    TaskTransition::Fail {
+                        finished_at: timestamp(),
+                        summary: reason.clone(),
+                        failure_kind: TaskFailureKind::RepeatedFailureLimit,
+                        error: Some(reason.clone()),
+                    },
+                );
+                record.retry_reason = Some(reason);
+                record.result_path = Some(result.result_path.clone());
+                record.outcome_path = Some(result.outcome_path.clone());
+                transition
+            };
+            let record = self
+                .records
+                .get(&task_id)
+                .context("fan-out denial task record disappeared")?
+                .clone();
+            write_task_record(&store, &record)?;
+            append_task_lifecycle_event(&store, &record, Some(&transition))?;
+            self.control
+                .update_current_status(&task_id, record.status.clone())?;
+            self.completed_runs.insert(
+                task_id.clone(),
+                ManagedWorkerRun {
+                    store,
+                    result,
+                    outcome,
+                    record,
+                },
+            );
+            return Ok(task_id);
+        }
+
         self.queued_tasks.push_back(queued_task);
         self.process_queue()?;
         Ok(task_id)
     }
 
     pub fn wait_for(&mut self, task_id: &str) -> Result<ManagedWorkerRun> {
+        self.wait_for_with_cancellation(task_id, None)?
+            .context("worker wait ended without a terminal run")
+    }
+
+    /// Wait for a worker completion event while allowing the caller to retain
+    /// cancellation ownership. The timeout is only a maintenance wake-up for
+    /// stale-task sweeping; completion is driven by `finished_task_rx`.
+    pub fn wait_for_with_cancellation(
+        &mut self,
+        task_id: &str,
+        cancellation_token: Option<&CancellationToken>,
+    ) -> Result<Option<ManagedWorkerRun>> {
         loop {
+            if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
+                return Ok(None);
+            }
             if let Some(run) = self.try_wait_for(task_id)? {
-                return Ok(run);
+                return Ok(Some(run));
             }
             match self.finished_task_rx.recv_timeout(WAIT_FOR_POLL_INTERVAL) {
                 Ok(finished_task) => self.settle_finished_task(finished_task)?,
@@ -1863,6 +2341,7 @@ impl TaskManager {
                 }
             }
         }
+        settled_count += self.process_tool_call_circuit_breakers()?;
         settled_count += self.sweep_orphaned_task_state()?;
         settled_count += self.sweep_stale_running_tasks()?;
         settled_count += self.ttl_cleanup();
@@ -1870,6 +2349,45 @@ impl TaskManager {
         self.trim_archive();
         self.process_queue()?;
         Ok(settled_count)
+    }
+
+    fn process_tool_call_circuit_breakers(&mut self) -> Result<usize> {
+        let triggered = self
+            .tool_call_circuit_states
+            .iter()
+            .filter_map(|(task_id, state)| {
+                let state = match state.lock() {
+                    Ok(state) => state,
+                    Err(_) => {
+                        eprintln!("failed to read Gear tool-call circuit state for `{task_id}`");
+                        return None;
+                    }
+                };
+                state
+                    .trigger_reason
+                    .clone()
+                    .map(|reason| (task_id.clone(), reason))
+            })
+            .collect::<Vec<_>>();
+        let mut cancelled = 0;
+        for (task_id, reason) in triggered {
+            if !self
+                .records
+                .get(&task_id)
+                .is_some_and(|record| record.status == ManagedTaskStatus::Running)
+            {
+                continue;
+            }
+            let outcome = self.cancel_task_direct_with_details(
+                &task_id,
+                "Worker task cancelled by tool-call circuit breaker.".to_string(),
+                Some(reason),
+            )?;
+            if matches!(outcome, ActionOutcome::Cancelled(_)) {
+                cancelled += 1;
+            }
+        }
+        Ok(cancelled)
     }
 
     fn sweep_orphaned_task_state(&mut self) -> Result<usize> {
@@ -1907,6 +2425,8 @@ impl TaskManager {
 
         self.concurrency.release(&running_task.queued_task);
         self.running_tasks.remove(task_id);
+        self.activity_heartbeats.remove(task_id);
+        self.tool_call_circuit_states.remove(task_id);
         Ok(true)
     }
 
@@ -1924,6 +2444,8 @@ impl TaskManager {
     ///   - record, archive, control, concurrency, release_guard all cleaned up
     fn destroy_resident_task(&mut self, task_id: &str, cause: &str) -> Result<()> {
         let mut first_error: Option<anyhow::Error> = None;
+        self.activity_heartbeats.remove(task_id);
+        self.tool_call_circuit_states.remove(task_id);
         self.pending_revives
             .retain(|request| request.task_id != task_id);
         // Release concurrency for running tasks
@@ -2202,7 +2724,23 @@ impl TaskManager {
             .running_tasks
             .iter()
             .filter(|(_, running_task)| {
-                now.duration_since(running_task.started_at) > stale_task_timeout
+                let last_activity = match self
+                    .activity_heartbeats
+                    .get(running_task.queued_task.task.id.as_str())
+                {
+                    Some(heartbeat) => match heartbeat.lock() {
+                        Ok(timestamp) => *timestamp,
+                        Err(_) => {
+                            eprintln!(
+                                "failed to read Gear worker activity heartbeat for `{}`",
+                                running_task.queued_task.task.id
+                            );
+                            running_task.started_at
+                        }
+                    },
+                    None => running_task.started_at,
+                };
+                now.duration_since(last_activity) > stale_task_timeout
             })
             .map(|(task_id, running_task)| (task_id.clone(), running_task.clone()))
             .collect::<Vec<_>>();
@@ -2260,13 +2798,76 @@ impl TaskManager {
         run_result: Result<(WorkerOutcome, WorkerResult)>,
     ) -> Result<Option<ManagedWorkerRun>> {
         match run_result {
-            Ok((outcome, result)) => {
+            Ok((mut outcome, mut result)) => {
                 let Some(mut record) = self.records.remove(task_id) else {
                     self.forget_task(task_id)?;
                     return Ok(None);
                 };
                 if let Some(session_id) = running_task.handle.session_id() {
                     record.session_id = Some(session_id);
+                }
+                let evidence_failure = if result.status == WorkerStatus::Succeeded
+                    && category_requires_worker_evidence(&record.worker_category)
+                    && worker_kind_supports_evidence_contract(&record.worker_kind)
+                {
+                    Some(validate_worker_evidence_receipt(
+                        &result,
+                        &running_task.queued_task.workspace,
+                    ))
+                } else {
+                    None
+                };
+                let mut evidence_retry_reason = None;
+                if let Some(evidence_check) = evidence_failure {
+                    match evidence_check {
+                        Ok(receipt_path) => {
+                            write_worker_evidence_gate_artifact(
+                                &running_task.store,
+                                task_id,
+                                record
+                                    .attempts
+                                    .last()
+                                    .map(|attempt| attempt.attempt)
+                                    .unwrap_or(1),
+                                Some(&receipt_path),
+                                None,
+                            )?;
+                        }
+                        Err(reason) => {
+                            let attempt = record
+                                .attempts
+                                .last()
+                                .map(|attempt| attempt.attempt)
+                                .unwrap_or(1);
+                            let summary =
+                                format!("Worker evidence gate rejected completion: {reason}");
+                            write_worker_evidence_gate_artifact(
+                                &running_task.store,
+                                task_id,
+                                attempt,
+                                None,
+                                Some(&reason),
+                            )?;
+                            result.status = WorkerStatus::Failed;
+                            result.summary = summary.clone();
+                            outcome.status = WorkerStatus::Failed;
+                            outcome.summary = summary.clone();
+                            if !outcome
+                                .known_failures
+                                .iter()
+                                .any(|failure| failure == &summary)
+                            {
+                                outcome.known_failures.push(summary.clone());
+                            }
+                            evidence_retry_reason = Some(reason);
+                            write_result_and_outcome_with_outcome(
+                                &running_task.store,
+                                task_id,
+                                &result,
+                                &outcome,
+                            )?;
+                        }
+                    }
                 }
                 let transition = match result.status {
                     WorkerStatus::Succeeded => transition_task_record(
@@ -2316,6 +2917,13 @@ impl TaskManager {
                         }
                     }
                 };
+                if let Some(reason) = evidence_retry_reason {
+                    let retry_reason = format!("{WORKER_EVIDENCE_RETRY_PREFIX} {reason}");
+                    record.retry_reason = Some(retry_reason.clone());
+                    if let Some(attempt) = record.attempts.last_mut() {
+                        attempt.retry_reason = Some(retry_reason);
+                    }
+                }
                 if transition.applied {
                     record.result_path = Some(result.result_path.clone());
                     record.outcome_path = Some(result.outcome_path.clone());
@@ -2629,6 +3237,15 @@ impl TaskManager {
     }
 
     fn cancel_task_direct(&mut self, task_id: &str) -> Result<ActionOutcome> {
+        self.cancel_task_direct_with_details(task_id, "Worker task cancelled.".to_string(), None)
+    }
+
+    fn cancel_task_direct_with_details(
+        &mut self,
+        task_id: &str,
+        summary: String,
+        error: Option<String>,
+    ) -> Result<ActionOutcome> {
         self.pending_revives
             .retain(|request| request.task_id != task_id);
         let mut queued_store = None;
@@ -2653,8 +3270,8 @@ impl TaskManager {
             record,
             TaskTransition::Cancel {
                 finished_at: timestamp(),
-                summary: "Worker task cancelled.".to_string(),
-                error: None,
+                summary,
+                error,
             },
         );
         let ctx = OutcomeContext {
@@ -2868,9 +3485,9 @@ impl TaskManager {
         task_id: &str,
         prompt: String,
         message_kind: QueuedMessageKind,
-    ) -> Result<bool> {
+    ) -> Result<ReviveDispatchOutcome> {
         let Some(resident_task) = self.resident_tasks.remove(task_id) else {
-            return Ok(false);
+            return Ok(ReviveDispatchOutcome::NotStarted);
         };
 
         if !self
@@ -2880,13 +3497,13 @@ impl TaskManager {
         {
             self.resident_tasks
                 .insert(task_id.to_string(), resident_task);
-            return Ok(false);
+            return Ok(ReviveDispatchOutcome::NotStarted);
         }
 
         if !self.concurrency.acquire(&resident_task.queued_task) {
             self.resident_tasks
                 .insert(task_id.to_string(), resident_task);
-            return Ok(false);
+            return Ok(ReviveDispatchOutcome::NotStarted);
         }
 
         let previous_record = self
@@ -2903,14 +3520,21 @@ impl TaskManager {
             .clone()
             .unwrap_or_else(|| format!("task:{task_id}"));
         let goal_epoch_context = self.goal_epoch_context.clone();
-        let revive_result = (|| -> Result<RunningTask> {
-            let subscription = subscribe_to_worker_events(
+        let activity_heartbeat = Arc::new(Mutex::new(Instant::now()));
+        let circuit_state = Arc::new(Mutex::new(ToolCallCircuitState::default()));
+        let circuit_policy = self.runtime_policy.tool_call_circuit_breaker.clone();
+        let revive_result = (|| -> Result<(RunningTask, ReviveDispatchOutcome)> {
+            handle.reset_event_history()?;
+            let subscription = subscribe_to_worker_events_with_activity_and_circuit(
                 &handle,
                 &resident_task.queued_task.store,
                 task_id,
                 &resident_task.queued_task.task.goal_id,
                 previous_record.run_epoch.saturating_add(1),
                 goal_epoch_context,
+                Some(activity_heartbeat.clone()),
+                Some(circuit_state.clone()),
+                circuit_policy.clone(),
             )?;
             let record = self
                 .records
@@ -2975,20 +3599,34 @@ impl TaskManager {
             };
             self.running_tasks
                 .insert(task_id.to_string(), running_task.clone());
-            match message_kind {
-                QueuedMessageKind::FollowUp => {
-                    running_task.handle.send_follow_up(prompt)?;
-                }
-                QueuedMessageKind::Steer => {
-                    running_task.handle.steer(prompt)?;
-                }
-            }
-            Ok(running_task)
+            self.activity_heartbeats
+                .insert(task_id.to_string(), activity_heartbeat.clone());
+            self.tool_call_circuit_states
+                .insert(task_id.to_string(), circuit_state.clone());
+            let dispatch_outcome = match message_kind {
+                QueuedMessageKind::FollowUp => match running_task.handle.send_follow_up(prompt) {
+                    Ok(()) => ReviveDispatchOutcome::Started,
+                    Err(error) if prompt_dispatch_error_is_possibly_accepted(&error) => {
+                        ReviveDispatchOutcome::PossiblyAccepted
+                    }
+                    Err(error) => return Err(error),
+                },
+                QueuedMessageKind::Steer => match running_task.handle.steer(prompt) {
+                    Ok(()) => ReviveDispatchOutcome::Started,
+                    Err(error) if prompt_dispatch_error_is_possibly_accepted(&error) => {
+                        ReviveDispatchOutcome::PossiblyAccepted
+                    }
+                    Err(error) => return Err(error),
+                },
+            };
+            Ok((running_task, dispatch_outcome))
         })();
-        let running_task = match revive_result {
-            Ok(running_task) => running_task,
+        let (running_task, dispatch_outcome) = match revive_result {
+            Ok(result) => result,
             Err(error) => {
                 self.running_tasks.remove(task_id);
+                self.activity_heartbeats.remove(task_id);
+                self.tool_call_circuit_states.remove(task_id);
                 self.concurrency.release(&rollback_queued_task);
                 self.resident_tasks.insert(
                     task_id.to_string(),
@@ -3016,7 +3654,7 @@ impl TaskManager {
         };
 
         self.dispatch_running_task(task_id.to_string(), running_task);
-        Ok(true)
+        Ok(dispatch_outcome)
     }
 
     pub fn send_follow_up_task(&mut self, task_id: &str, prompt: String) -> Result<SendOutcome> {
@@ -3049,9 +3687,16 @@ impl TaskManager {
         let Some(queued_task) = queued_task else {
             return Ok(PromptDispatchGateResult::Unavailable);
         };
-        let session_id = record
-            .session_id
-            .clone()
+        let session_id = self
+            .running_tasks
+            .get(task_id)
+            .and_then(|running_task| running_task.handle.session_id())
+            .or_else(|| {
+                self.resident_tasks
+                    .get(task_id)
+                    .and_then(|resident_task| resident_task.handle.session_id())
+            })
+            .or_else(|| record.session_id.clone())
             .unwrap_or_else(|| format!("task:{task_id}"));
         let semantic_key = format!(
             "{message_kind}:{source}:{}",
@@ -3125,6 +3770,7 @@ impl TaskManager {
                 QueuedMessageKind::FollowUp,
                 prompt,
                 caller_session_id,
+                gate_context.clone(),
             );
             if let Err(error) = queued {
                 let _ = settle_gate(
@@ -3143,10 +3789,18 @@ impl TaskManager {
 
         if let Some(running_task) = self.running_tasks.get(task_id) {
             if let Err(error) = running_task.handle.send_follow_up(prompt) {
-                let _ = settle_gate(
-                    PromptDispatchGateStatus::Failed,
-                    Some(format!("follow-up dispatch failed: {error:#}")),
-                );
+                let status = prompt_dispatch_error_status(&error);
+                let reason = prompt_dispatch_error_reason("follow-up", &status);
+                let settlement = settle_gate(status.clone(), Some(reason));
+                if matches!(status, PromptDispatchGateStatus::PossiblyAccepted) {
+                    settlement?;
+                    return Ok(SendOutcome::PossiblyAccepted(OutcomeContext {
+                        task_id: Some(task_id.to_string()),
+                        run_epoch: Some(run_epoch as usize),
+                        queue_position: None,
+                    }));
+                }
+                let _ = settlement;
                 return Err(error);
             }
             settle_gate(PromptDispatchGateStatus::Accepted, None)?;
@@ -3158,14 +3812,46 @@ impl TaskManager {
         }
 
         if messageability_for_record(&record) == Messageability::Revive {
-            let revived = self.revive_task(task_id, prompt.clone(), QueuedMessageKind::FollowUp)?;
-            if revived {
-                settle_gate(PromptDispatchGateStatus::Accepted, None)?;
-                return Ok(SendOutcome::Revive(OutcomeContext {
-                    task_id: Some(task_id.to_string()),
-                    run_epoch: Some(run_epoch as usize),
-                    queue_position: None,
-                }));
+            let revived = match self.revive_task(
+                task_id,
+                prompt.clone(),
+                QueuedMessageKind::FollowUp,
+            ) {
+                Ok(revived) => revived,
+                Err(error) => {
+                    let status = prompt_dispatch_error_status(&error);
+                    let reason = prompt_dispatch_error_reason("follow-up", &status);
+                    let settlement = settle_gate(status.clone(), Some(reason));
+                    if matches!(status, PromptDispatchGateStatus::PossiblyAccepted) {
+                        settlement?;
+                    } else if let Err(settlement_error) = settlement {
+                        eprintln!(
+                            "failed to settle follow-up revive dispatch gate: {settlement_error:#}"
+                        );
+                    }
+                    return Err(error);
+                }
+            };
+            match revived {
+                ReviveDispatchOutcome::Started => {
+                    settle_gate(PromptDispatchGateStatus::Accepted, None)?;
+                    return Ok(SendOutcome::Revive(OutcomeContext {
+                        task_id: Some(task_id.to_string()),
+                        run_epoch: Some(run_epoch as usize),
+                        queue_position: None,
+                    }));
+                }
+                ReviveDispatchOutcome::PossiblyAccepted => {
+                    let status = PromptDispatchGateStatus::PossiblyAccepted;
+                    let reason = prompt_dispatch_error_reason("follow-up", &status);
+                    settle_gate(status, Some(reason))?;
+                    return Ok(SendOutcome::PossiblyAccepted(OutcomeContext {
+                        task_id: Some(task_id.to_string()),
+                        run_epoch: Some(run_epoch as usize),
+                        queue_position: None,
+                    }));
+                }
+                ReviveDispatchOutcome::NotStarted => {}
             }
             if self.resident_tasks.contains_key(task_id) {
                 self.pending_revives.push_back(PendingRevive {
@@ -3295,6 +3981,7 @@ impl TaskManager {
                 QueuedMessageKind::Steer,
                 prompt,
                 caller_session_id,
+                gate_context.clone(),
             );
             if let Err(error) = queued {
                 let _ = settle_gate(
@@ -3313,10 +4000,18 @@ impl TaskManager {
 
         if let Some(running_task) = self.running_tasks.get(task_id) {
             if let Err(error) = running_task.handle.steer(prompt) {
-                let _ = settle_gate(
-                    PromptDispatchGateStatus::Failed,
-                    Some(format!("steer dispatch failed: {error:#}")),
-                );
+                let status = prompt_dispatch_error_status(&error);
+                let reason = prompt_dispatch_error_reason("steer", &status);
+                let settlement = settle_gate(status.clone(), Some(reason));
+                if matches!(status, PromptDispatchGateStatus::PossiblyAccepted) {
+                    settlement?;
+                    return Ok(SteerOutcome::PossiblyAccepted(OutcomeContext {
+                        task_id: Some(task_id.to_string()),
+                        run_epoch: Some(run_epoch as usize),
+                        queue_position: None,
+                    }));
+                }
+                let _ = settlement;
                 return Err(error);
             }
             settle_gate(PromptDispatchGateStatus::Accepted, None)?;
@@ -3328,14 +4023,43 @@ impl TaskManager {
         }
 
         if messageability_for_record(&record) == Messageability::Revive {
-            let revived = self.revive_task(task_id, prompt.clone(), QueuedMessageKind::Steer)?;
-            if revived {
-                settle_gate(PromptDispatchGateStatus::Accepted, None)?;
-                return Ok(SteerOutcome::Revive(OutcomeContext {
-                    task_id: Some(task_id.to_string()),
-                    run_epoch: Some(run_epoch as usize),
-                    queue_position: None,
-                }));
+            let revived = match self.revive_task(task_id, prompt.clone(), QueuedMessageKind::Steer)
+            {
+                Ok(revived) => revived,
+                Err(error) => {
+                    let status = prompt_dispatch_error_status(&error);
+                    let reason = prompt_dispatch_error_reason("steer", &status);
+                    let settlement = settle_gate(status.clone(), Some(reason));
+                    if matches!(status, PromptDispatchGateStatus::PossiblyAccepted) {
+                        settlement?;
+                    } else if let Err(settlement_error) = settlement {
+                        eprintln!(
+                            "failed to settle steer revive dispatch gate: {settlement_error:#}"
+                        );
+                    }
+                    return Err(error);
+                }
+            };
+            match revived {
+                ReviveDispatchOutcome::Started => {
+                    settle_gate(PromptDispatchGateStatus::Accepted, None)?;
+                    return Ok(SteerOutcome::Revive(OutcomeContext {
+                        task_id: Some(task_id.to_string()),
+                        run_epoch: Some(run_epoch as usize),
+                        queue_position: None,
+                    }));
+                }
+                ReviveDispatchOutcome::PossiblyAccepted => {
+                    let status = PromptDispatchGateStatus::PossiblyAccepted;
+                    let reason = prompt_dispatch_error_reason("steer", &status);
+                    settle_gate(status, Some(reason))?;
+                    return Ok(SteerOutcome::PossiblyAccepted(OutcomeContext {
+                        task_id: Some(task_id.to_string()),
+                        run_epoch: Some(run_epoch as usize),
+                        queue_position: None,
+                    }));
+                }
+                ReviveDispatchOutcome::NotStarted => {}
             }
             if self.resident_tasks.contains_key(task_id) {
                 self.pending_revives.push_back(PendingRevive {
@@ -3438,12 +4162,7 @@ impl TaskManager {
                 let status = record.status.clone();
                 let has_failure_kind = record.failure_kind.is_some();
                 let has_retry_reason = record.retry_reason.is_some();
-                let summary_head = record
-                    .summary
-                    .lines()
-                    .next()
-                    .unwrap_or(record.summary.as_str())
-                    .to_string();
+                let summary_head = summary_head_for_record(&record);
                 let continuation_hint = continuation_hint_for_record(&record);
                 TaskSnapshot {
                     task_id: record.task_id,
@@ -3490,6 +4209,7 @@ impl TaskManager {
                     result_path: record.result_path,
                     outcome_path: record.outcome_path,
                     summary: record.summary,
+                    retry_reason: record.retry_reason,
                     summary_head,
                     continuation_hint,
                 }
@@ -3517,6 +4237,186 @@ impl TaskManager {
             .running_tasks
             .values()
             .any(|running_task| scopes_overlap(&queued_task.task, &running_task.queued_task.task))
+    }
+
+    fn process_pending_messages(&mut self) -> Result<()> {
+        let task_ids = self.control.pending_message_task_ids()?;
+        for task_id in task_ids {
+            let mut pending_messages = self.control.take_pending_messages(&task_id)?;
+            if pending_messages.is_empty() {
+                continue;
+            }
+
+            let Some(record) = self.records.get(&task_id).cloned() else {
+                for queued_message in pending_messages {
+                    settle_queued_message_gate_best_effort(
+                        &queued_message,
+                        PromptDispatchGateStatus::Released,
+                        Some("task record disappeared before queued delivery".to_string()),
+                    );
+                }
+                continue;
+            };
+
+            if let Some(running_task) = self.running_tasks.get(&task_id) {
+                let handle = Arc::clone(&running_task.handle);
+                while let Some(mut queued_message) = pending_messages.pop_front() {
+                    if let Err(error) = deliver_queued_message(&handle, &queued_message) {
+                        let status = prompt_dispatch_error_status(&error);
+                        let reason = prompt_dispatch_error_reason(
+                            queued_message_operation(&queued_message.kind),
+                            &status,
+                        );
+                        if matches!(status, PromptDispatchGateStatus::PossiblyAccepted) {
+                            settle_queued_message_gate_best_effort(
+                                &queued_message,
+                                status,
+                                Some(reason),
+                            );
+                        } else if queued_message.delivery_attempts + 1
+                            >= MAX_PENDING_MESSAGE_DELIVERY_ATTEMPTS
+                        {
+                            settle_queued_message_gate_best_effort(
+                                &queued_message,
+                                PromptDispatchGateStatus::Failed,
+                                Some(reason),
+                            );
+                        } else {
+                            queued_message.delivery_attempts += 1;
+                            let mut retry_messages = VecDeque::from([queued_message]);
+                            retry_messages.extend(pending_messages);
+                            self.control
+                                .prepend_pending_messages(&task_id, retry_messages)?;
+                            break;
+                        }
+                        if !pending_messages.is_empty() {
+                            self.control
+                                .prepend_pending_messages(&task_id, pending_messages)?;
+                        }
+                        break;
+                    }
+                    settle_queued_message_gate_best_effort(
+                        &queued_message,
+                        PromptDispatchGateStatus::Accepted,
+                        None,
+                    );
+                }
+                continue;
+            }
+
+            let can_revive = messageability_for_record(&record) == Messageability::Revive
+                && self.resident_tasks.contains_key(&task_id);
+            if can_revive {
+                let Some(mut queued_message) = pending_messages.pop_front() else {
+                    continue;
+                };
+                let can_start = self
+                    .resident_tasks
+                    .get(&task_id)
+                    .is_some_and(|resident_task| {
+                        self.concurrency.can_start(&resident_task.queued_task)
+                    });
+                if !can_start {
+                    let mut retry_messages = VecDeque::from([queued_message]);
+                    retry_messages.extend(pending_messages);
+                    self.control
+                        .prepend_pending_messages(&task_id, retry_messages)?;
+                    continue;
+                }
+
+                match self.revive_task(
+                    &task_id,
+                    queued_message.message.clone(),
+                    queued_message.kind.clone(),
+                ) {
+                    Ok(ReviveDispatchOutcome::Started) => {
+                        settle_queued_message_gate_best_effort(
+                            &queued_message,
+                            PromptDispatchGateStatus::Accepted,
+                            None,
+                        );
+                        if !pending_messages.is_empty() {
+                            self.control
+                                .prepend_pending_messages(&task_id, pending_messages)?;
+                        }
+                    }
+                    Ok(ReviveDispatchOutcome::PossiblyAccepted) => {
+                        settle_queued_message_gate_best_effort(
+                            &queued_message,
+                            PromptDispatchGateStatus::PossiblyAccepted,
+                            Some(prompt_dispatch_error_reason(
+                                queued_message_operation(&queued_message.kind),
+                                &PromptDispatchGateStatus::PossiblyAccepted,
+                            )),
+                        );
+                        if !pending_messages.is_empty() {
+                            self.control
+                                .prepend_pending_messages(&task_id, pending_messages)?;
+                        }
+                    }
+                    Ok(ReviveDispatchOutcome::NotStarted) => {
+                        let mut retry_messages = VecDeque::from([queued_message]);
+                        retry_messages.extend(pending_messages);
+                        self.control
+                            .prepend_pending_messages(&task_id, retry_messages)?;
+                    }
+                    Err(error) => {
+                        let status = prompt_dispatch_error_status(&error);
+                        let reason = prompt_dispatch_error_reason(
+                            queued_message_operation(&queued_message.kind),
+                            &status,
+                        );
+                        if matches!(status, PromptDispatchGateStatus::PossiblyAccepted) {
+                            settle_queued_message_gate_best_effort(
+                                &queued_message,
+                                status,
+                                Some(reason),
+                            );
+                        } else if queued_message.delivery_attempts + 1
+                            >= MAX_PENDING_MESSAGE_DELIVERY_ATTEMPTS
+                        {
+                            settle_queued_message_gate_best_effort(
+                                &queued_message,
+                                PromptDispatchGateStatus::Failed,
+                                Some(reason),
+                            );
+                        } else {
+                            queued_message.delivery_attempts += 1;
+                            let mut retry_messages = VecDeque::from([queued_message]);
+                            retry_messages.extend(pending_messages);
+                            self.control
+                                .prepend_pending_messages(&task_id, retry_messages)?;
+                            continue;
+                        }
+                        if !pending_messages.is_empty() {
+                            self.control
+                                .prepend_pending_messages(&task_id, pending_messages)?;
+                        }
+                    }
+                }
+                continue;
+            }
+
+            if record.status == ManagedTaskStatus::Pending
+                || self
+                    .queued_tasks
+                    .iter()
+                    .any(|queued_task| queued_task.task.id == task_id)
+            {
+                self.control
+                    .prepend_pending_messages(&task_id, pending_messages)?;
+                continue;
+            }
+
+            for queued_message in pending_messages {
+                settle_queued_message_gate_best_effort(
+                    &queued_message,
+                    PromptDispatchGateStatus::Released,
+                    Some("task is no longer continuable".to_string()),
+                );
+            }
+        }
+        Ok(())
     }
 
     fn process_pending_revives(&mut self) -> Result<()> {
@@ -3555,16 +4455,19 @@ impl TaskManager {
                 remaining.push_back(request);
                 continue;
             }
-            if !self.revive_task(
+            match self.revive_task(
                 &request.task_id,
                 request.message.clone(),
                 request.kind.clone(),
             )? {
-                eprintln!(
-                    "Gear resident revive remained queued for task `{}` from session {:?}",
-                    request.task_id, request.caller_session_id
-                );
-                remaining.push_back(request);
+                ReviveDispatchOutcome::Started | ReviveDispatchOutcome::PossiblyAccepted => {}
+                ReviveDispatchOutcome::NotStarted => {
+                    eprintln!(
+                        "Gear resident revive remained queued for task `{}` from session {:?}",
+                        request.task_id, request.caller_session_id
+                    );
+                    remaining.push_back(request);
+                }
             }
         }
         self.pending_revives = remaining;
@@ -3572,6 +4475,7 @@ impl TaskManager {
     }
 
     fn process_queue(&mut self) -> Result<()> {
+        self.process_pending_messages()?;
         self.process_pending_revives()?;
         while self.running_tasks.len() < self.concurrency.max_parallel_workers() {
             let Some(index) = self
@@ -3684,8 +4588,24 @@ impl TaskManager {
 
     fn start_queued_task(&mut self, mut queued_task: QueuedTask) -> Result<()> {
         self.apply_goal_unavailable_models(&mut queued_task);
+        if queued_task.task.attempt > 1 {
+            let selected_route = queued_task.config.selected_route_for_hint(
+                queued_task.route_attempt,
+                queued_task.route_hint.as_deref(),
+            );
+            discard_resident_session_for_model_switch(
+                &queued_task.store,
+                &queued_task.workspace,
+                &queued_task.task.id,
+                selected_route.worker_kind,
+                selected_route.worker_model,
+            )?;
+        }
         self.seed_goal_provider_session(&queued_task)?;
         let task_id = queued_task.task.id.clone();
+        let activity_heartbeat = Arc::new(Mutex::new(Instant::now()));
+        let circuit_state = Arc::new(Mutex::new(ToolCallCircuitState::default()));
+        let circuit_policy = self.runtime_policy.tool_call_circuit_breaker.clone();
         loop {
             if let Some(model_unavailable_error) =
                 model_unavailable_error_for_task(&queued_task.config, &queued_task)
@@ -3831,13 +4751,16 @@ impl TaskManager {
                 .get(&task_id)
                 .map(|record| record.run_epoch)
                 .unwrap_or_default();
-            let subscription = subscribe_to_worker_events(
+            let subscription = subscribe_to_worker_events_with_activity_and_circuit(
                 &handle,
                 &queued_task.store,
                 &task_id,
                 &queued_task.task.goal_id,
                 run_epoch,
                 self.goal_epoch_context.clone(),
+                Some(activity_heartbeat.clone()),
+                Some(circuit_state.clone()),
+                circuit_policy.clone(),
             )?;
             self.control.set_current(
                 task_id.clone(),
@@ -3868,28 +4791,59 @@ impl TaskManager {
             };
             self.running_tasks
                 .insert(task_id.clone(), running_task.clone());
+            self.activity_heartbeats
+                .insert(task_id.clone(), activity_heartbeat.clone());
+            self.tool_call_circuit_states
+                .insert(task_id.clone(), circuit_state.clone());
             let pending_messages = self.control.take_pending_messages(&task_id)?;
             let mut pending_messages = pending_messages.into_iter();
-            while let Some(queued_message) = pending_messages.next() {
-                let delivery_result = match queued_message.kind {
-                    QueuedMessageKind::FollowUp => running_task
-                        .handle
-                        .send_follow_up(queued_message.message.clone()),
-                    QueuedMessageKind::Steer => {
-                        running_task.handle.steer(queued_message.message.clone())
-                    }
-                };
-                if let Err(error) = delivery_result {
+            while let Some(mut queued_message) = pending_messages.next() {
+                if let Err(error) = deliver_queued_message(&running_task.handle, &queued_message) {
                     eprintln!(
                         "failed to deliver queued Gear message for task `{task_id}` from {:?} created at {}: {error:#}",
                         queued_message.caller_session_id, queued_message.created_at
                     );
-                    let mut retry_messages = VecDeque::from([queued_message]);
-                    retry_messages.extend(pending_messages);
-                    self.control
-                        .prepend_pending_messages(&task_id, retry_messages)?;
+                    let status = prompt_dispatch_error_status(&error);
+                    let reason = prompt_dispatch_error_reason(
+                        queued_message_operation(&queued_message.kind),
+                        &status,
+                    );
+                    if matches!(status, PromptDispatchGateStatus::PossiblyAccepted) {
+                        settle_queued_message_gate_best_effort(
+                            &queued_message,
+                            status,
+                            Some(reason),
+                        );
+                        let remaining = pending_messages.collect::<VecDeque<_>>();
+                        if !remaining.is_empty() {
+                            self.control.prepend_pending_messages(&task_id, remaining)?;
+                        }
+                    } else if queued_message.delivery_attempts + 1
+                        >= MAX_PENDING_MESSAGE_DELIVERY_ATTEMPTS
+                    {
+                        settle_queued_message_gate_best_effort(
+                            &queued_message,
+                            PromptDispatchGateStatus::Failed,
+                            Some(reason),
+                        );
+                        let remaining = pending_messages.collect::<VecDeque<_>>();
+                        if !remaining.is_empty() {
+                            self.control.prepend_pending_messages(&task_id, remaining)?;
+                        }
+                    } else {
+                        queued_message.delivery_attempts += 1;
+                        let mut retry_messages = VecDeque::from([queued_message]);
+                        retry_messages.extend(pending_messages);
+                        self.control
+                            .prepend_pending_messages(&task_id, retry_messages)?;
+                    }
                     break;
                 }
+                settle_queued_message_gate_best_effort(
+                    &queued_message,
+                    PromptDispatchGateStatus::Accepted,
+                    None,
+                );
             }
             self.dispatch_running_task(task_id, running_task);
             return Ok(());
@@ -4005,6 +4959,7 @@ pub struct CompletionNotification {
 const NOTIFIER_DEBOUNCE_MS: u64 = 100;
 const NOTIFIER_RETRY_DELAY_MS: u64 = 100;
 const NOTIFIER_RETRY_ATTEMPTS: usize = 2;
+const NOTIFIER_REDELIVERY_ATTEMPTS: usize = 3;
 
 #[derive(Clone, Default)]
 pub struct CompletionNotifier {
@@ -4027,7 +4982,11 @@ impl CompletionNotifier {
     pub fn should_notify(record: &TaskRecord) -> bool {
         matches!(
             record.status,
-            ManagedTaskStatus::Completed | ManagedTaskStatus::Failed | ManagedTaskStatus::Lost
+            ManagedTaskStatus::Completed
+                | ManagedTaskStatus::Failed
+                | ManagedTaskStatus::Cancelled
+                | ManagedTaskStatus::Interrupted
+                | ManagedTaskStatus::Lost
         )
     }
 
@@ -4054,12 +5013,7 @@ impl CompletionNotifier {
             status: record.status.clone(),
             run_epoch: record.run_epoch,
             summary: record.summary.clone(),
-            summary_head: record
-                .summary
-                .lines()
-                .next()
-                .unwrap_or(record.summary.as_str())
-                .to_string(),
+            summary_head: summary_head_for_record(record),
             continuation_hint: continuation_hint_for_record(record),
             failure_kind: record.failure_kind.clone(),
             duration_ms,
@@ -4099,15 +5053,21 @@ impl CompletionNotifier {
         record_failed_epoch: &dyn Fn(&str, u64) -> Result<()>,
     ) -> Result<NotificationResult> {
         let mut last_failure: Option<String> = None;
-        for attempt in 0..NOTIFIER_RETRY_ATTEMPTS {
-            match write_notified(&notification.task_id, notification.run_epoch) {
-                Ok(()) => return Ok(NotificationResult::Sent),
-                Err(error) => {
-                    last_failure = Some(format!("{error:#}"));
-                    if attempt + 1 < NOTIFIER_RETRY_ATTEMPTS {
-                        std::thread::sleep(Duration::from_millis(NOTIFIER_RETRY_DELAY_MS));
+        for redelivery_attempt in 0..NOTIFIER_REDELIVERY_ATTEMPTS {
+            for attempt in 0..NOTIFIER_RETRY_ATTEMPTS {
+                match write_notified(&notification.task_id, notification.run_epoch) {
+                    Ok(()) => return Ok(NotificationResult::Sent),
+                    Err(error) => {
+                        last_failure = Some(format!("{error:#}"));
+                        if attempt + 1 < NOTIFIER_RETRY_ATTEMPTS {
+                            std::thread::sleep(Duration::from_millis(NOTIFIER_RETRY_DELAY_MS));
+                        }
                     }
                 }
+            }
+
+            if redelivery_attempt + 1 < NOTIFIER_REDELIVERY_ATTEMPTS {
+                std::thread::sleep(Duration::from_millis(NOTIFIER_RETRY_DELAY_MS));
             }
         }
 
@@ -4253,7 +5213,11 @@ impl CompletionNotifier {
     fn is_notifiable_status(status: &ManagedTaskStatus) -> bool {
         matches!(
             status,
-            ManagedTaskStatus::Completed | ManagedTaskStatus::Failed | ManagedTaskStatus::Lost
+            ManagedTaskStatus::Completed
+                | ManagedTaskStatus::Failed
+                | ManagedTaskStatus::Cancelled
+                | ManagedTaskStatus::Interrupted
+                | ManagedTaskStatus::Lost
         )
     }
 }
@@ -4578,6 +5542,56 @@ fn model_unavailable_error_for_task(
     })
 }
 
+fn write_worker_fanout_denied_artifacts(
+    store: &StateStore,
+    task_id: &str,
+    summary: &str,
+) -> Result<(WorkerResult, WorkerOutcome)> {
+    let packet_path = store.write_worker_file(
+        task_id,
+        "packet.json",
+        &format!(
+            "{}\n",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "task_id": task_id,
+                "status": "failed",
+                "summary": summary,
+                "failure_kind": "repeated_failure_limit",
+            }))?
+        ),
+    )?;
+    let prompt_path = store.write_worker_file(task_id, "prompt.md", summary)?;
+    let result_path = store.worker_dir(task_id).join("result.json");
+    let outcome_path = store.worker_dir(task_id).join("outcome.json");
+    let result = WorkerResult {
+        status: WorkerStatus::Failed,
+        command: None,
+        exit_code: None,
+        summary: summary.to_string(),
+        packet_path,
+        prompt_path,
+        stdout_path: None,
+        stderr_path: None,
+        last_message_path: None,
+        result_path,
+        outcome_path,
+    };
+    let outcome = WorkerOutcome {
+        status: WorkerStatus::Failed,
+        session_id: None,
+        session_capability: None,
+        summary: summary.to_string(),
+        changed_files: Vec::new(),
+        commands_run: Vec::new(),
+        known_failures: vec![summary.to_string()],
+        raw_output_path: None,
+        command: None,
+        exit_code: None,
+    };
+    write_result_and_outcome_with_outcome(store, task_id, &result, &outcome)?;
+    Ok((result, outcome))
+}
+
 fn write_model_unavailable_artifacts(
     store: &StateStore,
     task_id: &str,
@@ -4634,6 +5648,33 @@ fn write_model_unavailable_artifacts(
         &format!("{}\n", serde_json::to_string_pretty(&outcome)?),
     )?;
     Ok((result, outcome))
+}
+
+fn write_worker_evidence_gate_artifact(
+    store: &StateStore,
+    task_id: &str,
+    attempt: usize,
+    receipt_path: Option<&Path>,
+    reason: Option<&str>,
+) -> Result<PathBuf> {
+    let status = if reason.is_some() {
+        "rejected"
+    } else {
+        "accepted"
+    };
+    let artifact = serde_json::json!({
+        "task_id": task_id,
+        "attempt": attempt,
+        "status": status,
+        "evidence_root": ".gearbox-agent/evidence",
+        "receipt_path": receipt_path.map(|path| path.to_string_lossy().into_owned()),
+        "reason": reason,
+    });
+    store.write_worker_file(
+        task_id,
+        &format!("evidence-gate-attempt-{attempt}.json"),
+        &format!("{}\n", serde_json::to_string_pretty(&artifact)?),
+    )
 }
 
 fn write_route_transform_artifact(
@@ -4765,20 +5806,44 @@ fn record_worker_settle_event(
 }
 
 fn queue_next_attempt(record: &mut TaskRecord, queued_task: &mut QueuedTask) -> FallbackDecision {
+    let evidence_retry = is_worker_evidence_retry(record);
     if let Some(failure_kind) = record
         .attempts
         .last()
         .and_then(|attempt| attempt.failure_kind.clone())
     {
-        let same_failure_count = record
-            .attempts
-            .iter()
-            .filter(|attempt| attempt.failure_kind.as_ref() == Some(&failure_kind))
-            .count();
-        let max_attempts = queued_task.config.worker_routes.len().max(2);
+        let same_failure_count = if evidence_retry {
+            record
+                .attempts
+                .iter()
+                .filter(|attempt| {
+                    attempt
+                        .retry_reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.starts_with(WORKER_EVIDENCE_RETRY_PREFIX))
+                })
+                .count()
+        } else {
+            record
+                .attempts
+                .iter()
+                .filter(|attempt| attempt.failure_kind.as_ref() == Some(&failure_kind))
+                .count()
+        };
+        let max_attempts = if evidence_retry {
+            MAX_WORKER_EVIDENCE_ATTEMPTS
+        } else {
+            queued_task.config.worker_routes.len().max(2)
+        };
         if same_failure_count >= max_attempts {
             return FallbackDecision::Unavailable {
-                reason: fallback_exhaustion_reason(record, &failure_kind, max_attempts),
+                reason: if evidence_retry {
+                    format!(
+                        "worker evidence receipt remained invalid after {max_attempts} attempts"
+                    )
+                } else {
+                    fallback_exhaustion_reason(record, &failure_kind, max_attempts)
+                },
                 failure_kind: TaskFailureKind::RepeatedFailureLimit,
             };
         }
@@ -4787,7 +5852,12 @@ fn queue_next_attempt(record: &mut TaskRecord, queued_task: &mut QueuedTask) -> 
     if let Some(previous_attempt) = record.attempts.last() {
         mark_failed_model_unavailable_for_retry(previous_attempt, &mut queued_task.config);
     }
-    maybe_append_failure_upgrade_route(record, queued_task);
+    if !evidence_retry {
+        maybe_append_failure_upgrade_route(record, queued_task);
+    } else {
+        queued_task.goal.push_str("\n\n");
+        queued_task.goal.push_str(WORKER_EVIDENCE_REPAIR_PROMPT);
+    }
 
     let Some(previous_attempt) = record.attempts.last() else {
         return FallbackDecision::Unavailable {
@@ -4816,6 +5886,7 @@ fn queue_next_attempt(record: &mut TaskRecord, queued_task: &mut QueuedTask) -> 
     let next_route_identity =
         route_identity_key(selected_route.worker_kind, worker_model.as_deref());
     if previous_route_identity == next_route_identity
+        && !evidence_retry
         && normalized_worker_command(previous_attempt.worker_command.as_deref())
             == normalized_worker_command(worker_command.as_deref())
     {
@@ -4863,15 +5934,22 @@ fn queue_next_attempt(record: &mut TaskRecord, queued_task: &mut QueuedTask) -> 
     );
     let next_model_label =
         fallback_model_label(selected_route.worker_kind, worker_model.as_deref());
-    let retry_reason = format!(
-        "模型回退：{previous_model_label} -> {next_model_label}；retrying after {:?} with `{}` via {}",
-        previous_attempt
-            .failure_kind
-            .clone()
-            .unwrap_or(TaskFailureKind::WorkerFailed),
-        worker_kind,
-        route_reason
-    );
+    let retry_reason = if evidence_retry {
+        format!(
+            "{WORKER_EVIDENCE_RETRY_PREFIX} repair attempt {next_attempt}: receipt gate rejected the previous `{}` worker attempt",
+            previous_attempt.worker_kind
+        )
+    } else {
+        format!(
+            "模型回退：{previous_model_label} -> {next_model_label}；retrying after {:?} with `{}` via {}",
+            previous_attempt
+                .failure_kind
+                .clone()
+                .unwrap_or(TaskFailureKind::WorkerFailed),
+            worker_kind,
+            route_reason
+        )
+    };
     record.worker_kind = worker_kind.clone();
     record.worker_command = worker_command.clone();
     record.worker_model = worker_model.clone();
@@ -4905,6 +5983,13 @@ fn queue_next_attempt(record: &mut TaskRecord, queued_task: &mut QueuedTask) -> 
         error: None,
     });
     FallbackDecision::Queued
+}
+
+fn is_worker_evidence_retry(record: &TaskRecord) -> bool {
+    record
+        .retry_reason
+        .as_deref()
+        .is_some_and(|reason| reason.starts_with(WORKER_EVIDENCE_RETRY_PREFIX))
 }
 
 fn normalized_worker_command(value: Option<&str>) -> Option<String> {
@@ -5148,20 +6233,48 @@ fn should_retry_worker_result(
         && (!queued_task.config.worker_routes.is_empty() || queued_task.config.require_worker)
 }
 
-fn subscribe_to_worker_events(
+fn subscribe_to_worker_events_with_activity_and_circuit(
     handle: &Arc<dyn WorkerSessionHandle>,
     store: &StateStore,
     task_id: &str,
     goal_id: &str,
     run_epoch: u64,
     goal_epoch_context: Option<GoalEpochContext>,
+    activity_heartbeat: Option<Arc<Mutex<Instant>>>,
+    circuit_state: Option<Arc<Mutex<ToolCallCircuitState>>>,
+    circuit_policy: ToolCallCircuitBreakerPolicy,
 ) -> Result<Option<WorkerSubscription>> {
     if handle.supports_event_subscriptions() {
         let store = store.clone();
         let task_id = task_id.to_string();
         let goal_id = goal_id.to_string();
         let session_id = handle.session_id();
+        let activity_heartbeat = activity_heartbeat.clone();
+        let circuit_state = circuit_state.clone();
+        let circuit_policy = circuit_policy.clone();
         Ok(Some(handle.subscribe(Arc::new(move |event| {
+            if let Some(activity_heartbeat) = activity_heartbeat.as_ref() {
+                match activity_heartbeat.lock() {
+                    Ok(mut last_activity) => *last_activity = Instant::now(),
+                    Err(_) => {
+                        eprintln!("failed to update Gear worker activity heartbeat for `{task_id}`")
+                    }
+                }
+            }
+            if let WorkerEvent::ToolCallStarted {
+                tool_name,
+                arguments,
+                ..
+            } = &event
+                && let Some(circuit_state) = circuit_state.as_ref()
+            {
+                record_tool_call_for_circuit_breaker(
+                    circuit_state,
+                    &circuit_policy,
+                    tool_name,
+                    arguments,
+                );
+            }
             if let Err(error) =
                 append_worker_event_evidence(&store, &task_id, session_id.as_deref(), &event)
             {
@@ -5212,7 +6325,7 @@ fn project_worker_event_to_guard(
         WorkerEvent::WorkerStdout { .. } => Some("worker_stdout"),
         WorkerEvent::WorkerStderr { .. } => Some("worker_stderr"),
         WorkerEvent::Error { .. } => Some("error"),
-        WorkerEvent::TurnFinished { .. } => None,
+        WorkerEvent::TurnFinished { .. } => Some("turn_finished"),
     };
     let Some(marker) = marker else {
         return Ok(());
@@ -5223,10 +6336,12 @@ fn project_worker_event_to_guard(
         &context.epoch_id,
         |guard| {
             match event {
-                WorkerEvent::Error { .. } => {
+                WorkerEvent::Error { .. } | WorkerEvent::TurnFinished { .. } => {
                     guard.in_flight = false;
-                    guard.background_pending = true;
-                    guard.consecutive_failures = guard.consecutive_failures.saturating_add(1);
+                    guard.background_pending = false;
+                    if matches!(event, WorkerEvent::Error { .. }) {
+                        guard.consecutive_failures = guard.consecutive_failures.saturating_add(1);
+                    }
                 }
                 _ => {
                     guard.in_flight = true;
@@ -5370,10 +6485,11 @@ fn concurrency_key_for_task(queued_task: &QueuedTask) -> String {
     let selected_route = queued_task
         .config
         .selected_route_for_hint(queued_task.route_attempt, queued_task.route_hint.as_deref());
-    let model_key = queued_task
-        .coordinator_model
-        .as_ref()
-        .map(|model| format!("{}:{}", model.provider_id, model.model_id))
+    let model_key = selected_route
+        .worker_model
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(ToOwned::to_owned)
         .unwrap_or_else(|| "unconfigured".to_string());
     format!("{}:{model_key}", selected_route.worker_kind.as_str())
 }
@@ -5479,6 +6595,87 @@ mod tests {
         }
     }
 
+    fn queued_task_for_concurrency_key(
+        task_id: &str,
+        config: WorkerConfig,
+        coordinator_model: Option<CoordinatorModel>,
+    ) -> QueuedTask {
+        QueuedTask {
+            store: StateStore::new("/tmp/gearbox-concurrency-key-test"),
+            workspace: PathBuf::from("/tmp/gearbox-concurrency-key-test"),
+            task: test_task(task_id),
+            route_attempt: 1,
+            goal: "concurrency key test".to_string(),
+            verification_commands: Vec::new(),
+            config,
+            cancellation_token: None,
+            coordinator_model,
+            coordinator_brief: None,
+            route_hint: None,
+        }
+    }
+
+    #[test]
+    fn concurrency_key_uses_selected_worker_model_not_coordinator_model() {
+        let same_planner = Some(CoordinatorModel {
+            provider_id: "planner-provider".to_string(),
+            model_id: "planner-model".to_string(),
+            name: "planner".to_string(),
+        });
+        let mut worker_a_config = WorkerConfig::default();
+        worker_a_config.worker_kind = WorkerKind::Opencode;
+        worker_a_config.worker_command = Some("worker".to_string());
+        worker_a_config.worker_model = Some("worker-model-a".to_string());
+        let mut worker_b_config = worker_a_config.clone();
+        worker_b_config.worker_model = Some("worker-model-b".to_string());
+
+        let worker_a = queued_task_for_concurrency_key(
+            "task_worker_model_a",
+            worker_a_config.clone(),
+            same_planner.clone(),
+        );
+        let worker_b =
+            queued_task_for_concurrency_key("task_worker_model_b", worker_b_config, same_planner);
+        assert_ne!(
+            concurrency_key_for_task(&worker_a),
+            concurrency_key_for_task(&worker_b),
+            "different worker models must not share a planner-derived concurrency key"
+        );
+
+        let different_planner = Some(CoordinatorModel {
+            provider_id: "other-planner-provider".to_string(),
+            model_id: "other-planner-model".to_string(),
+            name: "other planner".to_string(),
+        });
+        let same_worker_different_planner = queued_task_for_concurrency_key(
+            "task_same_worker_different_planner",
+            worker_a_config,
+            different_planner,
+        );
+        assert_eq!(
+            concurrency_key_for_task(&worker_a),
+            concurrency_key_for_task(&same_worker_different_planner),
+            "the same worker model must retain one concurrency key across planners"
+        );
+
+        let mut unconfigured_worker_config = WorkerConfig::default();
+        unconfigured_worker_config.worker_kind = WorkerKind::Opencode;
+        unconfigured_worker_config.worker_command = Some("worker".to_string());
+        let unconfigured_worker = queued_task_for_concurrency_key(
+            "task_unconfigured_worker",
+            unconfigured_worker_config,
+            Some(CoordinatorModel {
+                provider_id: "planner-provider".to_string(),
+                model_id: "planner-model".to_string(),
+                name: "planner".to_string(),
+            }),
+        );
+        assert_eq!(
+            concurrency_key_for_task(&unconfigured_worker),
+            "opencode:unconfigured"
+        );
+    }
+
     fn test_task_record(
         task_id: &str,
         status: ManagedTaskStatus,
@@ -5540,6 +6737,237 @@ mod tests {
             _request: WorkerStartRequest<'_>,
         ) -> Result<Arc<dyn WorkerSessionHandle>> {
             Err(anyhow::anyhow!("injected native worker start failure"))
+        }
+    }
+
+    #[test]
+    fn worker_fanout_guard_counts_and_persists_session_starts() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::Opencode,
+            worker_command: Some("printf fanout-ok".to_string()),
+            worker_model: None,
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
+        };
+
+        let mut manager = TaskManager::new();
+        manager.set_session_scope("fanout-session");
+        manager.set_worker_fanout_limit(1);
+        let first_task = test_task("task_fanout_first");
+        let first_id = manager.start(WorkerStartRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &first_task,
+            route_attempt: 1,
+            goal: "fanout first",
+            verification_commands: &[],
+            config: &config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        })?;
+        assert_eq!(
+            manager.wait_for(&first_id)?.record.status,
+            ManagedTaskStatus::Completed
+        );
+
+        let second_task = test_task("task_fanout_second");
+        let second_id = manager.start(WorkerStartRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &second_task,
+            route_attempt: 1,
+            goal: "fanout second",
+            verification_commands: &[],
+            config: &config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        })?;
+        let second_run = manager.wait_for(&second_id)?;
+        assert_eq!(second_run.record.status, ManagedTaskStatus::Failed);
+        assert_eq!(
+            second_run.record.failure_kind,
+            Some(TaskFailureKind::RepeatedFailureLimit)
+        );
+        assert!(
+            second_run
+                .record
+                .retry_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("2/1"))
+        );
+        let counter = store.read_worker_fanout_counter("fanout-session")?;
+        assert_eq!(counter.count, 2);
+        assert!(
+            fs::read_dir(store.worker_fanout_dir_for_session("fanout-session"))?
+                .filter_map(Result::ok)
+                .any(|entry| entry.file_name().to_string_lossy().starts_with("denied-2"))
+        );
+
+        drop(manager);
+        let mut restarted_manager = TaskManager::new();
+        restarted_manager.set_session_scope("fanout-session");
+        restarted_manager.set_worker_fanout_limit(1);
+        let third_task = test_task("task_fanout_third");
+        let third_id = restarted_manager.start(WorkerStartRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &third_task,
+            route_attempt: 1,
+            goal: "fanout third",
+            verification_commands: &[],
+            config: &config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        })?;
+        assert_eq!(
+            restarted_manager.wait_for(&third_id)?.record.status,
+            ManagedTaskStatus::Failed
+        );
+        assert_eq!(store.read_worker_fanout_counter("fanout-session")?.count, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn worker_fanout_guard_is_inactive_without_session_scope() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::Opencode,
+            worker_command: Some("printf unscoped-ok".to_string()),
+            worker_model: None,
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
+        };
+        let mut manager = TaskManager::new();
+        manager.set_worker_fanout_limit(1);
+        for task_id in ["task_unscoped_first", "task_unscoped_second"] {
+            let task = test_task(task_id);
+            let managed_id = manager.start(WorkerStartRequest {
+                store: &store,
+                workspace: temp_dir.path(),
+                task: &task,
+                route_attempt: 1,
+                goal: "unscoped fanout",
+                verification_commands: &[],
+                config: &config,
+                cancellation_token: None,
+                coordinator_model: None,
+                coordinator_brief: None,
+                route_hint: None,
+            })?;
+            assert_eq!(
+                manager.wait_for(&managed_id)?.record.status,
+                ManagedTaskStatus::Completed
+            );
+        }
+        assert!(!store.worker_fanout_dir().exists());
+        Ok(())
+    }
+
+    struct FailOnceFollowUpBackend {
+        follow_up_attempts: Arc<AtomicUsize>,
+        steer_deliveries: Arc<AtomicUsize>,
+    }
+
+    impl NativeWorkerBackend for FailOnceFollowUpBackend {
+        fn start_zed_agent(
+            &self,
+            _request: WorkerStartRequest<'_>,
+        ) -> Result<Arc<dyn WorkerSessionHandle>> {
+            Ok(Arc::new(FailOnceFollowUpHandle {
+                follow_up_attempts: self.follow_up_attempts.clone(),
+                steer_deliveries: self.steer_deliveries.clone(),
+            }))
+        }
+    }
+
+    struct FailOnceFollowUpHandle {
+        follow_up_attempts: Arc<AtomicUsize>,
+        steer_deliveries: Arc<AtomicUsize>,
+    }
+
+    impl WorkerSessionHandle for FailOnceFollowUpHandle {
+        fn session_id(&self) -> Option<String> {
+            Some("session_fail_once_follow_up".to_string())
+        }
+
+        fn send_follow_up(&self, _prompt: String) -> Result<()> {
+            if self.follow_up_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                bail!("transient queued follow-up delivery failure")
+            }
+            Ok(())
+        }
+
+        fn steer(&self, _prompt: String) -> Result<()> {
+            self.steer_deliveries.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn interrupt(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn cancel(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn wait_for_outcome(&self) -> Result<WorkerOutcome> {
+            Ok(WorkerOutcome {
+                status: WorkerStatus::Succeeded,
+                session_id: self.session_id(),
+                session_capability: None,
+                summary: "fail-once fixture completed".to_string(),
+                changed_files: Vec::new(),
+                commands_run: Vec::new(),
+                known_failures: Vec::new(),
+                raw_output_path: None,
+                command: None,
+                exit_code: Some(0),
+            })
+        }
+
+        fn wait_for_result(&self) -> Result<WorkerResult> {
+            Ok(WorkerResult {
+                status: WorkerStatus::Succeeded,
+                command: None,
+                exit_code: Some(0),
+                summary: "fail-once fixture completed".to_string(),
+                packet_path: PathBuf::from("packet.json"),
+                prompt_path: PathBuf::from("prompt.md"),
+                stdout_path: None,
+                stderr_path: None,
+                last_message_path: None,
+                result_path: PathBuf::from("result.json"),
+                outcome_path: PathBuf::from("outcome.json"),
+            })
+        }
+
+        fn last_output(&self) -> Option<String> {
+            None
         }
     }
 
@@ -5640,7 +7068,7 @@ mod tests {
         store.initialize()?;
         let task = test_task("task_skipped");
         let config = WorkerConfig {
-            worker_kind: WorkerKind::Opencode,
+            worker_kind: WorkerKind::OpencodeSession,
             worker_command: None,
             worker_model: None,
             worker_routes: Vec::new(),
@@ -5733,6 +7161,115 @@ mod tests {
     }
 
     #[test]
+    fn task_manager_rejects_success_without_worker_evidence_receipt() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = test_task("task_missing_worker_evidence");
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::OpencodeSession,
+            worker_command: Some(
+                r#"printf 'completed without receipt\n' > "$GEARBOX_WORKER_LAST_MESSAGE""#
+                    .to_string(),
+            ),
+            worker_model: None,
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::OpencodeSession,
+        };
+        let mut manager = TaskManager::new();
+
+        let run = manager.run_worker_task(WorkerStartRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &task,
+            route_attempt: 1,
+            goal: "test evidence gate",
+            verification_commands: &[],
+            config: &config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        })?;
+
+        assert_eq!(run.result.status, WorkerStatus::Failed);
+        assert_eq!(run.record.status, ManagedTaskStatus::Failed);
+        assert_eq!(run.record.attempts.len(), 3);
+        assert!(run.record.summary.contains("evidence gate"));
+        for attempt in 1..=3 {
+            let artifact = store
+                .worker_dir(&task.id)
+                .join(format!("evidence-gate-attempt-{attempt}.json"));
+            assert!(
+                artifact.exists(),
+                "missing gate artifact for attempt {attempt}"
+            );
+        }
+        let task_record = fs::read_to_string(store.worker_dir(&task.id).join("task-record.json"))?;
+        assert!(!task_record.contains(r#""status": "completed""#));
+        Ok(())
+    }
+
+    #[test]
+    fn task_manager_accepts_success_with_valid_worker_evidence_receipt() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = test_task("task_valid_worker_evidence");
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::OpencodeSession,
+            worker_command: Some(
+                r#"mkdir -p .gearbox-agent/evidence && printf 'verified\n' > .gearbox-agent/evidence/receipt.md && printf 'done\nEVIDENCE_RECORDED: .gearbox-agent/evidence/receipt.md\n' > "$GEARBOX_WORKER_LAST_MESSAGE""#
+                    .to_string(),
+            ),
+            worker_model: None,
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::OpencodeSession,
+        };
+        let mut manager = TaskManager::new();
+
+        let run = manager.run_worker_task(WorkerStartRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &task,
+            route_attempt: 1,
+            goal: "test evidence gate",
+            verification_commands: &[],
+            config: &config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        })?;
+
+        assert_eq!(run.result.status, WorkerStatus::Succeeded);
+        assert_eq!(run.record.status, ManagedTaskStatus::Completed);
+        assert_eq!(run.record.attempts.len(), 1);
+        let artifact = fs::read_to_string(
+            store
+                .worker_dir(&task.id)
+                .join("evidence-gate-attempt-1.json"),
+        )?;
+        assert!(artifact.contains(r#""status": "accepted""#));
+        assert!(artifact.contains("receipt.md"));
+        Ok(())
+    }
+
+    #[test]
     fn task_manager_fallback_retries_failed_worker_result() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let store = StateStore::new(temp_dir.path());
@@ -5750,7 +7287,10 @@ mod tests {
                 },
                 WorkerRoute {
                     worker_kind: WorkerKind::Codex,
-                    worker_command: Some("printf fallback-ok".to_string()),
+                    worker_command: Some(
+                        r#"sh -c 'mkdir -p .gearbox-agent/evidence; printf verified > .gearbox-agent/evidence/receipt.md; printf "done\nEVIDENCE_RECORDED: .gearbox-agent/evidence/receipt.md\n" > "$GEARBOX_WORKER_LAST_MESSAGE"; printf fallback-ok'"#
+                            .to_string(),
+                    ),
                     worker_model: None,
                 },
             ],
@@ -6260,6 +7800,44 @@ mod tests {
     }
 
     #[test]
+    fn goal_epoch_context_resets_route_state_when_session_changes() -> Result<()> {
+        let mut manager = TaskManager::new();
+        manager.set_goal_epoch_context("session-one", "goal-shared", "epoch-one")?;
+        manager.goal_provider_sessions.insert(
+            "goal-shared".to_string(),
+            "provider-session-one".to_string(),
+        );
+        manager.goal_unavailable_worker_models.insert(
+            "goal-shared".to_string(),
+            HashMap::from([("opencode/hy3-free".to_string(), Instant::now())]),
+        );
+
+        manager.set_goal_epoch_context("session-two", "goal-shared", "epoch-two")?;
+
+        assert!(manager.goal_provider_sessions.is_empty());
+        assert!(manager.goal_unavailable_worker_models.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn possibly_accepted_outcomes_expose_a_warning_reason() {
+        let send = SendOutcome::PossiblyAccepted(OutcomeContext::default());
+        assert!(send.is_accepted());
+        assert!(
+            send.reason()
+                .is_some_and(|reason| reason.contains("may have been accepted"))
+        );
+
+        let steer = SteerOutcome::PossiblyAccepted(OutcomeContext::default());
+        assert!(steer.is_accepted());
+        assert!(
+            steer
+                .reason()
+                .is_some_and(|reason| reason.contains("may have been accepted"))
+        );
+    }
+
+    #[test]
     #[ignore = "requires GEARBOX_LIVE_OPENCODE_SESSION_SMOKE=1 and OpenCode provider access"]
     fn live_opencode_session_survives_a_same_goal_cross_model_task_handoff() -> Result<()> {
         if std::env::var("GEARBOX_LIVE_OPENCODE_SESSION_SMOKE")
@@ -6713,7 +8291,10 @@ mod tests {
                 },
                 WorkerRoute {
                     worker_kind: WorkerKind::Codex,
-                    worker_command: Some("printf fallback-ok".to_string()),
+                    worker_command: Some(
+                        r#"sh -c 'mkdir -p .gearbox-agent/evidence; printf verified > .gearbox-agent/evidence/receipt.md; printf "done\nEVIDENCE_RECORDED: .gearbox-agent/evidence/receipt.md\n" > "$GEARBOX_WORKER_LAST_MESSAGE"; printf fallback-ok'"#
+                            .to_string(),
+                    ),
                     worker_model: None,
                 },
             ],
@@ -6933,7 +8514,10 @@ mod tests {
                 },
                 WorkerRoute {
                     worker_kind: WorkerKind::Codex,
-                    worker_command: Some("printf model-fallback-ok".to_string()),
+                    worker_command: Some(
+                        r#"sh -c 'mkdir -p .gearbox-agent/evidence; printf verified > .gearbox-agent/evidence/receipt.md; printf "done\nEVIDENCE_RECORDED: .gearbox-agent/evidence/receipt.md\n" > "$GEARBOX_WORKER_LAST_MESSAGE"; printf model-fallback-ok'"#
+                            .to_string(),
+                    ),
                     worker_model: Some("fast-model".to_string()),
                 },
             ],
@@ -7113,7 +8697,10 @@ mod tests {
                 },
                 WorkerRoute {
                     worker_kind: WorkerKind::OpencodeSession,
-                    worker_command: Some("printf 'worker-ok\\n'".to_string()),
+                    worker_command: Some(
+                        r#"sh -c 'mkdir -p .gearbox-agent/evidence; printf verified > .gearbox-agent/evidence/receipt.md; printf "done\nEVIDENCE_RECORDED: .gearbox-agent/evidence/receipt.md\n" > "$GEARBOX_WORKER_LAST_MESSAGE"; printf worker-ok'"#
+                            .to_string(),
+                    ),
                     worker_model: Some("opencode/mimo-v2.5-free".to_string()),
                 },
             ],
@@ -7411,6 +8998,65 @@ mod tests {
         }
     }
 
+    struct FakeAmbiguousDispatchHandle;
+
+    impl WorkerSessionHandle for FakeAmbiguousDispatchHandle {
+        fn session_id(&self) -> Option<String> {
+            Some("session_ambiguous_dispatch".to_string())
+        }
+
+        fn send_follow_up(&self, _prompt: String) -> Result<()> {
+            bail!("JSON Parse error: Unexpected end of JSON input")
+        }
+
+        fn steer(&self, _prompt: String) -> Result<()> {
+            bail!("PromptAsync Timed Out after 30000ms")
+        }
+
+        fn interrupt(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn cancel(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn wait_for_outcome(&self) -> Result<WorkerOutcome> {
+            bail!("not supported")
+        }
+
+        fn wait_for_result(&self) -> Result<WorkerResult> {
+            bail!("not supported")
+        }
+
+        fn last_output(&self) -> Option<String> {
+            None
+        }
+    }
+
+    #[test]
+    fn prompt_dispatch_error_classifier_matches_omo_signals() {
+        for message in [
+            "JSON Parse error: Unexpected end of JSON input",
+            "PromptAsync Timed Out after 30000ms",
+            "unexpected EOF while reading response",
+        ] {
+            let error = anyhow::anyhow!(message);
+            assert!(prompt_dispatch_error_is_possibly_accepted(&error));
+            assert_eq!(
+                prompt_dispatch_error_status(&error),
+                PromptDispatchGateStatus::PossiblyAccepted
+            );
+        }
+        let definite =
+            anyhow::anyhow!("command-backed worker sessions do not support follow-up prompts");
+        assert!(!prompt_dispatch_error_is_possibly_accepted(&definite));
+        assert_eq!(
+            prompt_dispatch_error_status(&definite),
+            PromptDispatchGateStatus::Failed
+        );
+    }
+
     #[test]
     fn session_identity_does_not_imply_event_subscription_support() -> Result<()> {
         let handle: Arc<dyn WorkerSessionHandle> = Arc::new(FakeOutputHandle);
@@ -7421,13 +9067,16 @@ mod tests {
         assert!(handle.session_id().is_some());
         assert!(!handle.supports_event_subscriptions());
         assert!(
-            subscribe_to_worker_events(
+            subscribe_to_worker_events_with_activity_and_circuit(
                 &handle,
                 &store,
                 "task_session_identity",
                 "goal_session_identity",
                 1,
                 None,
+                None,
+                None,
+                ToolCallCircuitBreakerPolicy::default(),
             )?
             .is_none()
         );
@@ -7495,7 +9144,7 @@ mod tests {
         let handle: Arc<dyn WorkerSessionHandle> = Arc::new(EventfulHandle {
             event_hub: event_hub.clone(),
         });
-        let subscription = subscribe_to_worker_events(
+        let subscription = subscribe_to_worker_events_with_activity_and_circuit(
             &handle,
             &store,
             "task_eventful",
@@ -7506,6 +9155,9 @@ mod tests {
                 goal_id: "goal_eventful".to_string(),
                 epoch_id: "epoch_eventful".to_string(),
             }),
+            None,
+            None,
+            ToolCallCircuitBreakerPolicy::default(),
         )?
         .context("eventful handle did not create a subscription")?;
 
@@ -7574,7 +9226,7 @@ mod tests {
             .context("worker events did not update the matching continuation guard")?;
         assert_eq!(guard.epoch_id, "epoch_eventful");
         assert!(!guard.in_flight);
-        assert!(guard.background_pending);
+        assert!(!guard.background_pending);
         assert_eq!(guard.consecutive_failures, 1);
         assert_eq!(
             guard.last_progress_marker.as_deref(),
@@ -7611,6 +9263,86 @@ mod tests {
                 .exists()
         );
         drop(subscription);
+        Ok(())
+    }
+
+    #[test]
+    fn worker_event_guard_settles_active_background_state_on_turn_finished() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        store.update_continuation_guard(
+            "session_guard_settlement",
+            "goal_guard_settlement",
+            "epoch_guard_settlement",
+            |_| {},
+        )?;
+        let context = GoalEpochContext {
+            session_id: "session_guard_settlement".to_string(),
+            goal_id: "goal_guard_settlement".to_string(),
+            epoch_id: "epoch_guard_settlement".to_string(),
+        };
+
+        project_worker_event_to_guard(
+            &store,
+            &context,
+            "task_guard_settlement",
+            &WorkerEvent::TurnStarted {
+                kind: "acp".to_string(),
+                prompt_path: PathBuf::from("/private/prompt.md"),
+            },
+        )?;
+        let active = store
+            .read_continuation_guard_for_session(&context.session_id)?
+            .context("active worker event did not update continuation guard")?;
+        assert!(active.in_flight);
+        assert!(active.background_pending);
+        assert_eq!(active.blocking_reason(), Some("background work is pending"));
+
+        project_worker_event_to_guard(
+            &store,
+            &context,
+            "task_guard_settlement",
+            &WorkerEvent::TurnFinished {
+                kind: "acp".to_string(),
+                result_path: PathBuf::from("/private/result.json"),
+                outcome_path: PathBuf::from("/private/outcome.json"),
+                summary: "finished".to_string(),
+            },
+        )?;
+        let settled = store
+            .read_continuation_guard_for_session(&context.session_id)?
+            .context("turn-finished event removed continuation guard")?;
+        assert!(!settled.in_flight);
+        assert!(!settled.background_pending);
+        assert_eq!(settled.blocking_reason(), None);
+
+        store.update_continuation_guard(
+            &context.session_id,
+            &context.goal_id,
+            "newer_epoch",
+            |guard| {
+                guard.background_pending = true;
+                guard.in_flight = true;
+            },
+        )?;
+        project_worker_event_to_guard(
+            &store,
+            &context,
+            "task_guard_settlement",
+            &WorkerEvent::TurnFinished {
+                kind: "acp".to_string(),
+                result_path: PathBuf::from("/private/stale-result.json"),
+                outcome_path: PathBuf::from("/private/stale-outcome.json"),
+                summary: "stale".to_string(),
+            },
+        )?;
+        let newer = store
+            .read_continuation_guard_for_session(&context.session_id)?
+            .context("newer continuation guard disappeared")?;
+        assert_eq!(newer.epoch_id, "newer_epoch");
+        assert!(newer.in_flight);
+        assert!(newer.background_pending);
         Ok(())
     }
 
@@ -7673,7 +9405,70 @@ mod tests {
         }
     }
 
-    struct FakeReviveFailureHandle;
+    struct HistoryAwareReviveHandle {
+        event_hub: WorkerEventHub,
+        reset_calls: Arc<AtomicUsize>,
+        follow_ups: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl WorkerSessionHandle for HistoryAwareReviveHandle {
+        fn session_id(&self) -> Option<String> {
+            Some("session_history_aware".to_string())
+        }
+
+        fn send_follow_up(&self, prompt: String) -> Result<()> {
+            self.follow_ups
+                .lock()
+                .map_err(|_| anyhow::anyhow!("history-aware follow-up mutex poisoned"))?
+                .push(prompt);
+            self.event_hub.emit(WorkerEvent::TurnStarted {
+                kind: "history-aware".to_string(),
+                prompt_path: PathBuf::from("/new-epoch/prompt.md"),
+            });
+            Ok(())
+        }
+
+        fn steer(&self, _prompt: String) -> Result<()> {
+            bail!("history-aware handle steer is not used")
+        }
+
+        fn interrupt(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn cancel(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn wait_for_outcome(&self) -> Result<WorkerOutcome> {
+            bail!("history-aware handle outcome is not used")
+        }
+
+        fn wait_for_result(&self) -> Result<WorkerResult> {
+            bail!("history-aware handle result is not used")
+        }
+
+        fn last_output(&self) -> Option<String> {
+            None
+        }
+
+        fn supports_event_subscriptions(&self) -> bool {
+            true
+        }
+
+        fn subscribe(&self, listener: WorkerEventListener) -> Result<WorkerSubscription> {
+            self.event_hub.subscribe(listener)
+        }
+
+        fn reset_event_history(&self) -> Result<()> {
+            self.reset_calls.fetch_add(1, Ordering::SeqCst);
+            self.event_hub.clear_history()
+        }
+    }
+
+    struct FakeReviveFailureHandle {
+        error_message: &'static str,
+    }
 
     impl WorkerSessionHandle for FakeReviveFailureHandle {
         fn session_id(&self) -> Option<String> {
@@ -7681,11 +9476,11 @@ mod tests {
         }
 
         fn send_follow_up(&self, _prompt: String) -> Result<()> {
-            bail!("simulated revive delivery failure")
+            bail!("{}", self.error_message)
         }
 
         fn steer(&self, _prompt: String) -> Result<()> {
-            bail!("simulated revive delivery failure")
+            bail!("{}", self.error_message)
         }
 
         fn interrupt(&self) -> Result<()> {
@@ -7814,6 +9609,115 @@ mod tests {
                 .as_slice(),
             ["same prompt"]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn task_manager_control_marks_ambiguous_follow_up_as_possibly_accepted() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let control = TaskManagerControl::default();
+        control.set_current(
+            "task_control_ambiguous".to_string(),
+            ManagedTaskStatus::Running,
+            Some(Arc::new(FakeAmbiguousDispatchHandle)),
+        )?;
+        control.set_dispatch_context(
+            "task_control_ambiguous",
+            store.clone(),
+            "goal_control_ambiguous".to_string(),
+            "session_control_ambiguous".to_string(),
+            1,
+        )?;
+
+        let outcome = control.send_follow_up_task(
+            "task_control_ambiguous",
+            "same ambiguous prompt".to_string(),
+        )?;
+        assert_eq!(
+            outcome,
+            SendOutcome::PossiblyAccepted(OutcomeContext {
+                task_id: Some("task_control_ambiguous".to_string()),
+                ..OutcomeContext::default()
+            })
+        );
+        assert!(outcome.is_accepted());
+
+        let duplicate = store.reserve_prompt_dispatch(
+            "goal_control_ambiguous",
+            "task_control_ambiguous",
+            "session_control_ambiguous",
+            1,
+            "follow_up",
+            "gui_control",
+            "same ambiguous prompt",
+        )?;
+        let gate = match duplicate {
+            PromptDispatchDecision::Duplicate(gate) => gate,
+            PromptDispatchDecision::Acquired(_) => {
+                bail!("ambiguous follow-up should remain deduplicated during hold")
+            }
+        };
+        assert_eq!(gate.status, PromptDispatchGateStatus::PossiblyAccepted);
+        assert!(
+            gate.reason
+                .as_deref()
+                .is_some_and(|reason| !reason.contains("JSON"))
+        );
+        assert!(matches!(
+            control.send_follow_up_task(
+                "task_control_ambiguous",
+                "same ambiguous prompt".to_string(),
+            )?,
+            SendOutcome::Noop(_)
+        ));
+        assert_eq!(
+            control.steer_task("task_control_ambiguous", "same ambiguous steer".to_string(),)?,
+            SteerOutcome::PossiblyAccepted(OutcomeContext {
+                task_id: Some("task_control_ambiguous".to_string()),
+                ..OutcomeContext::default()
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn task_manager_control_keeps_definite_follow_up_failure_retryable() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let control = TaskManagerControl::default();
+        control.set_current(
+            "task_control_definite".to_string(),
+            ManagedTaskStatus::Running,
+            Some(Arc::new(FakeOutputHandle)),
+        )?;
+        control.set_dispatch_context(
+            "task_control_definite",
+            store.clone(),
+            "goal_control_definite".to_string(),
+            "session_control_definite".to_string(),
+            1,
+        )?;
+
+        assert!(
+            control
+                .send_follow_up_task("task_control_definite", "retryable prompt".to_string())
+                .is_err()
+        );
+        assert!(matches!(
+            store.reserve_prompt_dispatch(
+                "goal_control_definite",
+                "task_control_definite",
+                "session_control_definite",
+                1,
+                "follow_up",
+                "gui_control",
+                "retryable prompt",
+            )?,
+            PromptDispatchDecision::Acquired(_)
+        ));
         Ok(())
     }
 
@@ -8131,6 +10035,43 @@ mod tests {
     }
 
     #[test]
+    fn task_manager_snapshot_exposes_model_fallback_chain_without_errors() -> Result<()> {
+        let mut manager = TaskManager::new();
+        let mut record = test_task_record(
+            "task_snapshot_fallback",
+            ManagedTaskStatus::Completed,
+            TaskAttemptStatus::Completed,
+        );
+        record.summary = "Completed with a fallback.".to_string();
+        record.retry_reason =
+            Some("模型回退：opencode/hy3-free -> opencode/mimo-v2.5-free；accepted".to_string());
+        record.attempts[0].worker_model = Some("opencode/hy3-free".to_string());
+        record.attempts[0].error = Some("HTTP 429 rate limit exceeded".to_string());
+
+        let mut second_attempt = record.attempts[0].clone();
+        second_attempt.attempt = 2;
+        second_attempt.worker_model = Some("opencode/mimo-v2.5-free".to_string());
+        second_attempt.error = Some("api_key=do-not-expose".to_string());
+        record.attempts.push(second_attempt);
+
+        manager.records.insert(record.task_id.clone(), record);
+
+        let snapshot = manager.snapshot()?;
+        assert_eq!(snapshot.tasks.len(), 1);
+        assert_eq!(
+            snapshot.tasks[0].retry_reason.as_deref(),
+            Some("模型回退：opencode/hy3-free -> opencode/mimo-v2.5-free；accepted")
+        );
+        assert_eq!(
+            snapshot.tasks[0].summary_head,
+            "Completed with a fallback.；模型回退链：opencode/hy3-free -> opencode/mimo-v2.5-free"
+        );
+        assert!(!snapshot.tasks[0].summary_head.contains("429"));
+        assert!(!snapshot.tasks[0].summary_head.contains("api_key"));
+        Ok(())
+    }
+
+    #[test]
     fn task_manager_snapshot_includes_route_transform_artifacts() -> Result<()> {
         let mut manager = TaskManager::new();
         manager.records.insert(
@@ -8444,6 +10385,281 @@ mod tests {
         assert!(record.contains(r#""status": "lost""#));
         assert!(record.contains("timed out waiting for outcome"));
         Ok(())
+    }
+
+    #[test]
+    fn worker_activity_prevents_stale_timeout() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = test_task("task_active_worker");
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::Opencode,
+            worker_command: Some("printf noop".to_string()),
+            worker_model: None,
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
+        };
+        let queued_task = QueuedTask {
+            store: store.clone(),
+            workspace: temp_dir.path().to_path_buf(),
+            task: task.clone(),
+            route_attempt: 1,
+            goal: "test goal".to_string(),
+            verification_commands: Vec::new(),
+            config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        };
+        let event_hub = WorkerEventHub::default();
+        let handle: Arc<dyn WorkerSessionHandle> = Arc::new(EventfulHandle {
+            event_hub: event_hub.clone(),
+        });
+        let activity_heartbeat = Arc::new(Mutex::new(
+            Instant::now() - Duration::from_secs(30) - Duration::from_millis(1),
+        ));
+        let subscription = subscribe_to_worker_events_with_activity_and_circuit(
+            &handle,
+            &store,
+            &task.id,
+            &task.goal_id,
+            0,
+            None,
+            Some(activity_heartbeat.clone()),
+            None,
+            ToolCallCircuitBreakerPolicy::default(),
+        )?;
+        let mut record = test_task_record(
+            &task.id,
+            ManagedTaskStatus::Running,
+            TaskAttemptStatus::Running,
+        );
+        record.session_id = handle.session_id();
+        write_task_record(&store, &record)?;
+        let mut manager = TaskManager::new();
+        manager.records.insert(task.id.clone(), record);
+        manager
+            .activity_heartbeats
+            .insert(task.id.clone(), activity_heartbeat);
+        manager.running_tasks.insert(
+            task.id.clone(),
+            RunningTask {
+                store,
+                handle,
+                queued_task,
+                started_at: Instant::now() - Duration::from_secs(30) - Duration::from_millis(1),
+                _subscription: subscription,
+            },
+        );
+
+        event_hub.emit(WorkerEvent::AssistantTextDelta {
+            kind: "acp".to_string(),
+            delta: "still working".to_string(),
+        });
+
+        assert_eq!(manager.sweep_stale_running_tasks()?, 0);
+        assert!(manager.running_tasks.contains_key(&task.id));
+        Ok(())
+    }
+
+    #[test]
+    fn repetitive_tool_calls_trigger_a_circuit_breaker_cancel() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = test_task("task_tool_loop");
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::Opencode,
+            worker_command: Some("printf noop".to_string()),
+            worker_model: None,
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
+        };
+        let queued_task = QueuedTask {
+            store: store.clone(),
+            workspace: temp_dir.path().to_path_buf(),
+            task: task.clone(),
+            route_attempt: 1,
+            goal: "tool loop test".to_string(),
+            verification_commands: Vec::new(),
+            config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        };
+        let event_hub = WorkerEventHub::default();
+        let handle: Arc<dyn WorkerSessionHandle> = Arc::new(EventfulHandle {
+            event_hub: event_hub.clone(),
+        });
+        let circuit_state = Arc::new(Mutex::new(ToolCallCircuitState::default()));
+        let subscription = subscribe_to_worker_events_with_activity_and_circuit(
+            &handle,
+            &store,
+            &task.id,
+            &task.goal_id,
+            0,
+            None,
+            None,
+            Some(circuit_state.clone()),
+            ToolCallCircuitBreakerPolicy::default(),
+        )?;
+        let mut record = test_task_record(
+            &task.id,
+            ManagedTaskStatus::Running,
+            TaskAttemptStatus::Running,
+        );
+        record.session_id = handle.session_id();
+        write_task_record(&store, &record)?;
+        let mut manager = TaskManager::new();
+        manager.records.insert(task.id.clone(), record);
+        manager
+            .tool_call_circuit_states
+            .insert(task.id.clone(), circuit_state);
+        manager.running_tasks.insert(
+            task.id.clone(),
+            RunningTask {
+                store,
+                handle,
+                queued_task,
+                started_at: Instant::now(),
+                _subscription: subscription,
+            },
+        );
+
+        for _ in 0..20 {
+            event_hub.emit(WorkerEvent::ToolCallStarted {
+                kind: "acp".to_string(),
+                tool_name: "edit_file".to_string(),
+                arguments: r#"{"path":"src/lib.rs","patch":"same"}"#.to_string(),
+            });
+        }
+
+        manager.tick()?;
+        let record = manager
+            .records
+            .get(&task.id)
+            .context("missing tool-loop task record")?;
+        assert_eq!(record.status, ManagedTaskStatus::Cancelled);
+        assert!(
+            record
+                .error
+                .as_deref()
+                .is_some_and(|reason| reason.contains("circuit breaker")),
+            "record after circuit cancellation: {record:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tool_call_circuit_breaker_resets_consecutive_signature() {
+        let policy = ToolCallCircuitBreakerPolicy {
+            enabled: true,
+            max_tool_calls: 10,
+            consecutive_threshold: 3,
+        };
+        let state = Arc::new(Mutex::new(ToolCallCircuitState::default()));
+
+        record_tool_call_for_circuit_breaker(&state, &policy, "read_file", "{\"path\":\"a\"}");
+        record_tool_call_for_circuit_breaker(&state, &policy, "read_file", "{\"path\":\"a\"}");
+        record_tool_call_for_circuit_breaker(&state, &policy, "read_file", "{\"path\":\"b\"}");
+        {
+            let state = state
+                .lock()
+                .expect("circuit state lock should not be poisoned");
+            assert_eq!(state.total_calls, 3);
+            assert_eq!(state.consecutive_calls, 1);
+            assert!(state.trigger_reason.is_none());
+        }
+
+        record_tool_call_for_circuit_breaker(&state, &policy, "read_file", "{\"path\":\"b\"}");
+        record_tool_call_for_circuit_breaker(&state, &policy, "read_file", "{\"path\":\"b\"}");
+        let state = state
+            .lock()
+            .expect("circuit state lock should not be poisoned");
+        assert_eq!(state.total_calls, 5);
+        assert_eq!(state.consecutive_calls, 3);
+        assert!(
+            state
+                .trigger_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("read_file"))
+        );
+    }
+
+    #[test]
+    fn tool_call_circuit_breaker_normalizes_json_argument_order() {
+        let policy = ToolCallCircuitBreakerPolicy {
+            enabled: true,
+            max_tool_calls: 10,
+            consecutive_threshold: 2,
+        };
+        let state = Arc::new(Mutex::new(ToolCallCircuitState::default()));
+
+        record_tool_call_for_circuit_breaker(
+            &state,
+            &policy,
+            "edit_file",
+            r#"{"path":"src/lib.rs","patch":"same"}"#,
+        );
+        record_tool_call_for_circuit_breaker(
+            &state,
+            &policy,
+            "edit_file",
+            r#"{"patch":"same","path":"src/lib.rs"}"#,
+        );
+
+        let state = state
+            .lock()
+            .expect("circuit state lock should not be poisoned");
+        assert_eq!(state.consecutive_calls, 2);
+        assert!(state.trigger_reason.is_some());
+    }
+
+    #[test]
+    fn tool_call_circuit_breaker_enforces_total_call_limit() {
+        let policy = ToolCallCircuitBreakerPolicy {
+            enabled: true,
+            max_tool_calls: 3,
+            consecutive_threshold: 100,
+        };
+        let state = Arc::new(Mutex::new(ToolCallCircuitState::default()));
+
+        for path in ["a", "b", "c"] {
+            record_tool_call_for_circuit_breaker(
+                &state,
+                &policy,
+                "read_file",
+                &format!("{{\"path\":\"{path}\"}}"),
+            );
+        }
+
+        let state = state
+            .lock()
+            .expect("circuit state lock should not be poisoned");
+        assert_eq!(state.total_calls, 3);
+        assert!(
+            state
+                .trigger_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("maximum tool call limit"))
+        );
     }
 
     #[test]
@@ -8879,7 +11095,7 @@ mod tests {
             first_release.display()
         );
         let second_command = format!(
-            "sh -c 'while [ ! -f \"{}\" ]; do sleep 0.01; done; echo second-ok'",
+            "sh -c 'while [ ! -f \"{}\" ]; do sleep 0.01; done; mkdir -p .gearbox-agent/evidence; printf verified > .gearbox-agent/evidence/receipt.md; printf \"done\\nEVIDENCE_RECORDED: .gearbox-agent/evidence/receipt.md\\n\" > \"$GEARBOX_WORKER_LAST_MESSAGE\"; echo second-ok'",
             second_release.display()
         );
         let first_config = WorkerConfig {
@@ -9240,6 +11456,126 @@ mod tests {
             Some(task.id.as_str())
         );
 
+        let record = fs::read_to_string(store.worker_dir(&task.id).join("task-record.json"))?;
+        assert!(record.contains(r#""status": "cancelled""#));
+        Ok(())
+    }
+
+    #[test]
+    fn wait_for_with_cancellation_returns_completion_event() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = test_task("task_wait_completion_event");
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::Opencode,
+            worker_command: Some("printf worker-ok".to_string()),
+            worker_model: None,
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
+        };
+        let mut manager = TaskManager::new();
+        manager.start(WorkerStartRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &task,
+            route_attempt: 1,
+            goal: "test goal",
+            verification_commands: &[],
+            config: &config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        })?;
+
+        let run = manager
+            .wait_for_with_cancellation(&task.id, None)?
+            .context("completion channel should produce a terminal run")?;
+        assert_eq!(run.result.status, WorkerStatus::Succeeded);
+        let stdout_path = run
+            .result
+            .stdout_path
+            .as_deref()
+            .context("completion run should record stdout path")?;
+        assert_eq!(fs::read_to_string(stdout_path)?.trim(), "worker-ok");
+        Ok(())
+    }
+
+    #[test]
+    fn wait_for_with_cancellation_reports_channel_disconnect() {
+        let mut manager = TaskManager::new();
+        let (sender, receiver) = std::sync::mpsc::channel::<FinishedTaskMessage>();
+        manager.finished_task_rx = receiver;
+        drop(sender);
+
+        let error = manager
+            .wait_for_with_cancellation("task_channel_disconnect", None)
+            .expect_err("disconnected completion channel must be visible");
+        assert!(format!("{error:#}").contains("channel disconnected"));
+    }
+
+    #[test]
+    fn wait_for_with_cancellation_returns_cancelled_without_fixed_polling() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = test_task("task_wait_cancel_token");
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::Opencode,
+            worker_command: Some("sh -c 'sleep 5'".to_string()),
+            worker_model: None,
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
+        };
+        let mut manager = TaskManager::new();
+        let cancellation_token = CancellationToken::new();
+        manager.start(WorkerStartRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &task,
+            route_attempt: 1,
+            goal: "test goal",
+            verification_commands: &[],
+            config: &config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        })?;
+
+        let wait_task_id = task.id.clone();
+        let wait_token = cancellation_token.clone();
+        let waiter = std::thread::spawn(move || {
+            (
+                manager.wait_for_with_cancellation(&wait_task_id, Some(&wait_token)),
+                manager,
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        cancellation_token.cancel();
+
+        let (result, mut manager) = waiter.join().expect("wait thread should not panic");
+        assert!(result?.is_none());
+        manager.cancel_task(&task.id)?;
+        let error = manager
+            .wait_for(&task.id)
+            .expect_err("cancelled worker should not complete");
+        assert!(format!("{error:#}").contains("cancelled"));
         let record = fs::read_to_string(store.worker_dir(&task.id).join("task-record.json"))?;
         assert!(record.contains(r#""status": "cancelled""#));
         Ok(())
@@ -9754,7 +12090,7 @@ mod tests {
     // ── Phase 5 tests ──
 
     #[test]
-    fn cancelled_and_interrupted_do_not_emit_completion_notification() {
+    fn cancelled_and_interrupted_emit_completion_notification() {
         let cancelled = test_task_record(
             "task_cancelled",
             ManagedTaskStatus::Cancelled,
@@ -9766,8 +12102,24 @@ mod tests {
             TaskAttemptStatus::Interrupted,
         );
 
-        assert!(!CompletionNotifier::should_notify(&cancelled));
-        assert!(!CompletionNotifier::should_notify(&interrupted));
+        assert!(CompletionNotifier::should_notify(&cancelled));
+        assert!(CompletionNotifier::should_notify(&interrupted));
+        assert!(
+            CompletionNotifier::build_notification(
+                &cancelled,
+                &cancelled.started_at,
+                &cancelled.started_at,
+            )
+            .is_some()
+        );
+        assert!(
+            CompletionNotifier::build_notification(
+                &interrupted,
+                &interrupted.started_at,
+                &interrupted.started_at,
+            )
+            .is_some()
+        );
         assert!(CompletionNotifier::should_notify(&test_task_record(
             "task_completed",
             ManagedTaskStatus::Completed,
@@ -9839,6 +12191,79 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_and_interrupted_notifications_buffer_and_flush() -> Result<()> {
+        let notifier = CompletionNotifier::new();
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        for (task_id, status, attempt_status) in [
+            (
+                "task_cancelled_notification",
+                ManagedTaskStatus::Cancelled,
+                TaskAttemptStatus::Cancelled,
+            ),
+            (
+                "task_interrupted_notification",
+                ManagedTaskStatus::Interrupted,
+                TaskAttemptStatus::Interrupted,
+            ),
+        ] {
+            let mut record = test_task_record(task_id, status, attempt_status);
+            record.run_epoch = 1;
+            record.started_at = timestamp();
+            record.finished_at = Some(timestamp());
+            let notification = CompletionNotifier::build_notification(
+                &record,
+                &record.started_at,
+                record
+                    .finished_at
+                    .as_ref()
+                    .context("missing finish timestamp")?,
+            )
+            .context("terminal cancellation should build a notification")?;
+            assert_eq!(
+                notifier.try_notify(
+                    notification,
+                    ParentSessionState::Streaming,
+                    &|_, _| Ok(()),
+                    &|_, _| Ok(()),
+                )?,
+                NotificationResult::Buffered
+            );
+        }
+
+        let results = notifier.flush_buffer(
+            "parent_cancel_notification",
+            ParentSessionState::Idle,
+            &{
+                let delivered = delivered.clone();
+                move |task_id, epoch| {
+                    delivered
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("mutex"))?
+                        .push((task_id.to_string(), epoch));
+                    Ok(())
+                }
+            },
+            &|_, _| Ok(()),
+            &|_| Ok(None),
+        )?;
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| **result == NotificationResult::Sent)
+                .count(),
+            2
+        );
+        assert_eq!(
+            delivered
+                .lock()
+                .map_err(|_| anyhow::anyhow!("mutex"))?
+                .len(),
+            2
+        );
+        Ok(())
+    }
+
+    #[test]
     fn completion_notification_includes_summary_head_and_continuation_hint() -> Result<()> {
         let mut record = test_task_record(
             "task_notification_content",
@@ -9863,6 +12288,81 @@ mod tests {
                 .continuation_hint
                 .contains("Follow up from the Gear panel")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn completion_notification_omits_model_chain_for_same_model_retries() -> Result<()> {
+        let mut record = test_task_record(
+            "task_notification_same_model",
+            ManagedTaskStatus::Completed,
+            TaskAttemptStatus::Completed,
+        );
+        record.summary = "Head line\nTail line".to_string();
+        record.attempts[0].worker_model = Some("opencode/hy3-free".to_string());
+        record.attempts[0].error = Some("HTTP 429 rate limit exceeded".to_string());
+
+        let mut second_attempt = record.attempts[0].clone();
+        second_attempt.attempt = 2;
+        second_attempt.error = Some("provider_secret=do-not-expose".to_string());
+        record.attempts.push(second_attempt);
+        record.run_epoch = 2;
+        record.started_at = timestamp();
+        record.finished_at = Some(timestamp());
+
+        let notification = CompletionNotifier::build_notification(
+            &record,
+            &record.started_at,
+            record.finished_at.as_ref().unwrap(),
+        )
+        .context("should build notification for same-model retries")?;
+
+        assert_eq!(notification.summary_head, "Head line");
+        assert!(!notification.summary_head.contains("429"));
+        assert!(!notification.summary_head.contains("provider_secret"));
+        Ok(())
+    }
+
+    #[test]
+    fn completion_notification_includes_safe_three_model_fallback_chain() -> Result<()> {
+        let mut record = test_task_record(
+            "task_notification_three_model_fallback",
+            ManagedTaskStatus::Completed,
+            TaskAttemptStatus::Completed,
+        );
+        record.summary = "Head line\nTail line".to_string();
+        record.attempts[0].worker_model = Some("opencode/hy3-free".to_string());
+        record.attempts[0].error = Some("HTTP 429 rate limit exceeded".to_string());
+
+        let mut second_attempt = record.attempts[0].clone();
+        second_attempt.attempt = 2;
+        second_attempt.worker_model = Some("opencode/mimo-v2.5-free".to_string());
+        second_attempt.error = Some("provider_secret=do-not-expose".to_string());
+        record.attempts.push(second_attempt);
+
+        let mut third_attempt = record.attempts[1].clone();
+        third_attempt.attempt = 3;
+        third_attempt.worker_model = Some("opencode/deepseek-v4-flash-free".to_string());
+        third_attempt.error = Some("Authorization: Bearer do-not-expose".to_string());
+        record.attempts.push(third_attempt);
+        record.run_epoch = 3;
+        record.started_at = timestamp();
+        record.finished_at = Some(timestamp());
+
+        let notification = CompletionNotifier::build_notification(
+            &record,
+            &record.started_at,
+            record.finished_at.as_ref().unwrap(),
+        )
+        .context("should build notification for three-model fallback")?;
+
+        assert_eq!(
+            notification.summary_head,
+            "Head line；模型回退链：opencode/hy3-free -> opencode/mimo-v2.5-free -> opencode/deepseek-v4-flash-free"
+        );
+        assert!(!notification.summary_head.contains("429"));
+        assert!(!notification.summary_head.contains("provider_secret"));
+        assert!(!notification.summary_head.contains("Authorization"));
         Ok(())
     }
 
@@ -10003,7 +12503,10 @@ mod tests {
         let attempts = delivery_attempts
             .lock()
             .map_err(|_| anyhow::anyhow!("mutex"))?;
-        assert_eq!(*attempts, 2, "delivery should retry once before failing");
+        assert_eq!(
+            *attempts, 6,
+            "delivery should exhaust the bounded redelivery window before failing"
+        );
         let failed_epochs = failed_epochs.lock().map_err(|_| anyhow::anyhow!("mutex"))?;
         assert_eq!(
             failed_epochs.as_slice(),
@@ -10077,6 +12580,79 @@ mod tests {
         assert!(
             failed_epochs.is_empty(),
             "transient failure should not write failed epoch"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn delivery_redelivers_within_bounded_failure_window() -> Result<()> {
+        let notifier = CompletionNotifier::new();
+        let delivery_attempts = Arc::new(Mutex::new(0usize));
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let failed_epochs = Arc::new(Mutex::new(Vec::new()));
+        let mut record = test_task_record(
+            "task_delivery_redelivery",
+            ManagedTaskStatus::Completed,
+            TaskAttemptStatus::Completed,
+        );
+        record.run_epoch = 3;
+        record.started_at = timestamp();
+        record.finished_at = Some(timestamp());
+
+        let notification = CompletionNotifier::build_notification(
+            &record,
+            &record.started_at,
+            record.finished_at.as_ref().unwrap(),
+        )
+        .context("should build notification for completed task")?;
+
+        let result = notifier.try_notify(
+            notification,
+            ParentSessionState::Idle,
+            &{
+                let delivery_attempts = delivery_attempts.clone();
+                let delivered = delivered.clone();
+                move |task_id, epoch| {
+                    let mut attempts = delivery_attempts
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("mutex"))?;
+                    *attempts += 1;
+                    if *attempts <= 4 {
+                        bail!("temporary delivery failure for {task_id} epoch {epoch}");
+                    }
+                    delivered
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("mutex"))?
+                        .push((task_id.to_string(), epoch));
+                    Ok(())
+                }
+            },
+            &|task_id, epoch| {
+                failed_epochs
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("mutex"))?
+                    .push((task_id.to_string(), epoch));
+                Ok(())
+            },
+        )?;
+
+        assert_eq!(result, NotificationResult::Sent);
+        let attempts = delivery_attempts
+            .lock()
+            .map_err(|_| anyhow::anyhow!("mutex"))?;
+        assert_eq!(
+            *attempts, 5,
+            "delivery should succeed on the second attempt of the third round"
+        );
+        let delivered = delivered.lock().map_err(|_| anyhow::anyhow!("mutex"))?;
+        assert_eq!(
+            delivered.as_slice(),
+            &[("task_delivery_redelivery".to_string(), 3)]
+        );
+        let failed_epochs = failed_epochs.lock().map_err(|_| anyhow::anyhow!("mutex"))?;
+        assert!(
+            failed_epochs.is_empty(),
+            "recovery inside the redelivery window should not write failed epoch"
         );
         Ok(())
     }
@@ -10909,6 +13485,97 @@ mod tests {
     }
 
     #[test]
+    fn terminal_resident_revive_does_not_replay_stale_worker_events() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task_id = "task_revive_event_epoch".to_string();
+        let reset_calls = Arc::new(AtomicUsize::new(0));
+        let follow_ups = Arc::new(Mutex::new(Vec::new()));
+        let event_hub = WorkerEventHub::default();
+        event_hub.emit(WorkerEvent::AssistantTextDelta {
+            kind: "history-aware".to_string(),
+            delta: "stale-history-marker".to_string(),
+        });
+        let handle: Arc<dyn WorkerSessionHandle> = Arc::new(HistoryAwareReviveHandle {
+            event_hub,
+            reset_calls: reset_calls.clone(),
+            follow_ups: follow_ups.clone(),
+        });
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::Opencode,
+            worker_command: None,
+            worker_model: None,
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: true,
+            require_worker: false,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
+        };
+        let queued_task = QueuedTask {
+            store: store.clone(),
+            workspace: temp_dir.path().to_path_buf(),
+            task: test_task(&task_id),
+            route_attempt: 1,
+            goal: "revive event epoch test".to_string(),
+            verification_commands: Vec::new(),
+            config: config.clone(),
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        };
+        let mut manager = TaskManager::new();
+        manager.apply_worker_config(&config);
+        let mut record = test_task_record(
+            &task_id,
+            ManagedTaskStatus::Completed,
+            TaskAttemptStatus::Completed,
+        );
+        record.residency_state = ResidencyState::Resident;
+        record.run_epoch = 4;
+        manager.records.insert(task_id.clone(), record);
+        manager.resident_tasks.insert(
+            task_id.clone(),
+            ResidentTask {
+                handle: handle.clone(),
+                queued_task,
+            },
+        );
+        manager
+            .control
+            .set_current(task_id.clone(), ManagedTaskStatus::Completed, Some(handle))?;
+
+        assert_eq!(
+            manager.send_follow_up_task(&task_id, "new epoch".to_string())?,
+            SendOutcome::Revive(OutcomeContext {
+                task_id: Some(task_id.clone()),
+                run_epoch: Some(4),
+                ..OutcomeContext::default()
+            })
+        );
+        assert_eq!(reset_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            follow_ups
+                .lock()
+                .map_err(|_| anyhow::anyhow!("history-aware follow-up mutex poisoned"))?
+                .as_slice(),
+            ["new epoch"]
+        );
+        let evidence = fs::read_to_string(store.worker_dir(&task_id).join("worker-events.jsonl"))?;
+        assert!(evidence.contains("turn_started"));
+        assert!(
+            !evidence.contains("\"delta_length\":20"),
+            "resident revive must not project stale history into the new epoch"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn terminal_resident_task_revives_with_new_epoch_and_running_tracking() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let store = StateStore::new(temp_dir.path());
@@ -11080,7 +13747,9 @@ mod tests {
             coordinator_brief: None,
             route_hint: None,
         };
-        let handle: Arc<dyn WorkerSessionHandle> = Arc::new(FakeReviveFailureHandle);
+        let handle: Arc<dyn WorkerSessionHandle> = Arc::new(FakeReviveFailureHandle {
+            error_message: "simulated revive delivery failure",
+        });
         let mut manager = TaskManager::new();
         manager.apply_worker_config(&queued_task.config);
         let mut record = test_task_record(
@@ -11134,6 +13803,87 @@ mod tests {
             .get(&task_id)
             .context("missing restored resident task")?;
         assert!(manager.concurrency.can_start(&resident.queued_task));
+
+        let gate_paths = fs::read_dir(store.root().join("prompt-dispatch-gates"))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(gate_paths.len(), 1);
+        let gate: PromptDispatchGate =
+            serde_json::from_str(&fs::read_to_string(gate_paths[0].path())?)?;
+        assert_eq!(gate.status, PromptDispatchGateStatus::Failed);
+
+        let retry_error = manager
+            .send_follow_up_task(&task_id, "continue".to_string())
+            .expect_err("failed terminal revive should remain retryable");
+        assert!(
+            retry_error
+                .to_string()
+                .contains("simulated revive delivery failure")
+        );
+
+        let steer_error = manager
+            .steer_task(&task_id, "steer".to_string())
+            .expect_err("failed terminal steer should remain retryable");
+        assert!(
+            steer_error
+                .to_string()
+                .contains("simulated revive delivery failure")
+        );
+        let gate_statuses = fs::read_dir(store.root().join("prompt-dispatch-gates"))?
+            .map(|entry| -> Result<PromptDispatchGate> {
+                let path = entry?.path();
+                Ok(serde_json::from_str(&fs::read_to_string(path)?)?)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(gate_statuses.len(), 2);
+        assert!(
+            gate_statuses
+                .iter()
+                .all(|gate| gate.status == PromptDispatchGateStatus::Failed)
+        );
+
+        manager
+            .resident_tasks
+            .get_mut(&task_id)
+            .context("missing resident task for ambiguous retry")?
+            .handle = Arc::new(FakeReviveFailureHandle {
+            error_message: "JSON Parse error: Unexpected end of JSON input",
+        });
+        assert_eq!(
+            manager.send_follow_up_task(&task_id, "ambiguous".to_string())?,
+            SendOutcome::PossiblyAccepted(OutcomeContext {
+                task_id: Some(task_id.clone()),
+                run_epoch: Some(7),
+                ..OutcomeContext::default()
+            })
+        );
+        let running_record = manager
+            .records
+            .get(&task_id)
+            .context("missing running record after ambiguous revive")?;
+        assert_eq!(running_record.status, ManagedTaskStatus::Running);
+        assert_eq!(running_record.run_epoch, 8);
+        assert!(manager.running_tasks.contains_key(&task_id));
+        assert!(!manager.resident_tasks.contains_key(&task_id));
+        assert_eq!(
+            manager.send_follow_up_task(&task_id, "ambiguous".to_string())?,
+            SendOutcome::Noop(OutcomeContext {
+                task_id: Some(task_id.clone()),
+                run_epoch: Some(8),
+                ..OutcomeContext::default()
+            })
+        );
+        let gate_statuses = fs::read_dir(store.root().join("prompt-dispatch-gates"))?
+            .map(|entry| -> Result<PromptDispatchGate> {
+                let path = entry?.path();
+                Ok(serde_json::from_str(&fs::read_to_string(path)?)?)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(gate_statuses.len(), 3);
+        assert!(
+            gate_statuses
+                .iter()
+                .any(|gate| gate.status == PromptDispatchGateStatus::PossiblyAccepted)
+        );
         Ok(())
     }
 
@@ -11411,6 +14161,7 @@ mod tests {
                 QueuedMessageKind::FollowUp,
                 message.to_string(),
                 Some(format!("session-{index}")),
+                None,
             )?;
         }
 
@@ -11428,6 +14179,130 @@ mod tests {
                 .map(|message| message.message)
                 .collect::<Vec<_>>(),
             vec!["second".to_string(), "third".to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn queued_message_delivery_retries_after_start_failure() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let target_store = StateStore::new(temp_dir.path().join("target"));
+        target_store.initialize()?;
+        let follow_up_attempts = Arc::new(AtomicUsize::new(0));
+        let steer_deliveries = Arc::new(AtomicUsize::new(0));
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::ZedAgent,
+            worker_command: None,
+            worker_model: None,
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
+        };
+        let mut manager = TaskManager::new();
+        manager.apply_worker_config(&config);
+        manager.set_worker_registry(WorkerRegistry::with_native_backend(Arc::new(
+            FailOnceFollowUpBackend {
+                follow_up_attempts: follow_up_attempts.clone(),
+                steer_deliveries: steer_deliveries.clone(),
+            },
+        )));
+
+        let busy_queued_task = QueuedTask {
+            store: StateStore::new(temp_dir.path().join("busy")),
+            workspace: temp_dir.path().to_path_buf(),
+            task: test_task("task_busy_for_queued_message"),
+            route_attempt: 1,
+            goal: "busy fixture".to_string(),
+            verification_commands: Vec::new(),
+            config: config.clone(),
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        };
+        assert!(manager.concurrency.acquire(&busy_queued_task));
+        manager.running_tasks.insert(
+            busy_queued_task.task.id.clone(),
+            RunningTask {
+                store: busy_queued_task.store.clone(),
+                handle: Arc::new(FakeHangingHandle),
+                queued_task: busy_queued_task.clone(),
+                started_at: Instant::now(),
+                _subscription: None,
+            },
+        );
+
+        let target_task = test_task("task_queued_message_retry");
+        manager.start(WorkerStartRequest {
+            store: &target_store,
+            workspace: temp_dir.path(),
+            task: &target_task,
+            route_attempt: 1,
+            goal: "queued message retry fixture",
+            verification_commands: &[],
+            config: &config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        })?;
+        assert_eq!(
+            manager.send_follow_up_task(&target_task.id, "wake parent".to_string())?,
+            SendOutcome::Queued(OutcomeContext {
+                task_id: Some(target_task.id.clone()),
+                run_epoch: Some(0),
+                ..OutcomeContext::default()
+            })
+        );
+        assert_eq!(
+            manager.steer_task(&target_task.id, "steer parent".to_string())?,
+            SteerOutcome::Queued(OutcomeContext {
+                task_id: Some(target_task.id.clone()),
+                run_epoch: Some(0),
+                ..OutcomeContext::default()
+            })
+        );
+
+        let busy = manager
+            .running_tasks
+            .remove(&busy_queued_task.task.id)
+            .context("busy task disappeared")?;
+        manager.concurrency.release(&busy.queued_task);
+        manager.process_queue()?;
+
+        for _ in 0..50 {
+            manager.tick()?;
+            if manager.completed_runs.contains_key(&target_task.id) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(manager.completed_runs.contains_key(&target_task.id));
+        assert_eq!(
+            follow_up_attempts.load(Ordering::SeqCst),
+            2,
+            "a queued message must be retried after its initial delivery failure"
+        );
+        assert_eq!(steer_deliveries.load(Ordering::SeqCst), 1);
+        let gate_statuses = fs::read_dir(target_store.root().join("prompt-dispatch-gates"))?
+            .map(|entry| -> Result<_> {
+                let entry = entry?;
+                let gate: PromptDispatchGate =
+                    serde_json::from_str(&fs::read_to_string(entry.path())?)?;
+                Ok(gate.status)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(gate_statuses.len(), 2);
+        assert!(
+            gate_statuses
+                .iter()
+                .all(|status| *status == PromptDispatchGateStatus::Accepted)
         );
         Ok(())
     }

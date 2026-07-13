@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -289,7 +289,7 @@ impl WorkerCategory {
     fn prompt_append(self) -> Option<&'static str> {
         match self {
             Self::Quick | Self::Repair | Self::Deep | Self::Visual | Self::Custom => Some(
-                "Focus on implementation, keep changes minimal, and do not ask the user questions.",
+                "Focus on implementation, keep changes minimal, and do not ask the user questions. Before claiming completion, run the relevant verification, write a non-empty regular receipt under .gearbox-agent/evidence/, and end the response with EVIDENCE_RECORDED: <path>.",
             ),
             Self::Review => Some(
                 "This is an independent review turn. Do not edit files; inspect the evidence and return concrete findings.",
@@ -298,7 +298,7 @@ impl WorkerCategory {
                 "This is a read-only exploration turn. Do not edit files; trace the code and summarize the evidence.",
             ),
             Self::ZedNative => Some(
-                "This is a native Zed worker turn. Stay bounded and do not create a Gear goal loop recursively.",
+                "This is a native Zed worker turn. Stay bounded and do not create a Gear goal loop recursively. Before claiming completion, run the relevant verification, write a non-empty regular receipt under .gearbox-agent/evidence/, and end the response with EVIDENCE_RECORDED: <path>.",
             ),
         }
     }
@@ -336,6 +336,10 @@ impl WorkerCategory {
                 }
             }
         }
+    }
+
+    pub fn requires_evidence_receipt(self) -> bool {
+        self.tool_policy().can_write
     }
 }
 
@@ -1286,6 +1290,90 @@ pub struct WorkerResult {
     pub outcome_path: PathBuf,
 }
 
+const WORKER_EVIDENCE_MARKER: &str = "EVIDENCE_RECORDED:";
+const WORKER_EVIDENCE_ROOT: &str = ".gearbox-agent/evidence";
+
+pub fn category_requires_worker_evidence(category: &str) -> bool {
+    WorkerCategory::parse(category).is_some_and(WorkerCategory::requires_evidence_receipt)
+}
+
+pub fn worker_kind_supports_evidence_contract(worker_kind: &str) -> bool {
+    matches!(
+        WorkerKind::parse(worker_kind),
+        Some(WorkerKind::OpencodeSession | WorkerKind::Codex)
+    )
+}
+
+pub fn validate_worker_evidence_receipt(
+    result: &WorkerResult,
+    workspace: &Path,
+) -> std::result::Result<PathBuf, String> {
+    let marker_path = worker_evidence_marker_path(result)
+        .ok_or_else(|| format!("missing {WORKER_EVIDENCE_MARKER} marker in worker output"))?;
+    let workspace = workspace
+        .canonicalize()
+        .map_err(|error| format!("failed to resolve workspace: {error}"))?;
+    let evidence_root = workspace.join(WORKER_EVIDENCE_ROOT);
+    let real_evidence_root = evidence_root
+        .canonicalize()
+        .map_err(|error| format!("evidence root is unavailable: {error}"))?;
+    if !is_strictly_inside(&real_evidence_root, &workspace) {
+        return Err("evidence root resolves outside workspace".to_string());
+    }
+
+    let marker_path = PathBuf::from(marker_path);
+    let candidate = if marker_path.is_absolute() {
+        marker_path
+    } else {
+        workspace.join(marker_path)
+    };
+    let metadata = fs::symlink_metadata(&candidate)
+        .map_err(|error| format!("receipt path is unavailable: {error}"))?;
+    if metadata.file_type().is_symlink() {
+        return Err("receipt path must not be a symbolic link".to_string());
+    }
+    let real_candidate = candidate
+        .canonicalize()
+        .map_err(|error| format!("failed to resolve receipt path: {error}"))?;
+    if !is_strictly_inside(&real_candidate, &real_evidence_root) {
+        return Err(format!(
+            "receipt path `{}` is outside `{WORKER_EVIDENCE_ROOT}`",
+            real_candidate.display()
+        ));
+    }
+    let metadata = fs::metadata(&candidate)
+        .map_err(|error| format!("failed to inspect receipt path: {error}"))?;
+    if !metadata.is_file() {
+        return Err("receipt path must be a regular file".to_string());
+    }
+    if metadata.len() == 0 {
+        return Err("receipt file must not be empty".to_string());
+    }
+    Ok(real_candidate)
+}
+
+fn worker_evidence_marker_path(result: &WorkerResult) -> Option<String> {
+    let last_message_path = result.last_message_path.as_ref()?;
+    let output = fs::read_to_string(last_message_path).ok()?;
+    extract_worker_evidence_marker(&output)
+}
+
+fn extract_worker_evidence_marker(output: &str) -> Option<String> {
+    output.lines().rev().find_map(|line| {
+        let (_, value) = line.split_once(WORKER_EVIDENCE_MARKER)?;
+        value.split_whitespace().next().map(|path| {
+            path.trim_matches(|character: char| {
+                matches!(character, '"' | '\'' | '`' | ',' | ']' | '}')
+            })
+            .to_string()
+        })
+    })
+}
+
+fn is_strictly_inside(path: &Path, directory: &Path) -> bool {
+    path != directory && path.starts_with(directory)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkerOutcome {
     pub status: WorkerStatus,
@@ -1384,6 +1472,8 @@ pub type WorkerTurnOutcome = WorkerResult;
 
 pub type WorkerEventListener = Arc<dyn Fn(WorkerEvent) + Send + Sync>;
 
+const WORKER_EVENT_HISTORY_LIMIT: usize = 64;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerEvent {
@@ -1445,6 +1535,12 @@ impl WorkerEventHub {
     pub fn emit(&self, event: WorkerEvent) {
         self.subscriptions.emit(event);
     }
+
+    /// Drop replayable events at a resident-session epoch boundary.
+    pub fn clear_history(&self) -> Result<()> {
+        self.subscriptions.clear_history()?;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1465,16 +1561,28 @@ impl WorkerSubscription {
 #[derive(Default)]
 struct WorkerSessionSubscriptions {
     listeners: Mutex<HashMap<usize, WorkerEventListener>>,
+    history: Mutex<VecDeque<WorkerEvent>>,
     next_listener_id: AtomicUsize,
 }
 
 impl WorkerSessionSubscriptions {
     fn subscribe(self: &Arc<Self>, listener: WorkerEventListener) -> Result<WorkerSubscription> {
         let subscription_id = self.next_listener_id.fetch_add(1, Ordering::Relaxed);
-        self.listeners
-            .lock()
-            .map_err(|_| anyhow::anyhow!("worker session subscription mutex poisoned"))?
-            .insert(subscription_id, listener);
+        let replay = {
+            let history = self
+                .history
+                .lock()
+                .map_err(|_| anyhow::anyhow!("worker event history mutex poisoned"))?;
+            let replay = history.iter().cloned().collect::<Vec<_>>();
+            self.listeners
+                .lock()
+                .map_err(|_| anyhow::anyhow!("worker event subscription mutex poisoned"))?
+                .insert(subscription_id, listener.clone());
+            replay
+        };
+        for event in replay {
+            listener(event);
+        }
         Ok(WorkerSubscription {
             subscriptions: Arc::downgrade(self),
             subscription_id,
@@ -1482,11 +1590,23 @@ impl WorkerSessionSubscriptions {
     }
 
     fn emit(&self, event: WorkerEvent) {
-        let listeners = self
-            .listeners
-            .lock()
-            .map(|listeners| listeners.values().cloned().collect::<Vec<_>>())
-            .unwrap_or_default();
+        let listeners = match self.history.lock() {
+            Ok(mut history) => {
+                history.push_back(event.clone());
+                while history.len() > WORKER_EVENT_HISTORY_LIMIT {
+                    history.pop_front();
+                }
+                self.listeners
+                    .lock()
+                    .map(|listeners| listeners.values().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default()
+            }
+            Err(_) => self
+                .listeners
+                .lock()
+                .map(|listeners| listeners.values().cloned().collect::<Vec<_>>())
+                .unwrap_or_default(),
+        };
         for listener in listeners {
             listener(event.clone());
         }
@@ -1497,6 +1617,14 @@ impl WorkerSessionSubscriptions {
             .listeners
             .lock()
             .map(|mut listeners| listeners.remove(&subscription_id));
+    }
+
+    fn clear_history(&self) -> Result<()> {
+        self.history
+            .lock()
+            .map_err(|_| anyhow::anyhow!("worker event history mutex poisoned"))?
+            .clear();
+        Ok(())
     }
 }
 
@@ -1666,6 +1794,9 @@ pub trait WorkerSessionHandle: Send + Sync {
     }
     fn subscribe(&self, _listener: WorkerEventListener) -> Result<WorkerSubscription> {
         bail!("worker session does not support event subscriptions")
+    }
+    fn reset_event_history(&self) -> Result<()> {
+        Ok(())
     }
     fn wait_for_idle(&self) -> Result<WorkerTurnOutcome> {
         self.wait_for_result()
@@ -2210,6 +2341,40 @@ fn write_resident_session_descriptor(
     Ok(path)
 }
 
+pub(crate) fn discard_resident_session_for_model_switch(
+    store: &StateStore,
+    workspace: &Path,
+    task_id: &str,
+    worker_kind: WorkerKind,
+    worker_model: Option<&str>,
+) -> Result<()> {
+    let path = resident_session_descriptor_path(store, task_id);
+    let Some(descriptor) = read_resident_session_descriptor(store, task_id)? else {
+        return Ok(());
+    };
+    if descriptor.worker_kind != worker_kind || descriptor.workspace != workspace.to_string_lossy()
+    {
+        return Ok(());
+    }
+    let descriptor_worker_model = descriptor
+        .worker_model
+        .as_deref()
+        .filter(|model| !model.is_empty());
+    let requested_worker_model = worker_model.filter(|model| !model.is_empty());
+    if let (Some(descriptor_worker_model), Some(requested_worker_model)) =
+        (descriptor_worker_model, requested_worker_model)
+        && descriptor_worker_model != requested_worker_model
+    {
+        fs::remove_file(&path).with_context(|| {
+            format!(
+                "failed to discard resident session descriptor for model switch {}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
 fn prepare_resident_session_descriptor(
     store: &StateStore,
     workspace: &Path,
@@ -2231,7 +2396,22 @@ fn prepare_resident_session_descriptor(
         if !descriptor.resumable {
             bail!("resident session was disposed and cannot be reattached");
         }
-        descriptor.worker_model = worker_model.or(descriptor.worker_model);
+        let descriptor_worker_model = descriptor
+            .worker_model
+            .as_deref()
+            .filter(|model| !model.is_empty());
+        let requested_worker_model = worker_model.as_deref().filter(|model| !model.is_empty());
+        if let (Some(descriptor_worker_model), Some(requested_worker_model)) =
+            (descriptor_worker_model, requested_worker_model)
+            && descriptor_worker_model != requested_worker_model
+        {
+            bail!(
+                "resident session worker model binding mismatch: descriptor has `{descriptor_worker_model}`, requested `{requested_worker_model}`"
+            );
+        }
+        descriptor.worker_model = worker_model
+            .filter(|model| !model.is_empty())
+            .or(descriptor.worker_model);
         descriptor.resume_count = descriptor.resume_count.saturating_add(1);
         descriptor.last_resumed_at = Some(timestamp());
         return descriptor.seal();
@@ -2369,6 +2549,26 @@ fn usage_from_value(value: &Value, fallback_model: Option<&str>) -> Option<Broke
     object
         .values()
         .find_map(|value| usage_from_value(value, fallback_model))
+}
+
+fn merge_worker_usage(previous: Option<BrokerUsage>, current: BrokerUsage) -> BrokerUsage {
+    let add = |left: Option<u64>, right: Option<u64>| match (left, right) {
+        (Some(left), Some(right)) => Some(left.saturating_add(right)),
+        _ => None,
+    };
+    let Some(previous) = previous else {
+        return current;
+    };
+
+    BrokerUsage {
+        requested_tokens: add(previous.requested_tokens, current.requested_tokens),
+        actual_tokens: add(previous.actual_tokens, current.actual_tokens),
+        model: current.model,
+        duration_ms: add(previous.duration_ms, current.duration_ms),
+        cost_micros: add(previous.cost_micros, current.cost_micros),
+        cache_hit: current.cache_hit.or(previous.cache_hit),
+        unavailable_reason: current.unavailable_reason.or(previous.unavailable_reason),
+    }
 }
 
 fn extract_worker_usage(
@@ -2834,6 +3034,11 @@ impl CommandWorkerSessionHandle {
         if let Some(usage) =
             extract_worker_usage(&output.stdout, &output.stderr, self.worker_model.as_deref())
         {
+            let usage = if self.supports_interaction {
+                merge_worker_usage(self.read_persisted_usage()?, usage)
+            } else {
+                usage
+            };
             self.store.write_worker_file(
                 &self.task_id,
                 "usage.json",
@@ -3136,6 +3341,18 @@ impl CommandWorkerSessionHandle {
         Ok(())
     }
 
+    fn read_persisted_usage(&self) -> Result<Option<BrokerUsage>> {
+        let path = self.store.worker_dir(&self.task_id).join("usage.json");
+        if !path.exists() {
+            return Ok(None);
+        }
+        let contents = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read worker usage artifact {}", path.display()))?;
+        let usage = serde_json::from_str(&contents)
+            .with_context(|| format!("failed to parse worker usage artifact {}", path.display()))?;
+        Ok(Some(usage))
+    }
+
     fn set_last_output(&self, output: Option<String>) -> Result<()> {
         *self
             .last_output
@@ -3242,6 +3459,13 @@ impl WorkerSessionHandle for CommandWorkerSessionHandle {
             bail!("command-backed worker sessions do not support event subscriptions");
         }
         self.subscriptions.subscribe(listener)
+    }
+
+    fn reset_event_history(&self) -> Result<()> {
+        if self.supports_interaction {
+            self.subscriptions.clear_history()?;
+        }
+        Ok(())
     }
 
     fn wait_for_idle(&self) -> Result<WorkerTurnOutcome> {
@@ -3741,12 +3965,21 @@ pub fn write_result_and_outcome(
     task_id: &str,
     result: &WorkerResult,
 ) -> Result<()> {
+    let outcome = worker_outcome_from_result(result)?;
+    write_result_and_outcome_with_outcome(store, task_id, result, &outcome)
+}
+
+pub fn write_result_and_outcome_with_outcome(
+    store: &StateStore,
+    task_id: &str,
+    result: &WorkerResult,
+    outcome: &WorkerOutcome,
+) -> Result<()> {
     let result_json =
         serde_json::to_string_pretty(result).context("failed to serialize worker result")?;
     store.write_worker_file(task_id, "result.json", &format!("{result_json}\n"))?;
-    let outcome = worker_outcome_from_result(result)?;
     let outcome_json =
-        serde_json::to_string_pretty(&outcome).context("failed to serialize worker outcome")?;
+        serde_json::to_string_pretty(outcome).context("failed to serialize worker outcome")?;
     store.write_worker_file(task_id, "outcome.json", &format!("{outcome_json}\n"))?;
     Ok(())
 }
@@ -3785,12 +4018,187 @@ pub fn sanitize_model_fields(fields: &HashMap<String, String>) -> HashMap<String
 mod tests {
     use std::{
         fs,
+        path::PathBuf,
         sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
     use anyhow::Result;
 
     use super::*;
+
+    fn evidence_test_result(last_message_path: PathBuf) -> WorkerResult {
+        WorkerResult {
+            status: WorkerStatus::Succeeded,
+            command: None,
+            exit_code: Some(0),
+            summary: "worker completed".to_string(),
+            packet_path: PathBuf::from("packet.json"),
+            prompt_path: PathBuf::from("prompt.md"),
+            stdout_path: None,
+            stderr_path: None,
+            last_message_path: Some(last_message_path),
+            result_path: PathBuf::from("result.json"),
+            outcome_path: PathBuf::from("outcome.json"),
+        }
+    }
+
+    #[test]
+    fn worker_evidence_receipt_accepts_non_empty_file_inside_workspace_root() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let evidence_root = workspace.path().join(".gearbox-agent/evidence");
+        fs::create_dir_all(&evidence_root)?;
+        let receipt = evidence_root.join("receipt.md");
+        fs::write(&receipt, "verified\n")?;
+        let message = workspace.path().join("last-message.md");
+        fs::write(
+            &message,
+            "done\nEVIDENCE_RECORDED: .gearbox-agent/evidence/receipt.md\n",
+        )?;
+
+        let validated =
+            validate_worker_evidence_receipt(&evidence_test_result(message), workspace.path())
+                .map_err(anyhow::Error::msg)?;
+
+        assert_eq!(validated, receipt.canonicalize()?);
+        Ok(())
+    }
+
+    #[test]
+    fn worker_evidence_receipt_rejects_empty_directory_and_escape_paths() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let evidence_root = workspace.path().join(".gearbox-agent/evidence");
+        fs::create_dir_all(&evidence_root)?;
+        let message = workspace.path().join("last-message.md");
+
+        let empty_receipt = evidence_root.join("empty.md");
+        fs::write(&empty_receipt, "")?;
+        fs::write(
+            &message,
+            "EVIDENCE_RECORDED: .gearbox-agent/evidence/empty.md",
+        )?;
+        let empty_error = validate_worker_evidence_receipt(
+            &evidence_test_result(message.clone()),
+            workspace.path(),
+        )
+        .expect_err("empty receipt must be rejected");
+        assert!(empty_error.contains("must not be empty"));
+
+        let directory = evidence_root.join("directory");
+        fs::create_dir(&directory)?;
+        fs::write(
+            &message,
+            "EVIDENCE_RECORDED: .gearbox-agent/evidence/directory",
+        )?;
+        let directory_error = validate_worker_evidence_receipt(
+            &evidence_test_result(message.clone()),
+            workspace.path(),
+        )
+        .expect_err("directory receipt must be rejected");
+        assert!(directory_error.contains("regular file"));
+
+        let workspace_name = workspace
+            .path()
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .ok_or_else(|| anyhow::anyhow!("temporary workspace has no file name"))?;
+        let outside_name = format!("{workspace_name}-outside.md");
+        let outside = workspace
+            .path()
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("temporary workspace has no parent"))?
+            .join(&outside_name);
+        fs::write(&outside, "outside\n")?;
+        fs::write(&message, format!("EVIDENCE_RECORDED: ../{outside_name}"))?;
+        let escape_error =
+            validate_worker_evidence_receipt(&evidence_test_result(message), workspace.path())
+                .expect_err("receipt outside evidence root must be rejected");
+        assert!(escape_error.contains("outside"));
+        fs::remove_file(outside)?;
+        Ok(())
+    }
+
+    #[test]
+    fn worker_evidence_receipt_does_not_fallback_from_stdout_when_final_message_exists()
+    -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let evidence_root = workspace.path().join(".gearbox-agent/evidence");
+        fs::create_dir_all(&evidence_root)?;
+        fs::write(evidence_root.join("receipt.md"), "verified\n")?;
+        let message = workspace.path().join("last-message.md");
+        fs::write(&message, "completed without the final marker\n")?;
+        let stdout = workspace.path().join("stdout.log");
+        fs::write(
+            &stdout,
+            "EVIDENCE_RECORDED: .gearbox-agent/evidence/receipt.md\n",
+        )?;
+        let mut result = evidence_test_result(message);
+        result.stdout_path = Some(stdout);
+
+        let error = validate_worker_evidence_receipt(&result, workspace.path())
+            .expect_err("stdout must not replace a present final message");
+        assert!(error.contains("missing EVIDENCE_RECORDED:"));
+        Ok(())
+    }
+
+    #[test]
+    fn worker_evidence_receipt_requires_a_final_message_artifact() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let evidence_root = workspace.path().join(".gearbox-agent/evidence");
+        fs::create_dir_all(&evidence_root)?;
+        fs::write(evidence_root.join("receipt.md"), "verified\n")?;
+        let stdout = workspace.path().join("stdout.log");
+        fs::write(
+            &stdout,
+            "EVIDENCE_RECORDED: .gearbox-agent/evidence/receipt.md\n",
+        )?;
+        let mut result = evidence_test_result(workspace.path().join("missing-message.md"));
+        result.last_message_path = None;
+        result.stdout_path = Some(stdout);
+
+        let error = validate_worker_evidence_receipt(&result, workspace.path())
+            .expect_err("artifact-contract workers must provide a final message");
+        assert!(error.contains("missing EVIDENCE_RECORDED:"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_evidence_receipt_rejects_symbolic_link() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir()?;
+        let evidence_root = workspace.path().join(".gearbox-agent/evidence");
+        fs::create_dir_all(&evidence_root)?;
+        let outside = workspace.path().join("outside.md");
+        fs::write(&outside, "outside\n")?;
+        let link = evidence_root.join("link.md");
+        symlink(&outside, &link)?;
+        let message = workspace.path().join("last-message.md");
+        fs::write(
+            &message,
+            "EVIDENCE_RECORDED: .gearbox-agent/evidence/link.md",
+        )?;
+
+        let error =
+            validate_worker_evidence_receipt(&evidence_test_result(message), workspace.path())
+                .expect_err("symbolic link receipt must be rejected");
+        assert!(error.contains("symbolic link"));
+        Ok(())
+    }
+
+    #[test]
+    fn worker_evidence_gate_only_targets_write_capable_categories() {
+        assert!(category_requires_worker_evidence("quick"));
+        assert!(category_requires_worker_evidence("deep"));
+        assert!(category_requires_worker_evidence("zed-native"));
+        assert!(!category_requires_worker_evidence("review"));
+        assert!(!category_requires_worker_evidence("explore"));
+        assert!(!category_requires_worker_evidence("librarian"));
+        assert!(!worker_kind_supports_evidence_contract("opencode"));
+        assert!(worker_kind_supports_evidence_contract("opencode_session"));
+        assert!(worker_kind_supports_evidence_contract("codex"));
+        assert!(!worker_kind_supports_evidence_contract("claude"));
+    }
 
     #[test]
     fn parses_worker_kind_aliases() {
@@ -5364,6 +5772,129 @@ mod tests {
     }
 
     #[test]
+    fn opencode_session_worker_accumulates_usage_across_turns() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = Task {
+            id: "task_opencode_session_usage_accumulation".to_string(),
+            goal_id: "goal_test".to_string(),
+            title: "test opencode session usage accumulation".to_string(),
+            kind: crate::state::TaskKind::Edit,
+            status: crate::state::TaskStatus::Pending,
+            assigned_worker: Some("opencode_session".to_string()),
+            attempt: 1,
+            parent_task_id: None,
+            scope: Scope::new(Vec::new(), Vec::new(), 10),
+            inputs: crate::state::TaskInputs::default(),
+            outputs: crate::state::TaskOutputs::default(),
+        };
+        let script_path = temp_dir.path().join("usage-worker.sh");
+        std::fs::write(
+            &script_path,
+            r#"#!/bin/sh
+case "$GEARBOX_WORKER_PROMPT" in
+  *follow-up-1.md) printf '%s\n' '{"usage":{"input_tokens":7,"output_tokens":4,"cost_micros":5,"duration_ms":13,"cache_hit":true}}' ;;
+  *steer-2.md) printf '%s\n' '{"usage":{"input_tokens":9,"output_tokens":6,"cost_micros":7,"duration_ms":17,"cache_hit":true}}' ;;
+  *) printf '%s\n' '{"usage":{"input_tokens":5,"output_tokens":2,"cost_micros":3,"duration_ms":11,"cache_hit":false}}' ;;
+esac
+"#,
+        )?;
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::OpencodeSession,
+            worker_command: Some(format!(
+                "sh {}",
+                shell_single_quote(&script_path.to_string_lossy())
+            )),
+            worker_model: None,
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
+            require_worker: true,
+        };
+        let handle = OpencodeSessionWorker {}.start(WorkerStartRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &task,
+            route_attempt: 1,
+            goal: "test goal",
+            verification_commands: &[],
+            config: &config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        })?;
+
+        handle.wait_for_result()?;
+        let first = handle.usage().context("first turn usage missing")?;
+        assert_eq!(first.requested_tokens, Some(5));
+        assert_eq!(first.actual_tokens, Some(2));
+        assert_eq!(first.cost_micros, Some(3));
+        assert_eq!(first.duration_ms, Some(11));
+
+        handle.send_follow_up("continue with a second turn".to_string())?;
+        let second = handle.usage().context("second turn usage missing")?;
+        assert_eq!(second.requested_tokens, Some(12));
+        assert_eq!(second.actual_tokens, Some(6));
+        assert_eq!(second.cost_micros, Some(8));
+        assert_eq!(second.duration_ms, Some(24));
+
+        handle.steer("finish with a third turn".to_string())?;
+        let third = handle.usage().context("third turn usage missing")?;
+        assert_eq!(third.requested_tokens, Some(21));
+        assert_eq!(third.actual_tokens, Some(12));
+        assert_eq!(third.cost_micros, Some(15));
+        assert_eq!(third.duration_ms, Some(41));
+        assert_eq!(third.cache_hit, Some(true));
+        let persisted: BrokerUsage = serde_json::from_slice(&std::fs::read(
+            store.worker_dir(&task.id).join("usage.json"),
+        )?)?;
+        assert_eq!(persisted, third);
+        Ok(())
+    }
+
+    #[test]
+    fn merge_worker_usage_keeps_unknown_totals_unknown() {
+        let previous = BrokerUsage {
+            requested_tokens: None,
+            actual_tokens: Some(5),
+            model: "previous-model".to_string(),
+            duration_ms: Some(3),
+            cost_micros: None,
+            cache_hit: Some(false),
+            unavailable_reason: Some("previous usage was incomplete".to_string()),
+        };
+        let current = BrokerUsage {
+            requested_tokens: Some(8),
+            actual_tokens: None,
+            model: "current-model".to_string(),
+            duration_ms: Some(7),
+            cost_micros: Some(11),
+            cache_hit: Some(true),
+            unavailable_reason: None,
+        };
+
+        let merged = merge_worker_usage(Some(previous), current);
+
+        assert_eq!(merged.requested_tokens, None);
+        assert_eq!(merged.actual_tokens, None);
+        assert_eq!(merged.duration_ms, Some(10));
+        assert_eq!(merged.cost_micros, None);
+        assert_eq!(merged.model, "current-model");
+        assert_eq!(merged.cache_hit, Some(true));
+        assert_eq!(
+            merged.unavailable_reason.as_deref(),
+            Some("previous usage was incomplete")
+        );
+    }
+
+    #[test]
     fn opencode_session_worker_reattaches_from_persisted_descriptor() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let store = StateStore::new(temp_dir.path());
@@ -5392,7 +5923,7 @@ mod tests {
                 "sh {}",
                 shell_single_quote(&script_path.to_string_lossy())
             )),
-            worker_model: None,
+            worker_model: Some("provider/model-a".to_string()),
             worker_routes: Vec::new(),
             unavailable_worker_models: Vec::new(),
             premium_worker_budget: 1,
@@ -5461,7 +5992,51 @@ mod tests {
         let resumed_descriptor: ResidentSessionDescriptor =
             serde_json::from_slice(&std::fs::read(&descriptor_path)?)?;
         assert_eq!(resumed_descriptor.resume_count, 1);
+        assert_eq!(
+            resumed_descriptor.worker_model.as_deref(),
+            Some("provider/model-a")
+        );
         resumed_descriptor.validate()?;
+
+        let mut mismatched_config = config.clone();
+        mismatched_config.worker_model = Some("provider/model-b".to_string());
+        let mismatch_error = match (OpencodeSessionWorker {}).start(WorkerStartRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &task,
+            route_attempt: 1,
+            goal: "test goal",
+            verification_commands: &[],
+            config: &mismatched_config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        }) {
+            Ok(_) => panic!("a resident session must reject a different worker model"),
+            Err(error) => error,
+        };
+        assert!(
+            mismatch_error
+                .to_string()
+                .contains("resident session worker model binding mismatch")
+        );
+        assert_eq!(
+            std::fs::read_to_string(store.worker_dir(&task.id).join("packet.json.session"))?,
+            "provider-session-1:true\n"
+        );
+        let unchanged_descriptor: ResidentSessionDescriptor =
+            serde_json::from_slice(&std::fs::read(&descriptor_path)?)?;
+        assert_eq!(unchanged_descriptor.resume_count, 1);
+        assert_eq!(
+            unchanged_descriptor.provider_session_id.as_deref(),
+            Some("provider-session-1")
+        );
+        assert_eq!(
+            unchanged_descriptor.worker_model.as_deref(),
+            Some("provider/model-a")
+        );
+        unchanged_descriptor.validate()?;
         Ok(())
     }
 
@@ -5586,6 +6161,78 @@ mod tests {
         );
         assert!(store.worker_dir(&task.id).join("interrupt-1.md").exists());
         assert!(store.worker_dir(&task.id).join("revive-1.md").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn worker_event_hub_replays_bounded_history_to_late_subscribers() -> Result<()> {
+        let subscriptions = Arc::new(WorkerSessionSubscriptions::default());
+        subscriptions.emit(WorkerEvent::TurnStarted {
+            kind: "acp".to_string(),
+            prompt_path: PathBuf::from("prompt.md"),
+        });
+        subscriptions.emit(WorkerEvent::AssistantTextDelta {
+            kind: "acp".to_string(),
+            delta: "early output".to_string(),
+        });
+
+        let received_events = Arc::new(Mutex::new(Vec::new()));
+        let received_events_for_listener = received_events.clone();
+        let _subscription = subscriptions.subscribe(Arc::new(move |event| {
+            if let Ok(mut events) = received_events_for_listener.lock() {
+                events.push(event);
+            }
+        }))?;
+
+        {
+            let events = received_events
+                .lock()
+                .map_err(|_| anyhow::anyhow!("worker event mutex poisoned"))?;
+            assert_eq!(events.len(), 2);
+            assert!(matches!(events[0], WorkerEvent::TurnStarted { .. }));
+            assert!(matches!(events[1], WorkerEvent::AssistantTextDelta { .. }));
+        }
+
+        subscriptions.emit(WorkerEvent::TurnFinished {
+            kind: "acp".to_string(),
+            result_path: PathBuf::from("result.json"),
+            outcome_path: PathBuf::from("outcome.json"),
+            summary: "completed".to_string(),
+        });
+        assert_eq!(
+            received_events
+                .lock()
+                .map_err(|_| anyhow::anyhow!("worker event mutex poisoned"))?
+                .len(),
+            3
+        );
+
+        for index in 0..(WORKER_EVENT_HISTORY_LIMIT + 6) {
+            subscriptions.emit(WorkerEvent::AssistantTextDelta {
+                kind: "acp".to_string(),
+                delta: format!("delta-{index}"),
+            });
+        }
+
+        let late_events = Arc::new(Mutex::new(Vec::new()));
+        let late_events_for_listener = late_events.clone();
+        let _late_subscription = subscriptions.subscribe(Arc::new(move |event| {
+            if let Ok(mut events) = late_events_for_listener.lock() {
+                events.push(event);
+            }
+        }))?;
+        let late_events = late_events
+            .lock()
+            .map_err(|_| anyhow::anyhow!("worker event mutex poisoned"))?;
+        assert_eq!(late_events.len(), WORKER_EVENT_HISTORY_LIMIT);
+        assert!(matches!(
+            &late_events[0],
+            WorkerEvent::AssistantTextDelta { delta, .. } if delta == "delta-6"
+        ));
+        assert!(matches!(
+            late_events.last(),
+            Some(WorkerEvent::AssistantTextDelta { delta, .. }) if delta == "delta-69"
+        ));
         Ok(())
     }
 

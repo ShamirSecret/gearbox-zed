@@ -1184,6 +1184,22 @@ impl ThreadView {
         });
     }
 
+    fn show_gear_dispatch_warning(&self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        workspace.update(cx, |workspace, cx| {
+            let toast = StatusToast::new(message, cx, |this, _cx| {
+                this.icon(
+                    Icon::new(IconName::Warning)
+                        .size(IconSize::Small)
+                        .color(Color::Warning),
+                )
+            });
+            workspace.toggle_status_toast(toast, cx);
+        });
+    }
+
     pub(crate) fn as_native_connection(
         &self,
         cx: &App,
@@ -2023,11 +2039,16 @@ impl ThreadView {
             let outcome = connection.send_follow_up_gear_task(&self.session_id, prompt, cx)?;
             (outcome.is_accepted(), outcome.reason())
         };
+        let warning = Self::gear_ambiguous_dispatch_warning(accepted, reason.as_deref());
         if !accepted {
             if let Some(reason) = reason {
                 self.handle_thread_error(anyhow::anyhow!(reason), cx);
             }
             return Ok(false);
+        }
+
+        if let Some(warning) = warning {
+            self.show_gear_dispatch_warning(warning, cx);
         }
 
         self.thread_error.take();
@@ -4134,6 +4155,8 @@ impl ThreadView {
                 )
             })
             .children(tasks.into_iter().enumerate().map(|(index, task)| {
+                let has_model_fallback =
+                    Self::gear_task_has_model_fallback(task.retry_reason.as_deref());
                 v_flex()
                     .p_2()
                     .gap_1()
@@ -4203,9 +4226,24 @@ impl ThreadView {
                             ),
                     )
                     .child(
-                        Label::new(task.summary_head.clone())
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
+                        h_flex()
+                            .gap_1()
+                            .when(has_model_fallback, |this| {
+                                this.child(
+                                    Icon::new(IconName::Warning)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Warning),
+                                )
+                            })
+                            .child(
+                                Label::new(task.summary_head.clone())
+                                    .size(LabelSize::Small)
+                                    .color(if has_model_fallback {
+                                        Color::Warning
+                                    } else {
+                                        Color::Muted
+                                    }),
+                            ),
                     )
                     .when(!task.continuation_hint.is_empty(), |this| {
                         this.child(
@@ -4645,6 +4683,21 @@ impl ThreadView {
         worker_model
             .map(|worker_model| format!("{worker_kind}:{worker_model}"))
             .unwrap_or_else(|| worker_kind.to_string())
+    }
+
+    fn gear_task_has_model_fallback(retry_reason: Option<&str>) -> bool {
+        retry_reason.is_some_and(|reason| reason.starts_with("模型回退"))
+    }
+
+    fn gear_ambiguous_dispatch_warning(
+        accepted: bool,
+        reason: Option<&str>,
+    ) -> Option<&'static str> {
+        accepted
+            .then_some(reason)
+            .flatten()
+            .filter(|reason| reason.contains("may have been accepted"))
+            .map(|_| "Gear 指令可能已被 provider 接受，正在等待当前 worker 响应，请勿重复发送。")
     }
 
     fn gear_messageability_label(messageability: Option<&agent::GearTaskMessageability>) -> String {
@@ -13770,6 +13823,35 @@ mod tests {
             let snapshot = editor.snapshot(window, cx);
             assert_eq!(editor.selections.newest::<Point>(&snapshot).head().row, 1);
         });
+    }
+
+    #[test]
+    fn gear_task_model_fallback_warning_uses_structured_retry_reason() {
+        assert!(ThreadView::gear_task_has_model_fallback(Some(
+            "模型回退：opencode/hy3-free -> opencode/mimo-v2.5-free"
+        )));
+        assert!(!ThreadView::gear_task_has_model_fallback(Some(
+            "Worker task completed without a fallback"
+        )));
+        assert!(!ThreadView::gear_task_has_model_fallback(None));
+    }
+
+    #[test]
+    fn gear_ambiguous_dispatch_warning_only_targets_accepted_dispatches() {
+        assert!(ThreadView::gear_ambiguous_dispatch_warning(
+            true,
+            Some("follow-up dispatch may have been accepted before an ambiguous provider response")
+        )
+        .is_some_and(|warning| warning.contains("可能已被 provider 接受")));
+        assert!(ThreadView::gear_ambiguous_dispatch_warning(
+            false,
+            Some("follow-up dispatch may have been accepted before an ambiguous provider response")
+        )
+        .is_none());
+        assert!(
+            ThreadView::gear_ambiguous_dispatch_warning(true, Some("other accepted outcome"))
+                .is_none()
+        );
     }
 }
 

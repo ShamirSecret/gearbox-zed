@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
@@ -17,6 +17,37 @@ pub fn timestamp() -> String {
 
 pub fn id_timestamp() -> String {
     Local::now().format("%Y%m%d_%H%M%S_%3f").to_string()
+}
+
+const REPOSITORY_OBSERVATION_PATH_COMPONENT_LIMIT: usize = 64;
+
+fn repository_observation_path_component(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if sanitized.len() <= REPOSITORY_OBSERVATION_PATH_COMPONENT_LIMIT {
+        return sanitized;
+    }
+
+    // Keep long task/session identities distinguishable without exceeding filesystem limits.
+    let digest = format!("{:x}", Sha256::digest(value.as_bytes()));
+    let suffix = &digest[..16];
+    let prefix_length = REPOSITORY_OBSERVATION_PATH_COMPONENT_LIMIT - suffix.len() - 1;
+    let prefix = sanitized.chars().take(prefix_length).collect::<String>();
+    format!("{prefix}-{suffix}")
+}
+
+fn worker_fanout_session_path_component(value: &str) -> String {
+    let sanitized = repository_observation_path_component(value);
+    let digest = format!("{:x}", Sha256::digest(value.as_bytes()));
+    format!("{sanitized}-{}", &digest[..16])
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1163,6 +1194,73 @@ pub struct ModelCallLedgerEntry {
 
 pub const MODEL_CALL_LEDGER_SCHEMA_VERSION: u32 = 1;
 
+pub const WORKER_FANOUT_COUNTER_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerFanoutCounter {
+    pub schema_version: u32,
+    pub session_id: String,
+    pub count: usize,
+    pub updated_at: String,
+}
+
+impl WorkerFanoutCounter {
+    pub fn new(session_id: &str) -> Self {
+        Self {
+            schema_version: WORKER_FANOUT_COUNTER_SCHEMA_VERSION,
+            session_id: session_id.to_string(),
+            count: 0,
+            updated_at: timestamp(),
+        }
+    }
+
+    fn validate(&self, session_id: &str) -> Result<()> {
+        if self.schema_version != WORKER_FANOUT_COUNTER_SCHEMA_VERSION {
+            bail!("unsupported worker fan-out counter schema version");
+        }
+        if session_id.trim().is_empty() || self.session_id != session_id {
+            bail!("worker fan-out counter session binding mismatch");
+        }
+        if self.updated_at.trim().is_empty() {
+            bail!("worker fan-out counter updated_at cannot be empty");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerFanoutDenialReceipt {
+    pub schema_version: u32,
+    pub session_id: String,
+    pub task_id: String,
+    pub count: usize,
+    pub limit: usize,
+    pub reason: String,
+    pub created_at: String,
+}
+
+impl WorkerFanoutDenialReceipt {
+    fn validate(&self) -> Result<()> {
+        if self.schema_version != WORKER_FANOUT_COUNTER_SCHEMA_VERSION {
+            bail!("unsupported worker fan-out denial schema version");
+        }
+        for (field, value) in [
+            ("session_id", self.session_id.as_str()),
+            ("task_id", self.task_id.as_str()),
+            ("reason", self.reason.as_str()),
+            ("created_at", self.created_at.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                bail!("worker fan-out denial {field} cannot be empty");
+            }
+        }
+        if self.limit == 0 || self.count <= self.limit {
+            bail!("worker fan-out denial must record count above a positive limit");
+        }
+        Ok(())
+    }
+}
+
 /// Durable explanation of the worker route selected for one PlanGraph node.
 ///
 /// The tier calculation is deterministic, while the selected phase/model is
@@ -1303,6 +1401,7 @@ pub enum PromptDispatchGateStatus {
     Reserved,
     Held,
     Accepted,
+    PossiblyAccepted,
     Failed,
     Released,
 }
@@ -1341,6 +1440,7 @@ pub struct PromptDispatchGate {
 pub const PROMPT_DISPATCH_GATE_SCHEMA_VERSION: u32 = 1;
 pub const PROMPT_DISPATCH_RESERVATION_TTL_MS: i64 = 30_000;
 pub const PROMPT_DISPATCH_POST_DISPATCH_HOLD_MS: i64 = 2_000;
+pub const PROMPT_DISPATCH_POSSIBLY_ACCEPTED_HOLD_MS: i64 = 30_000;
 
 impl PromptDispatchGate {
     fn blocks_duplicate_dispatch(&self) -> bool {
@@ -1358,6 +1458,12 @@ impl PromptDispatchGate {
                 .map(|deadline| deadline > Local::now().fixed_offset())
                 .unwrap_or(true),
             PromptDispatchGateStatus::Held => self
+                .hold_until
+                .as_deref()
+                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                .map(|deadline| deadline > Local::now().fixed_offset())
+                .unwrap_or(true),
+            PromptDispatchGateStatus::PossiblyAccepted => self
                 .hold_until
                 .as_deref()
                 .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
@@ -1779,6 +1885,11 @@ pub struct RepositoryObservationReceipt {
     pub observed_paths: Vec<String>,
     #[serde(default)]
     pub observed_events: Vec<RepositoryObservationEvent>,
+    /// Git HEAD captured when the repository observation was written.
+    /// Production approval gates compare this identity with the current HEAD
+    /// so an old observation cannot be relabeled as current evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_commit: Option<String>,
     pub status: RepositoryObservationStatus,
     pub issued_at: String,
     pub receipt_hash: String,
@@ -1800,6 +1911,36 @@ impl RepositoryObservationReceipt {
         observed_paths: Vec<String>,
         observed_events: Vec<RepositoryObservationEvent>,
     ) -> Result<Self> {
+        Self::seal_with_capture_commit(
+            role,
+            goal_id,
+            plan_id,
+            plan_revision,
+            plan_hash,
+            worker_task_id,
+            session_id,
+            transcript_sha256,
+            observed_tool_count,
+            observed_paths,
+            observed_events,
+            None,
+        )
+    }
+
+    pub fn seal_with_capture_commit(
+        role: &str,
+        goal_id: &str,
+        plan_id: &str,
+        plan_revision: usize,
+        plan_hash: &str,
+        worker_task_id: &str,
+        session_id: &str,
+        transcript_sha256: Option<String>,
+        observed_tool_count: usize,
+        observed_paths: Vec<String>,
+        observed_events: Vec<RepositoryObservationEvent>,
+        capture_commit: Option<String>,
+    ) -> Result<Self> {
         let mut receipt = Self {
             schema_version: REPOSITORY_OBSERVATION_RECEIPT_SCHEMA_VERSION,
             receipt_id: String::new(),
@@ -1814,6 +1955,7 @@ impl RepositoryObservationReceipt {
             observed_tool_count,
             observed_paths,
             observed_events,
+            capture_commit: capture_commit.map(|commit| commit.trim().to_string()),
             status: RepositoryObservationStatus::Unverified,
             issued_at: timestamp(),
             receipt_hash: String::new(),
@@ -1849,6 +1991,14 @@ impl RepositoryObservationReceipt {
             if value.trim().is_empty() {
                 bail!("repository observation receipt {field} cannot be empty");
             }
+        }
+        if let Some(capture_commit) = self.capture_commit.as_deref()
+            && (capture_commit.len() < 7
+                || !capture_commit
+                    .chars()
+                    .all(|character| character.is_ascii_hexdigit()))
+        {
+            bail!("repository observation capture_commit must be a Git SHA");
         }
         if self.receipt_hash != self.expected_hash()? {
             bail!("repository observation receipt hash mismatch");
@@ -3338,6 +3488,122 @@ impl GoalEpochEvent {
     }
 }
 
+struct ObjectiveEventLedgerScan {
+    event_count: u64,
+    previous_hash: String,
+    active: bool,
+    terminated: bool,
+    duplicate: Option<ObjectiveEvent>,
+}
+
+impl ObjectiveEventLedgerScan {
+    fn empty() -> Self {
+        Self {
+            event_count: 0,
+            previous_hash: "0".repeat(64),
+            active: false,
+            terminated: false,
+            duplicate: None,
+        }
+    }
+}
+
+struct GoalEpochEventLedgerScan {
+    event_count: u64,
+    previous_hash: String,
+    active_epoch: Option<String>,
+    duplicate: Option<GoalEpochEvent>,
+}
+
+impl GoalEpochEventLedgerScan {
+    fn empty() -> Self {
+        Self {
+            event_count: 0,
+            previous_hash: "0".repeat(64),
+            active_epoch: None,
+            duplicate: None,
+        }
+    }
+}
+
+fn scan_objective_event_ledger(
+    path: &Path,
+    objective_id: &str,
+    idempotency_key: &str,
+) -> Result<ObjectiveEventLedgerScan> {
+    if !path.exists() {
+        return Ok(ObjectiveEventLedgerScan::empty());
+    }
+
+    let file =
+        fs::File::open(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut scan = ObjectiveEventLedgerScan::empty();
+    let mut idempotency_keys = HashSet::new();
+    for (sequence, line) in BufReader::new(file).lines().enumerate() {
+        let line = line
+            .with_context(|| format!("failed to read {} line {}", path.display(), sequence + 1))?;
+        let event: ObjectiveEvent = serde_json::from_str(&line)
+            .with_context(|| format!("failed to parse {} line {}", path.display(), sequence + 1))?;
+        let unique_idempotency_key = idempotency_keys.insert(event.idempotency_key.clone());
+        if event.schema_version != OBJECTIVE_EVENT_SCHEMA_VERSION
+            || event.objective_id != objective_id
+            || event.sequence != sequence as u64
+            || event.idempotency_key.trim().is_empty()
+            || !unique_idempotency_key
+            || event.previous_hash != scan.previous_hash
+            || event.event_hash != event.expected_hash()?
+        {
+            bail!("objective event ledger integrity check failed at sequence {sequence}");
+        }
+        validate_objective_event_transition(&mut scan.active, &mut scan.terminated, &event)?;
+        if event.idempotency_key == idempotency_key {
+            scan.duplicate = Some(event.clone());
+        }
+        scan.previous_hash = event.event_hash;
+        scan.event_count += 1;
+    }
+    Ok(scan)
+}
+
+fn scan_goal_epoch_event_ledger(
+    path: &Path,
+    goal_id: &str,
+    idempotency_key: &str,
+) -> Result<GoalEpochEventLedgerScan> {
+    if !path.exists() {
+        return Ok(GoalEpochEventLedgerScan::empty());
+    }
+
+    let file =
+        fs::File::open(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut scan = GoalEpochEventLedgerScan::empty();
+    let mut idempotency_keys = HashSet::new();
+    for (sequence, line) in BufReader::new(file).lines().enumerate() {
+        let line = line
+            .with_context(|| format!("failed to read {} line {}", path.display(), sequence + 1))?;
+        let event: GoalEpochEvent = serde_json::from_str(&line)
+            .with_context(|| format!("failed to parse {} line {}", path.display(), sequence + 1))?;
+        let unique_idempotency_key = idempotency_keys.insert(event.idempotency_key.clone());
+        if event.schema_version != 1
+            || event.goal_id != goal_id
+            || event.sequence != sequence as u64
+            || event.idempotency_key.trim().is_empty()
+            || !unique_idempotency_key
+            || event.previous_hash != scan.previous_hash
+            || event.event_hash != event.expected_hash()?
+        {
+            bail!("goal epoch ledger integrity check failed at sequence {sequence}");
+        }
+        validate_goal_epoch_transition(&mut scan.active_epoch, &event)?;
+        if event.idempotency_key == idempotency_key {
+            scan.duplicate = Some(event.clone());
+        }
+        scan.previous_hash = event.event_hash;
+        scan.event_count += 1;
+    }
+    Ok(scan)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
@@ -3812,35 +4078,25 @@ impl StateStore {
         kind: ObjectiveEventKind,
         payload: Value,
     ) -> Result<ObjectiveEvent> {
-        let existing = self.read_objective_events(objective_id)?;
-        if let Some(recorded) = existing
-            .iter()
-            .find(|event| event.idempotency_key == idempotency_key)
-        {
+        let path = self.objective_events_path(objective_id);
+        let scan = scan_objective_event_ledger(&path, objective_id, idempotency_key)?;
+        if let Some(recorded) = scan.duplicate.as_ref() {
             if recorded.kind == kind && recorded.payload == payload {
                 return Ok(recorded.clone());
             }
             bail!("objective event idempotency key conflicts with an existing event");
         }
-        let previous_hash = existing
-            .last()
-            .map(|event| event.event_hash.clone())
-            .unwrap_or_else(|| "0".repeat(64));
         let event = ObjectiveEvent::seal(
             objective_id,
-            existing.len() as u64,
+            scan.event_count,
             idempotency_key,
             kind,
             payload,
-            previous_hash,
+            scan.previous_hash,
         )?;
-        let mut active = false;
-        let mut terminated = false;
-        for existing_event in &existing {
-            validate_objective_event_transition(&mut active, &mut terminated, existing_event)?;
-        }
+        let mut active = scan.active;
+        let mut terminated = scan.terminated;
         validate_objective_event_transition(&mut active, &mut terminated, &event)?;
-        let path = self.objective_events_path(objective_id);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -3862,15 +4118,18 @@ impl StateStore {
         if !path.exists() {
             return Ok(Vec::new());
         }
-        let contents = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
+        let file =
+            fs::File::open(&path).with_context(|| format!("failed to read {}", path.display()))?;
         let mut events = Vec::new();
         let mut previous_hash = "0".repeat(64);
         let mut active = false;
         let mut terminated = false;
         let mut idempotency_keys = HashSet::new();
-        for (sequence, line) in contents.lines().enumerate() {
-            let event: ObjectiveEvent = serde_json::from_str(line).with_context(|| {
+        for (sequence, line) in BufReader::new(file).lines().enumerate() {
+            let line = line.with_context(|| {
+                format!("failed to read {} line {}", path.display(), sequence + 1)
+            })?;
+            let event: ObjectiveEvent = serde_json::from_str(&line).with_context(|| {
                 format!("failed to parse {} line {}", path.display(), sequence + 1)
             })?;
             if event.schema_version != OBJECTIVE_EVENT_SCHEMA_VERSION
@@ -3958,6 +4217,53 @@ impl StateStore {
 
     pub fn workers_dir(&self) -> PathBuf {
         self.root.join("workers")
+    }
+
+    pub fn worker_fanout_dir(&self) -> PathBuf {
+        self.root.join("worker-fanout")
+    }
+
+    pub fn worker_fanout_dir_for_session(&self, session_id: &str) -> PathBuf {
+        self.worker_fanout_dir()
+            .join(worker_fanout_session_path_component(session_id))
+    }
+
+    pub fn worker_fanout_counter_path_for_session(&self, session_id: &str) -> PathBuf {
+        self.worker_fanout_dir_for_session(session_id)
+            .join("spawn-count.json")
+    }
+
+    pub fn read_worker_fanout_counter(&self, session_id: &str) -> Result<WorkerFanoutCounter> {
+        if session_id.trim().is_empty() {
+            bail!("worker fan-out counter session_id cannot be empty");
+        }
+        let path = self.worker_fanout_counter_path_for_session(session_id);
+        if !path.exists() {
+            return Ok(WorkerFanoutCounter::new(session_id));
+        }
+        let counter: WorkerFanoutCounter = read_json_file(&path)
+            .with_context(|| format!("failed to read worker fan-out counter {}", path.display()))?;
+        counter.validate(session_id)?;
+        Ok(counter)
+    }
+
+    pub fn write_worker_fanout_counter(&self, counter: &WorkerFanoutCounter) -> Result<PathBuf> {
+        counter.validate(&counter.session_id)?;
+        let path = self.worker_fanout_counter_path_for_session(&counter.session_id);
+        write_json_atomic(&path, counter)?;
+        Ok(path)
+    }
+
+    pub fn write_worker_fanout_denial(
+        &self,
+        receipt: &WorkerFanoutDenialReceipt,
+    ) -> Result<PathBuf> {
+        receipt.validate()?;
+        let path = self
+            .worker_fanout_dir_for_session(&receipt.session_id)
+            .join(format!("denied-{}.json", receipt.count));
+        write_json_atomic(&path, receipt)?;
+        Ok(path)
     }
 
     pub fn continuation_dir(&self) -> PathBuf {
@@ -4408,28 +4714,8 @@ impl StateStore {
         {
             bail!("repository observation role must be an ASCII identifier");
         }
-        let task = receipt
-            .worker_task_id
-            .chars()
-            .map(|character| {
-                if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
-                    character
-                } else {
-                    '_'
-                }
-            })
-            .collect::<String>();
-        let session = receipt
-            .session_id
-            .chars()
-            .map(|character| {
-                if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
-                    character
-                } else {
-                    '_'
-                }
-            })
-            .collect::<String>();
+        let task = repository_observation_path_component(&receipt.worker_task_id);
+        let session = repository_observation_path_component(&receipt.session_id);
         let path = self.plan_review_dir(&receipt.goal_id).join(format!(
             "revision-{:03}-{}-{}-{}-repository-observation.json",
             receipt.plan_revision, receipt.role, task, session
@@ -4446,22 +4732,10 @@ impl StateStore {
         worker_task_id: &str,
         session_id: &str,
     ) -> Result<Option<RepositoryObservationReceipt>> {
-        let sanitize = |value: &str| {
-            value
-                .chars()
-                .map(|character| {
-                    if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
-                        character
-                    } else {
-                        '_'
-                    }
-                })
-                .collect::<String>()
-        };
         let path = self.plan_review_dir(goal_id).join(format!(
             "revision-{revision:03}-{role}-{}-{}-repository-observation.json",
-            sanitize(worker_task_id),
-            sanitize(session_id)
+            repository_observation_path_component(worker_task_id),
+            repository_observation_path_component(session_id)
         ));
         if !path.is_file() {
             return Ok(None);
@@ -5126,36 +5400,26 @@ impl StateStore {
         kind: GoalEpochEventKind,
         payload: Value,
     ) -> Result<GoalEpochEvent> {
-        let existing = self.read_goal_epoch_events(goal_id)?;
-        if let Some(recorded) = existing
-            .iter()
-            .find(|event| event.idempotency_key == idempotency_key)
-        {
+        let path = self.goal_epoch_path(goal_id);
+        let scan = scan_goal_epoch_event_ledger(&path, goal_id, idempotency_key)?;
+        if let Some(recorded) = scan.duplicate.as_ref() {
             if recorded.epoch_id == epoch_id && recorded.kind == kind && recorded.payload == payload
             {
                 return Ok(recorded.clone());
             }
             bail!("goal epoch idempotency key conflicts with an existing event");
         }
-        let previous_hash = existing
-            .last()
-            .map(|event| event.event_hash.clone())
-            .unwrap_or_else(|| "0".repeat(64));
         let event = GoalEpochEvent::seal(
             goal_id,
             epoch_id,
-            existing.len() as u64,
+            scan.event_count,
             idempotency_key,
             kind,
             payload,
-            previous_hash,
+            scan.previous_hash,
         )?;
-        let mut active_epoch = None;
-        for existing_event in &existing {
-            validate_goal_epoch_transition(&mut active_epoch, existing_event)?;
-        }
+        let mut active_epoch = scan.active_epoch;
         validate_goal_epoch_transition(&mut active_epoch, &event)?;
-        let path = self.goal_epoch_path(goal_id);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -5332,14 +5596,17 @@ impl StateStore {
         if !path.exists() {
             return Ok(Vec::new());
         }
-        let contents = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
+        let file =
+            fs::File::open(&path).with_context(|| format!("failed to read {}", path.display()))?;
         let mut events = Vec::new();
         let mut previous_hash = "0".repeat(64);
         let mut active_epoch = None;
         let mut idempotency_keys = HashSet::new();
-        for (sequence, line) in contents.lines().enumerate() {
-            let event: GoalEpochEvent = serde_json::from_str(line).with_context(|| {
+        for (sequence, line) in BufReader::new(file).lines().enumerate() {
+            let line = line.with_context(|| {
+                format!("failed to read {} line {}", path.display(), sequence + 1)
+            })?;
+            let event: GoalEpochEvent = serde_json::from_str(&line).with_context(|| {
                 format!("failed to parse {} line {}", path.display(), sequence + 1)
             })?;
             if event.schema_version != 1
@@ -5493,6 +5760,51 @@ impl StateStore {
             .join(format!("{gate_id}.json"))
     }
 
+    fn active_semantic_prompt_dispatch_gate(
+        &self,
+        goal_id: &str,
+        task_id: &str,
+        session_id: &str,
+        message_kind: &str,
+        source: &str,
+        semantic_dedupe_key: &str,
+    ) -> Result<Option<PromptDispatchGate>> {
+        let directory = self.root.join("prompt-dispatch-gates");
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to read {}", directory.display()));
+            }
+        };
+
+        for entry in entries {
+            let path = entry
+                .with_context(|| format!("failed to read {}", directory.display()))?
+                .path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                continue;
+            }
+            let gate: PromptDispatchGate = read_json_file(&path).with_context(|| {
+                format!("failed to read prompt dispatch gate {}", path.display())
+            })?;
+            gate.validate()?;
+            if gate.goal_id == goal_id
+                && gate.task_id == task_id
+                && gate.session_id == session_id
+                && gate.message_kind == message_kind
+                && gate.source == source
+                && gate.semantic_dedupe_key.as_deref() == Some(semantic_dedupe_key)
+                && gate.blocks_duplicate_dispatch()
+            {
+                return Ok(Some(gate));
+            }
+        }
+
+        Ok(None)
+    }
+
     pub fn reserve_prompt_dispatch(
         &self,
         goal_id: &str,
@@ -5578,6 +5890,20 @@ impl StateStore {
         {
             return Ok(PromptDispatchDecision::Duplicate(gate.clone()));
         }
+        if existing.is_none() {
+            if let Some(semantic_dedupe_key) = semantic_dedupe_key.as_deref()
+                && let Some(gate) = self.active_semantic_prompt_dispatch_gate(
+                    goal_id,
+                    task_id,
+                    session_id,
+                    message_kind,
+                    source,
+                    semantic_dedupe_key,
+                )?
+            {
+                return Ok(PromptDispatchDecision::Duplicate(gate));
+            }
+        }
         let now = timestamp();
         let gate = PromptDispatchGate {
             schema_version: PROMPT_DISPATCH_GATE_SCHEMA_VERSION,
@@ -5632,6 +5958,13 @@ impl StateStore {
                         .to_rfc3339(),
                     )
                 }),
+            PromptDispatchGateStatus::PossiblyAccepted => hold_until.or_else(|| {
+                Some(
+                    (Local::now()
+                        + Duration::milliseconds(PROMPT_DISPATCH_POSSIBLY_ACCEPTED_HOLD_MS))
+                    .to_rfc3339(),
+                )
+            }),
             _ => None,
         };
         let reservation_expires_at =
@@ -5917,6 +6250,88 @@ mod epoch_tests {
         let contents = fs::read_to_string(&path)?;
         fs::write(&path, contents.replace("review_required", "complete"))?;
         assert!(store.read_goal_epoch_events("goal-1").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn event_ledger_scanner_tracks_tail_and_idempotent_replay() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+
+        let objective_id = "objective-stream";
+        store.append_objective_event(
+            objective_id,
+            "objective-stream.started",
+            ObjectiveEventKind::Started,
+            json!({ "session_id": "root" }),
+        )?;
+        for index in 0..128 {
+            store.append_objective_event(
+                objective_id,
+                &format!("goal-attached:{index}"),
+                ObjectiveEventKind::GoalAttached,
+                json!({
+                    "goal_id": format!("goal-{index}"),
+                    "epoch_id": format!("epoch-{index}"),
+                }),
+            )?;
+        }
+        let completed = store.append_objective_event(
+            objective_id,
+            "objective-stream.completed",
+            ObjectiveEventKind::Completed,
+            json!({ "goal_id": "goal-127" }),
+        )?;
+        let objective_scan = scan_objective_event_ledger(
+            &store.objective_events_path(objective_id),
+            objective_id,
+            "goal-attached:64",
+        )?;
+        assert_eq!(objective_scan.event_count, 130);
+        assert_eq!(objective_scan.previous_hash, completed.event_hash);
+        assert!(!objective_scan.active);
+        assert!(objective_scan.terminated);
+        assert_eq!(
+            objective_scan
+                .duplicate
+                .as_ref()
+                .map(|event| event.idempotency_key.as_str()),
+            Some("goal-attached:64")
+        );
+
+        let goal_id = "goal-stream";
+        for index in 0..128 {
+            let epoch_id = format!("epoch-{index}");
+            store.append_goal_epoch_event(
+                goal_id,
+                &epoch_id,
+                &format!("{epoch_id}.started"),
+                GoalEpochEventKind::Started,
+                json!({ "plan_revision": index }),
+            )?;
+            store.append_goal_epoch_event(
+                goal_id,
+                &epoch_id,
+                &format!("{epoch_id}.settled"),
+                GoalEpochEventKind::Settled,
+                json!({ "outcome": "complete" }),
+            )?;
+        }
+        let goal_scan = scan_goal_epoch_event_ledger(
+            &store.goal_epoch_path(goal_id),
+            goal_id,
+            "epoch-64.settled",
+        )?;
+        assert_eq!(goal_scan.event_count, 256);
+        assert_eq!(goal_scan.active_epoch, None);
+        assert_eq!(
+            goal_scan
+                .duplicate
+                .as_ref()
+                .map(|event| event.idempotency_key.as_str()),
+            Some("epoch-64.settled")
+        );
         Ok(())
     }
 
@@ -6825,6 +7240,42 @@ mod plan_wave_tests {
     }
 
     #[test]
+    fn repository_observation_capture_commit_is_hashed_and_validated() -> Result<()> {
+        let capture_commit = "a".repeat(40);
+        let receipt = RepositoryObservationReceipt::seal_with_capture_commit(
+            "planner",
+            "goal-capture-commit",
+            "plan-capture-commit",
+            1,
+            "plan-hash",
+            "worker-capture-commit",
+            "session-capture-commit",
+            Some("transcript-hash".to_string()),
+            1,
+            vec!["src/lib.rs".to_string()],
+            vec![RepositoryObservationEvent {
+                operation: "read".to_string(),
+                path: "src/lib.rs".to_string(),
+                event_id: "tool-capture-commit".to_string(),
+                event_hash: "event-capture-commit".to_string(),
+                observed_at: timestamp(),
+            }],
+            Some(capture_commit.clone()),
+        )?;
+        assert_eq!(
+            receipt.capture_commit.as_deref(),
+            Some(capture_commit.as_str())
+        );
+        receipt.validate()?;
+
+        let mut tampered = serde_json::to_value(&receipt)?;
+        tampered["capture_commit"] = serde_json::json!("b".repeat(40));
+        let tampered: RepositoryObservationReceipt = serde_json::from_value(tampered)?;
+        assert!(tampered.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
     fn repository_observation_index_keeps_same_role_calls_separate() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let store = StateStore::new(temp_dir.path());
@@ -6884,6 +7335,52 @@ mod plan_wave_tests {
                     "planner",
                     "planner_goal-wave_repair",
                     "session-planner-repair",
+                )?
+                .is_some()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn repository_observation_paths_bound_long_task_and_session_ids() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task_id = format!("planner_{}", "goal-wave-".repeat(40));
+        let session_id = format!("session_{}", "worker-wave-".repeat(40));
+        let receipt = RepositoryObservationReceipt::seal(
+            "planner",
+            "goal-long-identities",
+            "pending_goal-long-identities",
+            0,
+            "pending",
+            &task_id,
+            &session_id,
+            Some("transcript-long-identities".to_string()),
+            1,
+            vec!["src/lib.rs".to_string()],
+            vec![RepositoryObservationEvent {
+                operation: "read".to_string(),
+                path: "src/lib.rs".to_string(),
+                event_id: "tool-long-identities".to_string(),
+                event_hash: "event-long-identities".to_string(),
+                observed_at: timestamp(),
+            }],
+        )?;
+        let path = store.write_repository_observation_receipt(&receipt)?;
+        let filename_length = path
+            .file_name()
+            .context("repository observation path has no filename")?
+            .len();
+        assert!(filename_length < 255);
+        assert!(
+            store
+                .read_repository_observation_receipt_for_task(
+                    "goal-long-identities",
+                    0,
+                    "planner",
+                    &task_id,
+                    &session_id,
                 )?
                 .is_some()
         );
@@ -6981,6 +7478,66 @@ mod plan_wave_tests {
     }
 
     #[test]
+    fn prompt_dispatch_gate_preserves_possibly_accepted_hold_until_expiry() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let acquired = match store.reserve_prompt_dispatch(
+            "goal-gate",
+            "task-gate-ambiguous",
+            "session-gate",
+            2,
+            "follow_up",
+            "continuation",
+            "resume after an ambiguous response",
+        )? {
+            PromptDispatchDecision::Acquired(gate) => gate,
+            PromptDispatchDecision::Duplicate(_) => {
+                bail!("first ambiguous reservation unexpectedly deduplicated")
+            }
+        };
+        let possibly_accepted = store.settle_prompt_dispatch_gate(
+            &acquired,
+            PromptDispatchGateStatus::PossiblyAccepted,
+            None,
+            Some("dispatch may have been accepted".to_string()),
+        )?;
+        assert!(possibly_accepted.hold_until.is_some());
+        assert!(matches!(
+            store.reserve_prompt_dispatch(
+                "goal-gate",
+                "task-gate-ambiguous",
+                "session-gate",
+                2,
+                "follow_up",
+                "continuation",
+                "resume after an ambiguous response",
+            )?,
+            PromptDispatchDecision::Duplicate(_)
+        ));
+
+        let expired = PromptDispatchGate {
+            hold_until: Some((Local::now() - Duration::seconds(1)).to_rfc3339()),
+            ..possibly_accepted
+        }
+        .seal()?;
+        write_json_atomic(&store.prompt_dispatch_gate_path(&expired.gate_id), &expired)?;
+        assert!(matches!(
+            store.reserve_prompt_dispatch(
+                "goal-gate",
+                "task-gate-ambiguous",
+                "session-gate",
+                2,
+                "follow_up",
+                "continuation",
+                "resume after an ambiguous response",
+            )?,
+            PromptDispatchDecision::Acquired(_)
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn prompt_dispatch_gate_supports_semantic_dedupe_and_expired_reservation_recovery() -> Result<()>
     {
         let temp_dir = tempfile::tempdir()?;
@@ -7014,9 +7571,31 @@ mod plan_wave_tests {
         )?;
         assert!(matches!(duplicate, PromptDispatchDecision::Duplicate(_)));
 
+        let possibly_accepted = store.settle_prompt_dispatch_gate(
+            &acquired,
+            PromptDispatchGateStatus::PossiblyAccepted,
+            None,
+            Some("provider response was ambiguous".to_string()),
+        )?;
+
+        let next_epoch_duplicate = store.reserve_prompt_dispatch_with_options(
+            "goal-gate",
+            "task-gate",
+            "session-gate",
+            4,
+            "follow_up",
+            "continuation",
+            "resume task with another wording",
+            Some("next-step"),
+        )?;
+        assert!(matches!(
+            next_epoch_duplicate,
+            PromptDispatchDecision::Duplicate(_)
+        ));
+
         let expired = PromptDispatchGate {
-            reservation_expires_at: Some((Local::now() - Duration::seconds(1)).to_rfc3339()),
-            ..acquired
+            hold_until: Some((Local::now() - Duration::seconds(1)).to_rfc3339()),
+            ..possibly_accepted
         }
         .seal()?;
         let path = store.prompt_dispatch_gate_path(&expired.gate_id);

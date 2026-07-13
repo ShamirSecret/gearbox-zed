@@ -33,10 +33,10 @@ use crate::state::{
     GoalEpochEventKind, GoalGraphNode, GoalRunLeaseGuard, GoalStatus, ModelCallKind,
     ObjectiveEpochOutcomeReceipt, ObjectiveEventKind, ObjectiveGraph, ObjectivePolicy,
     ObjectiveStatus, PlanNodeRunLedger, PlanNodeRunStatus, PlanWaveNodeStatus, PlanWaveRunLedger,
-    PromptSettleAction, PromptSettleEvent, RepositoryObservationStatus, ReviewEpochBundle,
-    ReviewEpochRoleEvidence, Scope, Session, SettledBudgetUsage, StateStore, Task, TaskInputs,
-    TaskKind, TaskOutputs, TaskRouteDecisionReceipt, TaskStatus, WorkLineage, event, id_timestamp,
-    timestamp,
+    PromptSettleAction, PromptSettleEvent, RepositoryObservationReceipt,
+    RepositoryObservationStatus, ReviewEpochBundle, ReviewEpochRoleEvidence, Scope, Session,
+    SettledBudgetUsage, StateStore, Task, TaskInputs, TaskKind, TaskOutputs,
+    TaskRouteDecisionReceipt, TaskStatus, WorkLineage, event, id_timestamp, timestamp,
 };
 use crate::task_manager::{
     CompletionNotifier, ManagedTaskStatus, NotificationResult, ParentSessionState, SendOutcome,
@@ -44,8 +44,8 @@ use crate::task_manager::{
     TaskManagerControl, TaskManagerTickLoop, TaskRecord,
 };
 use crate::tools::{
-    CancellationToken, DiffSnapshot, ShellCommandResult, check_scope, git_snapshot,
-    run_shell_command_with_env_and_cancellation,
+    CancellationToken, DiffSnapshot, ShellCommandResult, check_scope, git_head_commit,
+    git_snapshot, run_shell_command_with_env_and_cancellation,
 };
 use crate::worker_broker::{
     BrokerLifecycleReceipt, BrokerOutcome, BrokerPhaseRequest, BrokerUsage, LifecycleState,
@@ -180,6 +180,15 @@ pub struct IntentFoldSubmission {
     pub raw_output: String,
     pub artifact_path: Option<String>,
     pub repository_evidence_path: Option<String>,
+    pub repository_discovery: Option<RepositoryDiscoverySubmission>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RepositoryDiscoverySubmission {
+    pub raw_output: String,
+    pub analyst: PhaseExecutionIdentity,
+    pub artifact_path: String,
+    pub repository_evidence_path: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -190,6 +199,7 @@ pub struct PlannerInput {
     pub verification_commands: Vec<String>,
     pub route_decision: PhaseRouteDecision,
     pub intent_fold: Option<IntentFoldReceipt>,
+    pub repository_discovery: Option<RepositoryDiscoverySubmission>,
 }
 
 #[derive(Clone, Debug)]
@@ -260,6 +270,8 @@ pub struct StrategistNextGoalVerdict {
     pub required_questions: Vec<String>,
     #[serde(default)]
     pub evidence_refs: Vec<String>,
+    #[serde(default)]
+    pub answerable_now: bool,
     pub rationale: String,
 }
 
@@ -292,6 +304,22 @@ impl StrategistNextGoalVerdict {
                 bail!("strategist verdict contains an empty evidence or decision value");
             }
         }
+        if matches!(self.decision, StrategistNextGoalDecision::Stop)
+            && self.evidence_refs.is_empty()
+        {
+            bail!("stop strategist verdict requires evidence references");
+        }
+        if self.answerable_now
+            && !matches!(
+                self.decision,
+                StrategistNextGoalDecision::Complete | StrategistNextGoalDecision::Stop
+            )
+        {
+            bail!("answerable strategist verdict must be terminal");
+        }
+        if self.answerable_now && self.evidence_refs.is_empty() {
+            bail!("answerable strategist verdict requires evidence references");
+        }
         match self.decision {
             StrategistNextGoalDecision::Continue => {
                 if self
@@ -300,6 +328,7 @@ impl StrategistNextGoalVerdict {
                     .is_none_or(|objective| objective.trim().is_empty())
                     || self.acceptance_signals.is_empty()
                     || !self.required_questions.is_empty()
+                    || self.answerable_now
                 {
                     bail!("continue verdict requires an objective and acceptance signals");
                 }
@@ -308,6 +337,7 @@ impl StrategistNextGoalVerdict {
                 if self.reviewed_status != GoalStatus::NeedsUser
                     || self.required_questions.is_empty()
                     || self.next_objective.is_some()
+                    || self.answerable_now
                 {
                     bail!("needs-user verdict requires questions and no next objective");
                 }
@@ -862,6 +892,13 @@ pub struct RunOutcome {
     pub final_verification_wave_path: PathBuf,
     pub final_verification_wave_hash: String,
     pub strategist_receipt: Option<StrategistNextGoalReceipt>,
+}
+
+#[derive(Clone, Debug)]
+struct FinalReviewInputEvidence {
+    execution_id: String,
+    result_path: PathBuf,
+    outcome_path: PathBuf,
 }
 
 #[derive(Clone, Debug)]
@@ -1550,8 +1587,10 @@ impl Orchestrator {
             let guard =
                 store.update_continuation_guard(&session_id, &goal_id, &epoch_id, |guard| {
                     // An in-flight marker belongs to the previous process;
-                    // a restarted runtime must not treat it as a live turn.
+                    // a restarted runtime must not treat it as a live turn or
+                    // retain a worker-event background marker from that process.
                     guard.in_flight = false;
+                    guard.background_pending = false;
                 })?;
             if let Some(reason) = guard.blocking_reason() {
                 store.record_prompt_settle_decision(
@@ -1769,7 +1808,7 @@ impl Orchestrator {
         let mut final_evaluation = None;
         let mut last_coordinator_review: Option<CoordinatorReview> = None;
         let mut next_route_hint_override: Option<String> = None;
-        let mut last_executor_execution_id: Option<String> = None;
+        let mut last_executor_evidence: Option<FinalReviewInputEvidence> = None;
         let mut provider_unknown_streak = 0usize;
         let mut repeated_failure_streak = 0usize;
         let mut last_failure_kind: Option<TaskFailureKind> = None;
@@ -1867,7 +1906,8 @@ impl Orchestrator {
             if options.continuation {
                 let guard =
                     store.update_continuation_guard(&session_id, &goal_id, &epoch_id, |guard| {
-                        guard.in_flight = false
+                        guard.in_flight = false;
+                        guard.background_pending = false;
                     })?;
                 if let Some(reason) = guard.blocking_reason() {
                     store.record_prompt_settle_decision(
@@ -2267,11 +2307,16 @@ impl Orchestrator {
             }
 
             let reviewed_execution_id = if worker_route_hint == Some("review") {
-                Some(
-                    last_executor_execution_id
-                        .clone()
-                        .context("review route requires a completed executor execution")?,
-                )
+                let evidence = last_executor_evidence
+                    .as_ref()
+                    .context("review route requires a completed executor execution")?;
+                validate_final_review_input_artifacts(
+                    &evidence.execution_id,
+                    Some(&evidence.result_path),
+                    Some(&evidence.outcome_path),
+                    last_verification_path.as_deref(),
+                )?;
+                Some(evidence.execution_id.clone())
             } else {
                 None
             };
@@ -2531,7 +2576,7 @@ impl Orchestrator {
                     }
                 }
             };
-            let mut live_binding_persisted = persist_live_plan_node_session_binding(
+            persist_live_plan_node_session_binding(
                 &store,
                 &goal_id,
                 &epoch_id,
@@ -2572,25 +2617,19 @@ impl Orchestrator {
                     .take()
                     .context("prestarted wave worker was not reduced at the barrier")?
             } else {
-                let run = loop {
-                    if !live_binding_persisted {
-                        live_binding_persisted = persist_live_plan_node_session_binding(
-                            &store,
-                            &goal_id,
-                            &epoch_id,
-                            &plan_graph,
-                            &plan_task_id,
-                            route_attempt,
-                            &managed_worker_task_id,
-                            &selected_route,
-                            &route_receipt.receipt_hash,
-                        )?;
+                let wait_result = match task_manager.lock() {
+                    Ok(mut task_manager) => task_manager.wait_for_with_cancellation(
+                        &managed_worker_task_id,
+                        options.cancellation_token.as_ref(),
+                    ),
+                    Err(_) => {
+                        stop_lineage_task(&store, &mut lineage, &worker_task_id)?;
+                        bail!("task manager mutex poisoned");
                     }
-                    if options
-                        .cancellation_token
-                        .as_ref()
-                        .is_some_and(CancellationToken::is_cancelled)
-                    {
+                };
+                match wait_result {
+                    Ok(Some(run)) => run,
+                    Ok(None) => {
                         let cancel_result = match task_manager.lock() {
                             Ok(mut task_manager) => {
                                 task_manager.cancel_task(&managed_worker_task_id)
@@ -2606,25 +2645,15 @@ impl Orchestrator {
                         stop_lineage_task(&store, &mut lineage, &worker_task_id)?;
                         cancel_result?;
                         check_run_cancelled(options.cancellation_token.as_ref())?;
+                        unreachable!(
+                            "cancellation-aware worker wait returned without cancellation"
+                        );
                     }
-                    let wait_result = match task_manager.lock() {
-                        Ok(mut task_manager) => task_manager.try_wait_for(&managed_worker_task_id),
-                        Err(_) => {
-                            stop_lineage_task(&store, &mut lineage, &worker_task_id)?;
-                            bail!("task manager mutex poisoned");
-                        }
-                    };
-                    match wait_result {
-                        Ok(Some(run)) => break run,
-                        Ok(None) => {}
-                        Err(error) => {
-                            stop_lineage_task(&store, &mut lineage, &worker_task_id)?;
-                            return Err(error).context("failed while waiting for Gear worker task");
-                        }
+                    Err(error) => {
+                        stop_lineage_task(&store, &mut lineage, &worker_task_id)?;
+                        return Err(error).context("failed while waiting for Gear worker task");
                     }
-                    std::thread::sleep(Duration::from_millis(10));
-                };
-                run
+                }
             };
             // A wave is reduced only after every prestarted sibling has
             // reached a terminal worker state. This prevents verification of
@@ -2899,11 +2928,13 @@ impl Orchestrator {
                 &phase_route_receipt,
             )?;
             if worker_route_hint != Some("review") {
-                last_executor_execution_id = Some(
-                    worker_session_id
+                last_executor_evidence = Some(FinalReviewInputEvidence {
+                    execution_id: worker_session_id
                         .clone()
                         .unwrap_or_else(|| worker_task_id.clone()),
-                );
+                    result_path: iteration_worker_result.result_path.clone(),
+                    outcome_path: iteration_worker_result.outcome_path.clone(),
+                });
             }
             worker_call_count += 1;
             attempt_count += worker_task_record.attempts.len();
@@ -3023,6 +3054,7 @@ impl Orchestrator {
             if options.continuation {
                 store.update_continuation_guard(&session_id, &goal_id, &epoch_id, |guard| {
                     guard.in_flight = false;
+                    guard.background_pending = false;
                     if worker_failed {
                         guard.consecutive_failures = guard.consecutive_failures.saturating_add(1);
                     } else {
@@ -3591,6 +3623,7 @@ impl Orchestrator {
             let completed = final_evaluation.status == GoalStatus::Complete;
             store.update_continuation_guard(&session_id, &goal_id, &epoch_id, |guard| {
                 guard.in_flight = false;
+                guard.background_pending = false;
                 guard.all_todos_completed = completed;
             })?;
         }
@@ -3637,7 +3670,10 @@ impl Orchestrator {
         {
             strategist_prior_execution_ids.push(planner_session_id);
         }
-        if let Some(executor_execution_id) = last_executor_execution_id.clone() {
+        if let Some(executor_execution_id) = last_executor_evidence
+            .as_ref()
+            .map(|evidence| evidence.execution_id.clone())
+        {
             strategist_prior_execution_ids.push(executor_execution_id);
         }
         let strategist_receipt = run_strategist_next_goal(
@@ -4097,6 +4133,9 @@ fn run_objective_controller(
                     "status": outcome.status.as_str(),
                     "final_report_path": outcome.final_report_path.to_string_lossy(),
                     "final_verification_wave_hash": outcome.final_verification_wave_hash,
+                    "answerable_now": strategist_receipt
+                        .as_ref()
+                        .map(|receipt| receipt.verdict.answerable_now),
                 }),
             )?;
         }
@@ -5929,6 +5968,8 @@ fn run_strategist_next_goal(
         json!({
             "decision": receipt.verdict.decision,
             "next_objective": receipt.verdict.next_objective,
+            "answerable_now": receipt.verdict.answerable_now,
+            "evidence_refs": receipt.verdict.evidence_refs,
             "receipt_hash": receipt.receipt_hash,
             "receipt_path": receipt_path.to_string_lossy(),
         }),
@@ -5944,6 +5985,8 @@ fn run_strategist_next_goal(
             "Strategist next-goal decision recorded",
             json!({
                 "decision": receipt.verdict.decision,
+                "answerable_now": receipt.verdict.answerable_now,
+                "evidence_refs": receipt.verdict.evidence_refs,
                 "receipt_path": receipt_path.to_string_lossy(),
             }),
         ),
@@ -6023,6 +6066,7 @@ fn build_approved_plan_graph_inner(
     }
     let mut intent_fold_artifact_path: Option<String> = None;
     let mut intent_fold_observation_path: Option<String> = None;
+    let mut repository_discovery: Option<RepositoryDiscoverySubmission> = None;
     let intent_fold_receipt =
         if let Some(intent_fold_hook) = phase_runtime.intent_fold_hook.as_ref() {
             check_run_cancelled(cancellation_token)?;
@@ -6050,9 +6094,17 @@ fn build_approved_plan_graph_inner(
                 "intent-fold",
             )?;
             let submission = submission_result?;
+            repository_discovery = submission.repository_discovery.clone();
+            if phase_runtime.broker_factory.is_some() {
+                let discovery = repository_discovery
+                    .as_ref()
+                    .context("broker-backed IntentFold completed without repository discovery")?;
+                require_repository_discovery_artifact(store, discovery, &goal.id)?;
+            }
             intent_fold_observation_path = submission.repository_evidence_path.clone();
             if phase_runtime.broker_factory.is_some() {
                 require_verified_repository_observation_for_goal(
+                    store,
                     submission.repository_evidence_path.as_deref(),
                     &goal.id,
                     "planner",
@@ -6115,6 +6167,7 @@ fn build_approved_plan_graph_inner(
             verification_commands: verification_commands.to_vec(),
             route_decision: planner_decision.clone(),
             intent_fold: intent_fold_receipt.clone(),
+            repository_discovery: repository_discovery.clone(),
         })
         .context("planner hook failed before plan construction");
         settle_planning_phase_budget(
@@ -6127,6 +6180,7 @@ fn build_approved_plan_graph_inner(
         let submission = submission_result?;
         if phase_runtime.broker_factory.is_some() {
             require_verified_repository_observation_for_goal(
+                store,
                 submission.repository_evidence_path.as_deref(),
                 &goal.id,
                 "planner",
@@ -7033,7 +7087,7 @@ fn worker_task_id_from_artifact_path(path: Option<&str>) -> Option<String> {
 }
 
 fn require_verified_repository_observation(
-    _store: &StateStore,
+    store: &StateStore,
     plan: &PlanGraph,
     role: &str,
     path: Option<&str>,
@@ -7043,9 +7097,10 @@ fn require_verified_repository_observation(
     ))?;
     let contents = std_fs::read_to_string(path)
         .with_context(|| format!("failed to read repository observation receipt {path}"))?;
-    let receipt: crate::state::RepositoryObservationReceipt = serde_json::from_str(&contents)
+    let receipt: RepositoryObservationReceipt = serde_json::from_str(&contents)
         .with_context(|| format!("failed to parse repository observation receipt {path}"))?;
     receipt.validate()?;
+    validate_repository_observation_capture_commit(role, &receipt, current_workspace_head(store)?)?;
     if receipt.goal_id != plan.goal_id
         || receipt.plan_id != plan.plan_id
         || receipt.plan_revision != plan.revision
@@ -7063,6 +7118,7 @@ fn require_verified_repository_observation(
 }
 
 fn require_verified_repository_observation_for_goal(
+    store: &StateStore,
     path: Option<&str>,
     goal_id: &str,
     role: &str,
@@ -7072,9 +7128,10 @@ fn require_verified_repository_observation_for_goal(
     ))?;
     let contents = std_fs::read_to_string(path)
         .with_context(|| format!("failed to read repository observation receipt {path}"))?;
-    let receipt: crate::state::RepositoryObservationReceipt = serde_json::from_str(&contents)
+    let receipt: RepositoryObservationReceipt = serde_json::from_str(&contents)
         .with_context(|| format!("failed to parse repository observation receipt {path}"))?;
     receipt.validate()?;
+    validate_repository_observation_capture_commit(role, &receipt, current_workspace_head(store)?)?;
     if receipt.goal_id != goal_id {
         bail!("{role} repository observation receipt is bound to a different goal");
     }
@@ -7083,6 +7140,109 @@ fn require_verified_repository_observation_for_goal(
     }
     if receipt.status != RepositoryObservationStatus::Verified {
         bail!("{role} repository observation is unverified");
+    }
+    Ok(())
+}
+
+fn require_repository_discovery_artifact(
+    store: &StateStore,
+    discovery: &RepositoryDiscoverySubmission,
+    goal_id: &str,
+) -> Result<()> {
+    if discovery.raw_output.trim().is_empty() || !Path::new(&discovery.artifact_path).is_file() {
+        bail!(
+            "broker-backed planning requires a readable repository discovery artifact: {}",
+            discovery.artifact_path
+        );
+    }
+    let contents = std_fs::read_to_string(&discovery.artifact_path).with_context(|| {
+        format!(
+            "failed to read repository discovery artifact {}",
+            discovery.artifact_path
+        )
+    })?;
+    let artifact: Value = serde_json::from_str(&contents).with_context(|| {
+        format!(
+            "failed to parse repository discovery artifact {}",
+            discovery.artifact_path
+        )
+    })?;
+    if artifact["schema_version"] != 1
+        || artifact["phase"] != "repository_discovery"
+        || artifact["goal_id"] != goal_id
+        || artifact["task_id"] != format!("repository_discovery_{goal_id}")
+    {
+        bail!("repository discovery artifact binding mismatch");
+    }
+    let raw_output = artifact["raw_output"]
+        .as_str()
+        .context("repository discovery artifact is missing raw_output")?;
+    if raw_output != discovery.raw_output {
+        bail!("repository discovery submission does not match its artifact");
+    }
+    if artifact["raw_output_sha256"] != hash_text(raw_output) {
+        bail!("repository discovery artifact raw output hash mismatch");
+    }
+    let current_commit = current_workspace_head(store)?;
+    validate_discovery_capture_commit(
+        artifact["capture_commit"].as_str(),
+        current_commit.as_deref(),
+    )?;
+    let observation_path = artifact["repository_observation_path"]
+        .as_str()
+        .with_context(|| "repository discovery artifact is missing repository observation path")?;
+    require_verified_repository_observation_for_goal(
+        store,
+        Some(observation_path),
+        goal_id,
+        "planner",
+    )?;
+    Ok(())
+}
+
+fn validate_discovery_capture_commit(
+    captured_commit: Option<&str>,
+    current_commit: Option<&str>,
+) -> Result<()> {
+    let Some(current_commit) = current_commit else {
+        return Ok(());
+    };
+    let captured_commit = captured_commit.context(format!(
+        "repository discovery artifact is missing capture commit for current HEAD {current_commit}"
+    ))?;
+    if captured_commit != current_commit {
+        bail!(
+            "repository discovery artifact is stale: captured commit {captured_commit}, current HEAD {current_commit}"
+        );
+    }
+    Ok(())
+}
+
+fn current_workspace_head(store: &StateStore) -> Result<Option<String>> {
+    let workspace = store
+        .root()
+        .parent()
+        .context("Gear StateStore root has no workspace parent")?;
+    git_head_commit(workspace)
+}
+
+fn validate_repository_observation_capture_commit(
+    role: &str,
+    receipt: &RepositoryObservationReceipt,
+    current_commit: Option<String>,
+) -> Result<()> {
+    let Some(current_commit) = current_commit else {
+        return Ok(());
+    };
+    let captured_commit = receipt.capture_commit.as_deref().with_context(|| {
+        format!(
+            "{role} repository observation is missing capture commit for current HEAD {current_commit}; rerun the phase"
+        )
+    })?;
+    if captured_commit != current_commit {
+        bail!(
+            "{role} repository observation is stale: captured commit {captured_commit}, current HEAD {current_commit}; rerun the phase"
+        );
     }
     Ok(())
 }
@@ -7370,7 +7530,10 @@ fn try_resume_plan_session(
         .send_follow_up_task(&binding.worker_task_id, prompt.to_string())?;
     if matches!(
         outcome,
-        SendOutcome::Sent(_) | SendOutcome::Queued(_) | SendOutcome::Revive(_)
+        SendOutcome::Sent(_)
+            | SendOutcome::Queued(_)
+            | SendOutcome::Revive(_)
+            | SendOutcome::PossiblyAccepted(_)
     ) {
         Ok(Some(binding.worker_task_id))
     } else {
@@ -8475,6 +8638,24 @@ fn append_completion_notification(
     task_id: &str,
     run_epoch: u64,
 ) -> Result<()> {
+    append_completion_notification_with_event_writer(
+        store,
+        session_id,
+        goal_id,
+        task_id,
+        run_epoch,
+        &|completion_event| append_event(store, event_sink, completion_event.clone()),
+    )
+}
+
+fn append_completion_notification_with_event_writer(
+    store: &StateStore,
+    session_id: &str,
+    goal_id: &str,
+    task_id: &str,
+    run_epoch: u64,
+    event_writer: &dyn Fn(&Event) -> Result<()>,
+) -> Result<()> {
     let task_record_path = store.worker_dir(task_id).join("task-record.json");
     let task_record_contents = std_fs::read_to_string(&task_record_path)
         .with_context(|| format!("failed to read {}", task_record_path.display()))?;
@@ -8495,21 +8676,38 @@ fn append_completion_notification(
         return Ok(());
     };
 
-    let task_name = notification.task_name.clone();
-    let status_label = format!("{:?}", &notification.status);
-    let summary = notification.summary.clone();
-    let failure_kind = notification
-        .failure_kind
-        .as_ref()
-        .map(|kind| format!("{kind:?}"));
-    let result_path = notification
-        .result_path
-        .as_ref()
-        .map(|path| path.to_string_lossy().to_string());
-    let outcome_path = notification
-        .outcome_path
-        .as_ref()
-        .map(|path| path.to_string_lossy().to_string());
+    let completion_event = event(
+        session_id,
+        Some(goal_id),
+        Some(task_id),
+        EventKind::CompletionNotified,
+        format!(
+            "{} {} in {}ms: {} ({})",
+            notification.task_name,
+            format!("{:?}", notification.status),
+            notification.duration_ms,
+            notification.summary_head,
+            notification.continuation_hint,
+        ),
+        json!({
+            "task_name": notification.task_name,
+            "status": format!("{:?}", notification.status),
+            "duration_ms": notification.duration_ms,
+            "summary": notification.summary,
+            "summary_head": notification.summary_head,
+            "continuation_hint": notification.continuation_hint,
+            "failure_kind": notification.failure_kind.as_ref().map(|kind| format!("{kind:?}")),
+            "result_path": notification.result_path.as_ref().map(|path| path.to_string_lossy().to_string()),
+            "outcome_path": notification.outcome_path.as_ref().map(|path| path.to_string_lossy().to_string()),
+            "task_record_path": task_record_path.to_string_lossy(),
+            "run_epoch": notification.run_epoch,
+            "notified_epoch": run_epoch,
+        }),
+    );
+
+    if !completion_notification_event_exists(store, session_id, task_id, run_epoch)? {
+        event_writer(&completion_event)?;
+    }
 
     task_record.notified_epoch = run_epoch as i64;
     let task_record_json = serde_json::to_string_pretty(&task_record)
@@ -8519,40 +8717,36 @@ fn append_completion_notification(
         "task-record.json",
         &format!("{task_record_json}\n"),
     )?;
-
-    append_event(
-        store,
-        event_sink,
-        event(
-            session_id,
-            Some(goal_id),
-            Some(task_id),
-            EventKind::CompletionNotified,
-            format!(
-                "{} {} in {}ms: {} ({})",
-                task_name.as_str(),
-                status_label.as_str(),
-                notification.duration_ms,
-                notification.summary_head,
-                notification.continuation_hint,
-            ),
-            json!({
-                "task_name": task_name,
-                "status": status_label,
-                "duration_ms": notification.duration_ms,
-                "summary": summary,
-                "summary_head": notification.summary_head,
-                "continuation_hint": notification.continuation_hint,
-                "failure_kind": failure_kind,
-                "result_path": result_path,
-                "outcome_path": outcome_path,
-                "task_record_path": task_record_path.to_string_lossy(),
-                "run_epoch": notification.run_epoch,
-                "notified_epoch": run_epoch,
-            }),
-        ),
-    )?;
     Ok(())
+}
+
+fn completion_notification_event_exists(
+    store: &StateStore,
+    session_id: &str,
+    task_id: &str,
+    run_epoch: u64,
+) -> Result<bool> {
+    let events_path = store.events_path(session_id);
+    if !events_path.exists() {
+        return Ok(false);
+    }
+
+    let contents = std_fs::read_to_string(&events_path)
+        .with_context(|| format!("failed to read {}", events_path.display()))?;
+    for line in contents.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(existing_event) = serde_json::from_str::<Event>(line) else {
+            continue;
+        };
+        if existing_event.task_id.as_deref() != Some(task_id)
+            || !matches!(existing_event.kind, EventKind::CompletionNotified)
+        {
+            continue;
+        }
+        if existing_event.data.get("run_epoch").and_then(Value::as_u64) == Some(run_epoch) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn record_completion_notification_failed_epoch(
@@ -10442,6 +10636,41 @@ fn repair_request(
     )
 }
 
+fn validate_final_review_input_artifacts(
+    execution_id: &str,
+    executor_result_path: Option<&Path>,
+    executor_outcome_path: Option<&Path>,
+    verification_path: Option<&Path>,
+) -> Result<()> {
+    if execution_id.trim().is_empty() {
+        bail!("final review input is missing the executor execution id");
+    }
+    for (label, path) in [
+        ("executor result", executor_result_path),
+        ("executor outcome", executor_outcome_path),
+        ("verification", verification_path),
+    ] {
+        let path =
+            path.with_context(|| format!("final review input is missing {label} artifact"))?;
+        let metadata = std_fs::metadata(path).with_context(|| {
+            format!(
+                "final review {label} artifact is missing: {}",
+                path.display()
+            )
+        })?;
+        if !metadata.is_file() {
+            bail!(
+                "final review {label} artifact must be a regular file: {}",
+                path.display()
+            );
+        }
+        if metadata.len() == 0 {
+            bail!("final review {label} artifact is empty: {}", path.display());
+        }
+    }
+    Ok(())
+}
+
 fn review_worker_request(base_request: &str, reviewed_execution_id: &str) -> String {
     let required_receipt = json!({
         "schema_version": 1,
@@ -10984,6 +11213,79 @@ mod tests {
     use crate::tools::ScopeCheck;
     use crate::workers::{WorkerKind, WorkerStatus};
 
+    #[test]
+    fn repository_observation_stale_capture_commit_is_rejected() -> Result<()> {
+        let capture_commit = "a".repeat(40);
+        let receipt = RepositoryObservationReceipt::seal_with_capture_commit(
+            "planner",
+            "goal-capture-gate",
+            "plan-capture-gate",
+            1,
+            "plan-hash",
+            "worker-capture-gate",
+            "session-capture-gate",
+            Some("transcript-hash".to_string()),
+            1,
+            vec!["src/lib.rs".to_string()],
+            vec![crate::state::RepositoryObservationEvent {
+                operation: "read".to_string(),
+                path: "src/lib.rs".to_string(),
+                event_id: "tool-capture-gate".to_string(),
+                event_hash: "event-capture-gate".to_string(),
+                observed_at: timestamp(),
+            }],
+            Some(capture_commit.clone()),
+        )?;
+        assert!(
+            validate_repository_observation_capture_commit(
+                "planner",
+                &receipt,
+                Some(capture_commit.clone()),
+            )
+            .is_ok()
+        );
+        let stale = validate_repository_observation_capture_commit(
+            "planner",
+            &receipt,
+            Some("b".repeat(40)),
+        )
+        .expect_err("stale observation must be rejected");
+        assert!(stale.to_string().contains("stale"));
+
+        let legacy = RepositoryObservationReceipt::seal(
+            "planner",
+            "goal-capture-gate",
+            "plan-capture-gate",
+            1,
+            "plan-hash",
+            "worker-capture-gate",
+            "session-capture-gate",
+            Some("transcript-hash".to_string()),
+            1,
+            vec!["src/lib.rs".to_string()],
+            receipt.observed_events.clone(),
+        )?;
+        let missing = validate_repository_observation_capture_commit(
+            "planner",
+            &legacy,
+            Some(capture_commit),
+        )
+        .expect_err("Git evidence without capture commit must be rejected");
+        assert!(missing.to_string().contains("missing capture commit"));
+        assert!(validate_repository_observation_capture_commit("planner", &legacy, None).is_ok());
+        let discovery_commit = "a".repeat(40);
+        assert!(
+            validate_discovery_capture_commit(Some(&discovery_commit), Some(&discovery_commit))
+                .is_ok()
+        );
+        let discovery_stale =
+            validate_discovery_capture_commit(Some(&discovery_commit), Some(&"b".repeat(40)))
+                .expect_err("stale discovery must be rejected");
+        assert!(discovery_stale.to_string().contains("stale"));
+        assert!(validate_discovery_capture_commit(None, None).is_ok());
+        Ok(())
+    }
+
     fn test_budget(max_iterations: usize) -> BudgetController {
         BudgetController {
             max_iterations,
@@ -11133,7 +11435,7 @@ mod tests {
         let mut config = WorkerConfig::default();
         config.worker_kind = WorkerKind::Opencode;
         config.worker_command = Some(
-            r###"sh -c 'task_id=$(grep -o "\"task_id\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$GEARBOX_WORKER_PACKET" | head -1 | cut -d "\"" -f4); reviewed_id=$(grep -o '"'"'reviewed_execution_id\\":\\"[^\\"]*'"'"' "$GEARBOX_WORKER_PACKET" | head -1 | sed '"'"'s/.*\\"//'"'"'); if [ -z "$reviewed_id" ]; then reviewed_id=$task_id; fi; printf "%s" "{\"schema_version\":1,\"reviewed_execution_id\":\"TASK_ID\",\"dimensions\":[{\"dimension\":\"goal_verification\",\"verdict\":\"pass\",\"findings\":[\"verification evidence inspected\"]},{\"dimension\":\"code_quality\",\"verdict\":\"pass\",\"findings\":[\"scope inspected\"]},{\"dimension\":\"security\",\"verdict\":\"pass\",\"findings\":[\"forbidden paths clean\"]},{\"dimension\":\"qa_execution\",\"verdict\":\"pass\",\"findings\":[\"verification passed\"]}]}" | sed "s|TASK_ID|$reviewed_id|" > "$GEARBOX_WORKER_LAST_MESSAGE"'"###
+            r###"sh -c 'task_id=$(grep -o "\"task_id\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$GEARBOX_WORKER_PACKET" | head -1 | cut -d "\"" -f4); reviewed_id=$(grep -o '"'"'reviewed_execution_id\\":\\"[^\\"]*'"'"' "$GEARBOX_WORKER_PACKET" | head -1 | sed '"'"'s/.*\\"//'"'"'); if [ -z "$reviewed_id" ]; then reviewed_id=$task_id; fi; printf "%s" "{\"schema_version\":1,\"reviewed_execution_id\":\"TASK_ID\",\"dimensions\":[{\"dimension\":\"goal_verification\",\"verdict\":\"pass\",\"findings\":[\"verification evidence inspected\"]},{\"dimension\":\"code_quality\",\"verdict\":\"pass\",\"findings\":[\"scope inspected\"]},{\"dimension\":\"security\",\"verdict\":\"pass\",\"findings\":[\"forbidden paths clean\"]},{\"dimension\":\"qa_execution\",\"verdict\":\"pass\",\"findings\":[\"verification passed\",\"EVIDENCE_RECORDED: .gearbox-agent/evidence/receipt.md\"]}]}" | sed "s|TASK_ID|$reviewed_id|" > "$GEARBOX_WORKER_LAST_MESSAGE"'"###
                 .to_string(),
         );
         config.skip_worker = false;
@@ -11179,6 +11481,7 @@ mod tests {
                         .unwrap_or_default(),
                     required_questions: Vec::new(),
                     evidence_refs: vec![input.final_report_path],
+                    answerable_now: false,
                     rationale: "Crash matrix deterministic strategist".to_string(),
                 };
                 Ok(StrategistNextGoalSubmission {
@@ -11228,6 +11531,7 @@ mod tests {
                     acceptance_signals: vec!["The successor has a durable edge".to_string()],
                     required_questions: Vec::new(),
                     evidence_refs: vec![input.final_report_path],
+                    answerable_now: false,
                     rationale: "The first epoch passed and has a bounded successor".to_string(),
                 };
                 Ok(StrategistNextGoalSubmission {
@@ -11426,6 +11730,7 @@ mod tests {
                 acceptance_signals: vec!["Tasks survive a restart".to_string()],
                 required_questions: Vec::new(),
                 evidence_refs: vec![input.final_report_path],
+                answerable_now: false,
                 rationale: "The first goal passed and the next bounded improvement is clear"
                     .to_string(),
             };
@@ -11546,6 +11851,41 @@ mod tests {
     }
 
     #[test]
+    fn strategist_answerable_stop_requires_evidence() -> Result<()> {
+        let mut verdict = StrategistNextGoalVerdict {
+            schema_version: 1,
+            goal_id: "goal-answerable".to_string(),
+            epoch_id: "epoch-answerable".to_string(),
+            reviewed_status: GoalStatus::Running,
+            decision: StrategistNextGoalDecision::Stop,
+            next_objective: None,
+            acceptance_signals: Vec::new(),
+            required_questions: Vec::new(),
+            evidence_refs: Vec::new(),
+            answerable_now: true,
+            rationale: "The result should be answerable".to_string(),
+        };
+        let missing_evidence = verdict
+            .validate("goal-answerable", "epoch-answerable", &GoalStatus::Running)
+            .expect_err("answerable stop without evidence must be rejected");
+        assert!(missing_evidence.to_string().contains("evidence reference"));
+
+        verdict.evidence_refs = vec!["artifacts/final-report.md".to_string()];
+        verdict
+            .validate("goal-answerable", "epoch-answerable", &GoalStatus::Running)
+            .expect("answerable stop with evidence should be accepted");
+
+        verdict.decision = StrategistNextGoalDecision::Continue;
+        verdict.next_objective = Some("Continue only if evidence is insufficient".to_string());
+        verdict.acceptance_signals = vec!["A bounded follow-up is required".to_string()];
+        let non_terminal = verdict
+            .validate("goal-answerable", "epoch-answerable", &GoalStatus::Running)
+            .expect_err("answerable continue must be rejected");
+        assert!(non_terminal.to_string().contains("terminal"));
+        Ok(())
+    }
+
+    #[test]
     fn rolling_objective_continue_creates_one_child() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let strategist_calls = Arc::new(AtomicUsize::new(0));
@@ -11604,6 +11944,7 @@ mod tests {
                     acceptance_signals,
                     required_questions: Vec::new(),
                     evidence_refs: vec![input.final_report_path],
+                    answerable_now: false,
                     rationale: if call == 1 {
                         "The next bounded objective is ready".to_string()
                     } else {
@@ -11699,6 +12040,120 @@ mod tests {
     }
 
     #[test]
+    fn objective_controller_stops_answerable_result_before_child() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let strategist_calls = Arc::new(AtomicUsize::new(0));
+        let critic_hook: PlanCriticHook =
+            Arc::new(|input| plan_critic_submission(&input, 1, PlanCriticDecision::Approve));
+        let mut phase_runtime = phase_runtime_for_test(Some(critic_hook));
+        phase_runtime.planner_hook = Some(Arc::new(|input: PlannerInput| {
+            let draft = deterministic_fallback_draft(
+                &input.request,
+                &input.scope,
+                &input.verification_commands,
+            );
+            Ok(PlannerSubmission {
+                raw_output: serde_json::to_string(&draft)?,
+                draft,
+                planner: phase_identity("answerable_planner"),
+                artifact_path: None,
+                repository_evidence_path: None,
+            })
+        }));
+        phase_runtime.strategist_next_goal_hook = Some({
+            let strategist_calls = strategist_calls.clone();
+            Arc::new(move |input: StrategistNextGoalInput| {
+                strategist_calls.fetch_add(1, Ordering::SeqCst);
+                let verdict = StrategistNextGoalVerdict {
+                    schema_version: 1,
+                    goal_id: input.goal_id,
+                    epoch_id: input.epoch_id,
+                    reviewed_status: input.status,
+                    decision: StrategistNextGoalDecision::Stop,
+                    next_objective: None,
+                    acceptance_signals: Vec::new(),
+                    required_questions: Vec::new(),
+                    evidence_refs: vec![input.final_report_path],
+                    answerable_now: true,
+                    rationale: "The current evidence answers the core request".to_string(),
+                };
+                Ok(StrategistNextGoalSubmission {
+                    raw_output: serde_json::to_string(&verdict)?,
+                    verdict,
+                    strategist: phase_identity("answerable_strategist"),
+                    artifact_path: None,
+                })
+            })
+        });
+
+        let outcome = Orchestrator::run_objective_with_phase_runtime(
+            RunOptions {
+                request: "Answer the completed task without another epoch".to_string(),
+                workspace: temp_dir.path().to_path_buf(),
+                verification_commands: vec!["echo verify-ok".to_string()],
+                worker: objective_worker_for_test(),
+                allowed_paths: Vec::new(),
+                forbidden_paths: vec![".git".to_string()],
+                max_files_changed: 10,
+                install_dependencies: false,
+                event_sink: None,
+                cancellation_token: None,
+                max_iterations: 2,
+                max_provider_unknown_streak: DEFAULT_MAX_PROVIDER_UNKNOWN_STREAK,
+                max_child_depth: usize::MAX,
+                max_runtime_minutes: 1,
+                budget: None,
+                coordinator_model: None,
+                coordinator_brief: None,
+                coordinator_review_hook: None,
+                task_manager_control: None,
+                task_manager: None,
+                session_id: Some("answerable-root-session".to_string()),
+                continuation: true,
+            },
+            phase_runtime,
+            ObjectivePolicy {
+                auto_continue: true,
+                max_epochs: 3,
+                ..ObjectivePolicy::default()
+            },
+        )?;
+
+        assert_eq!(outcome.status, ObjectiveStatus::Stopped);
+        assert_eq!(outcome.goal_outcomes.len(), 1);
+        assert_eq!(strategist_calls.load(Ordering::SeqCst), 1);
+        let answerable = outcome.goal_outcomes[0]
+            .strategist_receipt
+            .as_ref()
+            .is_some_and(|receipt| receipt.verdict.answerable_now);
+        assert!(answerable);
+
+        let store = StateStore::new(temp_dir.path());
+        let graph: ObjectiveGraph =
+            serde_json::from_str(&fs::read_to_string(&outcome.graph_path)?)?;
+        graph.validate()?;
+        assert_eq!(graph.nodes.len(), 1);
+        assert_eq!(
+            store
+                .read_objective_events(&outcome.objective_id)?
+                .iter()
+                .filter(|event| event.kind == ObjectiveEventKind::GoalAttached)
+                .count(),
+            1
+        );
+        let epoch_events = store.read_goal_epoch_events(&outcome.goal_outcomes[0].goal_id)?;
+        assert!(epoch_events.iter().any(|event| {
+            event.kind == GoalEpochEventKind::NextGoalSelected
+                && event
+                    .payload
+                    .get("answerable_now")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+        }));
+        Ok(())
+    }
+
+    #[test]
     fn objective_controller_stops_before_child_when_epoch_limit_is_reached() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let critic_hook: PlanCriticHook =
@@ -11730,6 +12185,7 @@ mod tests {
                     acceptance_signals: vec!["A stable observation exists".to_string()],
                     required_questions: Vec::new(),
                     evidence_refs: vec![input.final_report_path],
+                    answerable_now: false,
                     rationale: "Continue is intentionally blocked by the epoch policy".to_string(),
                 };
                 Ok(StrategistNextGoalSubmission {
@@ -11973,6 +12429,7 @@ mod tests {
                 },
                 artifact_path: None,
                 repository_evidence_path: None,
+                repository_discovery: None,
             })
         });
         let phase_runtime = PhaseRuntime {
@@ -12019,6 +12476,88 @@ mod tests {
                 .join("intent-fold-receipt.json")
                 .is_file()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn broker_backed_planner_requires_repository_discovery_artifact() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let scope = Scope::new(Vec::new(), vec![".git".to_string()], 10);
+        let draft = deterministic_fallback_draft("Require discovery", &scope, &[]);
+        let mut goal = planning_goal(&draft)?;
+        let planner_called = Arc::new(Mutex::new(false));
+        let planner_hook: PlannerHook = Arc::new({
+            let planner_called = planner_called.clone();
+            move |_input| {
+                *planner_called.lock().expect("planner flag poisoned") = true;
+                anyhow::bail!("planner must not run without discovery")
+            }
+        });
+        let intent_fold_hook: IntentFoldHook = Arc::new(|input| {
+            let verdict = IntentFoldVerdict {
+                schema_version: crate::plan_review::PLAN_REVIEW_SCHEMA_VERSION,
+                goal_id: input.goal_id,
+                normalized_objective: "Require discovery before planning".to_string(),
+                assumptions: Vec::new(),
+                constraints: vec!["Read-only discovery must precede planning".to_string()],
+                ambiguities: Vec::new(),
+                required_questions: Vec::new(),
+                risks: Vec::new(),
+                acceptance_signals: vec!["Discovery artifact exists".to_string()],
+                decision: IntentFoldDecision::Ready,
+                summary: "Ready after discovery requirement".to_string(),
+            };
+            Ok(IntentFoldSubmission {
+                raw_output: serde_json::to_string(&verdict)?,
+                verdict,
+                analyst: phase_identity("intent_fold_without_discovery"),
+                artifact_path: None,
+                repository_evidence_path: None,
+                repository_discovery: None,
+            })
+        });
+        let broker_factory = Arc::new(crate::worker_broker::PhaseBrokerFactory::new(
+            Arc::new(crate::workers::WorkerRegistry::default()),
+            temp_dir.path().join(".gearbox-agent"),
+        ));
+        let phase_runtime = PhaseRuntime {
+            routes: PhaseRouteTable::opencode_only(crate::phase_routing::OpenCodeModelProfiles {
+                planner: "openai/gpt-planner".to_string(),
+                executor: "deepseek/flash".to_string(),
+                reviewer: "openai/gpt-reviewer".to_string(),
+            })?,
+            inventory: LiveModelInventory::default(),
+            current_model: None,
+            planner: None,
+            intent_fold_hook: Some(intent_fold_hook),
+            planner_hook: Some(planner_hook),
+            plan_critic_hook: None,
+            oracle_hook: None,
+            plan_revision_hook: None,
+            strategist_next_goal_hook: None,
+            require_plan_approval: false,
+            max_plan_revisions: DEFAULT_MAX_PLAN_REVISIONS,
+            broker: None,
+            broker_factory: Some(broker_factory),
+            direct_model_usage_provider: None,
+        };
+
+        let error = build_approved_plan_graph(
+            &mut goal,
+            &scope,
+            &[],
+            temp_dir.path(),
+            &store,
+            "session-discovery-gate",
+            &None,
+            None,
+            &phase_runtime,
+        )
+        .expect_err("broker-backed planner must require discovery evidence");
+        assert!(error.to_string().contains("without repository discovery"));
+        assert!(!*planner_called.lock().expect("planner flag poisoned"));
         Ok(())
     }
 
@@ -12810,7 +13349,12 @@ mod tests {
             .worker_command
             .take()
             .context("test worker command should be configured")?;
-        worker.worker_command = Some(worker_command.replacen("sh -c '", "sh -c 'sleep 0.3; ", 1));
+        let worker_command = worker_command.replacen(
+            "sh -c '",
+            "sh -c 'mkdir -p .gearbox-agent/evidence; printf verified > .gearbox-agent/evidence/receipt.md; sleep 0.3; ",
+            1,
+        );
+        worker.worker_command = Some(worker_command);
         worker.max_parallel_workers = 2;
         worker.max_parallel_per_key = 2;
         let outcome = Orchestrator::run_with_phase_runtime(
@@ -13488,6 +14032,59 @@ mod tests {
                 .all(|result| result.reviewer_evidence.is_none())
         );
         assert!(gate.failed_reason().is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn final_review_input_preflight_requires_non_empty_executor_evidence() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let result_path = temp_dir.path().join("result.json");
+        let outcome_path = temp_dir.path().join("outcome.json");
+        let verification_path = temp_dir.path().join("verification.md");
+        std_fs::write(&result_path, "result\n")?;
+        std_fs::write(&outcome_path, "outcome\n")?;
+        std_fs::write(&verification_path, "verification\n")?;
+
+        assert!(
+            validate_final_review_input_artifacts(
+                "executor-1",
+                Some(&result_path),
+                Some(&outcome_path),
+                Some(&verification_path),
+            )
+            .is_ok()
+        );
+
+        std_fs::remove_file(&outcome_path)?;
+        let missing = validate_final_review_input_artifacts(
+            "executor-1",
+            Some(&result_path),
+            Some(&outcome_path),
+            Some(&verification_path),
+        )
+        .expect_err("missing outcome must block final reviewer admission");
+        assert!(missing.to_string().contains("outcome"));
+
+        std_fs::write(&outcome_path, "")?;
+        let empty = validate_final_review_input_artifacts(
+            "executor-1",
+            Some(&result_path),
+            Some(&outcome_path),
+            Some(&verification_path),
+        )
+        .expect_err("empty outcome must block final reviewer admission");
+        assert!(empty.to_string().contains("empty"));
+
+        std_fs::remove_file(&outcome_path)?;
+        std_fs::create_dir(&outcome_path)?;
+        let directory = validate_final_review_input_artifacts(
+            "executor-1",
+            Some(&result_path),
+            Some(&outcome_path),
+            Some(&verification_path),
+        )
+        .expect_err("directory outcome must block final reviewer admission");
+        assert!(directory.to_string().contains("regular file"));
         Ok(())
     }
 
@@ -14296,6 +14893,205 @@ mod tests {
         let stored_task_record: TaskRecord = serde_json::from_str(&stored_task_record)?;
         assert_eq!(stored_task_record.notification_failed_epoch, Some(7));
         assert_eq!(stored_task_record.notified_epoch, -1);
+        Ok(())
+    }
+
+    #[test]
+    fn completion_notification_event_failure_does_not_advance_notified_epoch() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+
+        let task_record = TaskRecord {
+            task_id: "task_notification_commit".to_string(),
+            worker_kind: "opencode".to_string(),
+            worker_command: None,
+            worker_model: None,
+            worker_category: "quick".to_string(),
+            route_hint: None,
+            route_reason: "route reason".to_string(),
+            status: crate::task_manager::ManagedTaskStatus::Completed,
+            started_at: timestamp(),
+            finished_at: Some(timestamp()),
+            residency_state: crate::task_manager::ResidencyState::Resident,
+            run_epoch: 7,
+            notified_epoch: -1,
+            notification_failed_epoch: None,
+            killed: false,
+            session_id: None,
+            parent_session_id: None,
+            root_session_id: None,
+            parent_task_id: None,
+            result_path: Some(temp_dir.path().join("result.json")),
+            outcome_path: Some(temp_dir.path().join("outcome.json")),
+            summary: "task summary".to_string(),
+            failure_kind: None,
+            retry_reason: None,
+            error: None,
+            attempts: Vec::new(),
+        };
+        let task_record_json = serde_json::to_string_pretty(&task_record)?;
+        store.write_worker_file(
+            "task_notification_commit",
+            "task-record.json",
+            &format!("{task_record_json}\n"),
+        )?;
+
+        let writer_attempts = Arc::new(Mutex::new(0usize));
+        let first_result = append_completion_notification_with_event_writer(
+            &store,
+            "session_notification_commit",
+            "goal_notification_commit",
+            "task_notification_commit",
+            7,
+            &{
+                let writer_attempts = writer_attempts.clone();
+                let event_store = store.clone();
+                move |completion_event| {
+                    let mut attempts = writer_attempts
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("mutex"))?;
+                    *attempts += 1;
+                    if *attempts == 1 {
+                        return Err(anyhow::anyhow!("deliberate event append failure"));
+                    }
+                    event_store.append_event(completion_event).map(|_| ())
+                }
+            },
+        );
+        assert!(first_result.is_err());
+
+        let task_record_path = store
+            .worker_dir("task_notification_commit")
+            .join("task-record.json");
+        let after_failure: TaskRecord =
+            serde_json::from_str(&fs::read_to_string(&task_record_path)?)?;
+        assert_eq!(after_failure.notified_epoch, -1);
+
+        append_completion_notification_with_event_writer(
+            &store,
+            "session_notification_commit",
+            "goal_notification_commit",
+            "task_notification_commit",
+            7,
+            &{
+                let writer_attempts = writer_attempts.clone();
+                let event_store = store.clone();
+                move |completion_event| {
+                    let mut attempts = writer_attempts
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("mutex"))?;
+                    *attempts += 1;
+                    event_store.append_event(completion_event).map(|_| ())
+                }
+            },
+        )?;
+
+        let after_success: TaskRecord =
+            serde_json::from_str(&fs::read_to_string(&task_record_path)?)?;
+        assert_eq!(after_success.notified_epoch, 7);
+        let events = fs::read_to_string(store.events_path("session_notification_commit"))?;
+        let completion_events = events
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Event>(line).ok())
+            .filter(|event| matches!(event.kind, EventKind::CompletionNotified))
+            .count();
+        assert_eq!(completion_events, 1);
+        let attempts = writer_attempts
+            .lock()
+            .map_err(|_| anyhow::anyhow!("mutex"))?;
+        assert_eq!(*attempts, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn completion_notification_marker_failure_reuses_persisted_event() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+
+        let task_record = TaskRecord {
+            task_id: "task_notification_marker".to_string(),
+            worker_kind: "opencode".to_string(),
+            worker_command: None,
+            worker_model: None,
+            worker_category: "quick".to_string(),
+            route_hint: None,
+            route_reason: "route reason".to_string(),
+            status: crate::task_manager::ManagedTaskStatus::Completed,
+            started_at: timestamp(),
+            finished_at: Some(timestamp()),
+            residency_state: crate::task_manager::ResidencyState::Resident,
+            run_epoch: 8,
+            notified_epoch: -1,
+            notification_failed_epoch: None,
+            killed: false,
+            session_id: None,
+            parent_session_id: None,
+            root_session_id: None,
+            parent_task_id: None,
+            result_path: Some(temp_dir.path().join("result.json")),
+            outcome_path: Some(temp_dir.path().join("outcome.json")),
+            summary: "task summary".to_string(),
+            failure_kind: None,
+            retry_reason: None,
+            error: None,
+            attempts: Vec::new(),
+        };
+        let task_record_json = serde_json::to_string_pretty(&task_record)?;
+        store.write_worker_file(
+            "task_notification_marker",
+            "task-record.json",
+            &format!("{task_record_json}\n"),
+        )?;
+
+        let task_record_path = store
+            .worker_dir("task_notification_marker")
+            .join("task-record.json");
+        let backup_path = task_record_path.with_extension("json.backup");
+        let event_store = store.clone();
+        let first_result = append_completion_notification_with_event_writer(
+            &store,
+            "session_notification_marker",
+            "goal_notification_marker",
+            "task_notification_marker",
+            8,
+            &{
+                let task_record_path = task_record_path.clone();
+                let backup_path = backup_path.clone();
+                move |completion_event| {
+                    event_store.append_event(completion_event)?;
+                    fs::rename(&task_record_path, &backup_path)?;
+                    fs::create_dir(&task_record_path)?;
+                    Ok(())
+                }
+            },
+        );
+        assert!(first_result.is_err());
+        assert!(task_record_path.is_dir());
+        fs::remove_dir(&task_record_path)?;
+        fs::rename(&backup_path, &task_record_path)?;
+
+        let event_store = store.clone();
+        append_completion_notification_with_event_writer(
+            &store,
+            "session_notification_marker",
+            "goal_notification_marker",
+            "task_notification_marker",
+            8,
+            &move |completion_event| event_store.append_event(completion_event).map(|_| ()),
+        )?;
+
+        let stored_task_record: TaskRecord =
+            serde_json::from_str(&fs::read_to_string(&task_record_path)?)?;
+        assert_eq!(stored_task_record.notified_epoch, 8);
+        let events = fs::read_to_string(store.events_path("session_notification_marker"))?;
+        let completion_events = events
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Event>(line).ok())
+            .filter(|event| matches!(event.kind, EventKind::CompletionNotified))
+            .count();
+        assert_eq!(completion_events, 1);
         Ok(())
     }
 
@@ -16201,6 +16997,7 @@ mod tests {
                     acceptance_signals: vec!["The successor has a durable edge".to_string()],
                     required_questions: Vec::new(),
                     evidence_refs: vec![input.final_report_path],
+                    answerable_now: false,
                     rationale: "The first epoch passed and has a bounded successor".to_string(),
                 };
                 Ok(StrategistNextGoalSubmission {
@@ -16566,6 +17363,7 @@ mod tests {
                     acceptance_signals: vec!["The successor has a durable edge".to_string()],
                     required_questions: Vec::new(),
                     evidence_refs: vec![input.final_report_path],
+                    answerable_now: false,
                     rationale: "The first epoch passed and has a bounded successor".to_string(),
                 };
                 Ok(StrategistNextGoalSubmission {

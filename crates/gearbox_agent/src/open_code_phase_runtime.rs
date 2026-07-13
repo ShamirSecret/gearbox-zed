@@ -3,9 +3,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context as _, Result, bail};
+use sha2::{Digest as _, Sha256};
 
 use crate::phase_routing::{
-    LiveModelInventory, OpenCodeModelProfiles, PhaseBackend, PhaseRouteDecision, PhaseRouteTable,
+    LiveModelInventory, OpenCodeModelProfiles, PhaseBackend, PhaseModelBinding, PhaseRouteDecision,
+    PhaseRouteTable,
 };
 #[cfg(test)]
 use crate::plan_graph::PhaseProfile;
@@ -17,7 +19,8 @@ use crate::plan_review::{IntentFoldVerdict, PhaseExecutionIdentity, PlanCriticVe
 use crate::runtime::{
     IntentFoldInput, IntentFoldSubmission, PhaseRuntime, PlanCriticInput, PlanCriticSubmission,
     PlanRevisionInput, PlanRevisionSubmission, PlannerInput, PlannerSubmission,
-    StrategistNextGoalInput, StrategistNextGoalSubmission, StrategistNextGoalVerdict,
+    RepositoryDiscoverySubmission, StrategistNextGoalInput, StrategistNextGoalSubmission,
+    StrategistNextGoalVerdict,
 };
 use crate::state::{
     ModelCallKind, ModelCallLedgerEntry, RepositoryObservationEvent, RepositoryObservationReceipt,
@@ -26,14 +29,15 @@ use crate::state::{
 use crate::task_manager::{
     ManagedTaskStatus, ResidencyState, TaskAttempt, TaskAttemptStatus, TaskRecord,
 };
-use crate::tools::CancellationToken;
+use crate::tools::{CancellationToken, git_head_commit};
 use crate::worker_broker::PhaseBrokerFactory;
-use crate::workers::{WorkerConfig, WorkerKind, WorkerStartRequest, WorkerStatus};
+use crate::workers::{WorkerConfig, WorkerKind, WorkerResult, WorkerStartRequest, WorkerStatus};
 
 /// Builder for a production `PhaseRuntime` that routes all planning and review
 /// phases through independent OpenCode session workers.
 ///
-/// Each phase (IntentFold, Planner, PlanCritic, PlanRevision, Strategist)
+/// Each planning phase (RepositoryDiscovery, IntentFold, Planner, PlanCritic,
+/// PlanRevision, Strategist)
 /// receives its own `execution_id`, `session_id`, and `task_id`.  Phases
 /// never share an actual worker session.
 pub struct OpenCodePhaseRuntimeFactory {
@@ -188,6 +192,27 @@ struct OpenCodePhaseOutput {
     repository_observation_path: Option<String>,
 }
 
+fn read_phase_output(result: &WorkerResult) -> Result<(String, Option<String>)> {
+    let output_path = result
+        .last_message_path
+        .as_ref()
+        .filter(|path| path.is_file())
+        .or_else(|| result.stdout_path.as_ref().filter(|path| path.is_file()));
+    let raw_output = output_path
+        .map(std::fs::read_to_string)
+        .transpose()?
+        .unwrap_or_else(|| result.summary.clone())
+        .trim()
+        .to_string();
+    if raw_output.is_empty() {
+        bail!("OpenCode phase returned an empty response");
+    }
+    Ok((
+        raw_output,
+        output_path.map(|path| path.to_string_lossy().to_string()),
+    ))
+}
+
 impl OpenCodePhaseRunner {
     pub fn new(
         broker_factory: Arc<PhaseBrokerFactory>,
@@ -216,6 +241,36 @@ impl OpenCodePhaseRunner {
         scope: Scope,
         prompt: String,
     ) -> Result<OpenCodePhaseOutput> {
+        self.run_with_follow_up(
+            decision,
+            goal_id,
+            plan_id,
+            plan_revision,
+            plan_hash,
+            task_id,
+            task_kind,
+            scope,
+            prompt,
+            |_result, _follow_up_index| Ok(None),
+        )
+    }
+
+    fn run_with_follow_up<F>(
+        &self,
+        decision: &PhaseRouteDecision,
+        goal_id: &str,
+        plan_id: &str,
+        plan_revision: usize,
+        plan_hash: Option<&str>,
+        task_id: &str,
+        task_kind: crate::state::TaskKind,
+        scope: Scope,
+        prompt: String,
+        mut follow_up: F,
+    ) -> Result<OpenCodePhaseOutput>
+    where
+        F: FnMut(&WorkerResult, usize) -> Result<Option<String>>,
+    {
         let call_ordinal = self.call_budget.reserve(goal_id)?;
         if !matches!(
             decision.candidate.backend,
@@ -224,10 +279,14 @@ impl OpenCodePhaseRunner {
             bail!("Gear OpenCode phase runner received a non-OpenCode route");
         }
         let config = decision.overlay_worker_config(&self.worker_config)?;
-        // The phase decision is authoritative for the task-record route. A
-        // Plan task may be read-only, but recording it as `explore` when the
-        // route selected `deep` makes the receipt disagree with its attempt.
-        let phase_route_hint = Some(decision.category.as_str());
+        // Spec phases are read-only discovery/interpretation turns. Keep the
+        // route decision's model binding, but use the Explore policy so the
+        // worker cannot write while gathering context or folding intent.
+        let phase_route_hint = if matches!(task_kind, crate::state::TaskKind::Spec) {
+            Some("explore")
+        } else {
+            Some(decision.category.as_str())
+        };
         let store = StateStore::new(&self.workspace);
         store.initialize()?;
         let task = Task {
@@ -247,7 +306,7 @@ impl OpenCodePhaseRunner {
             outputs: TaskOutputs::default(),
         };
         let suffix = id_timestamp();
-        let execution = self.broker_factory.execute_worker_phase(
+        let execution = self.broker_factory.execute_worker_phase_with_follow_up(
             decision,
             goal_id,
             plan_id,
@@ -268,6 +327,7 @@ impl OpenCodePhaseRunner {
                 coordinator_brief: None,
                 route_hint: phase_route_hint,
             },
+            |result, follow_up_index| follow_up(result, follow_up_index),
         )?;
         if execution.result.status != WorkerStatus::Succeeded {
             bail!(
@@ -289,7 +349,8 @@ impl OpenCodePhaseRunner {
             &config,
             &execution,
         )?;
-        let observation = RepositoryObservationReceipt::seal(
+        let capture_commit = git_head_commit(&self.workspace)?;
+        let observation = RepositoryObservationReceipt::seal_with_capture_commit(
             &format!(
                 "{}-{}",
                 phase_role_name(&decision.phase),
@@ -305,30 +366,15 @@ impl OpenCodePhaseRunner {
             call_entry.observed_tool_count,
             call_entry.observed_paths.clone(),
             call_entry.observation_events.clone(),
+            capture_commit,
         )?;
         let observation_path = store.write_repository_observation_receipt(&observation)?;
-        let raw_output = execution
-            .result
-            .last_message_path
-            .as_ref()
-            .filter(|path| path.is_file())
-            .or_else(|| {
-                execution
-                    .result
-                    .stdout_path
-                    .as_ref()
-                    .filter(|path| path.is_file())
-            })
-            .map(std::fs::read_to_string)
-            .transpose()?
-            .unwrap_or_else(|| execution.result.summary.clone());
-        let raw_output = raw_output.trim().to_string();
-        if raw_output.is_empty() {
-            bail!(
+        let (raw_output, _) = read_phase_output(&execution.result).with_context(|| {
+            format!(
                 "OpenCode {:?} phase returned an empty response",
                 decision.phase
-            );
-        }
+            )
+        })?;
         Ok(OpenCodePhaseOutput {
             raw_output,
             execution_identity: execution.execution_identity,
@@ -337,52 +383,174 @@ impl OpenCodePhaseRunner {
         })
     }
 
-    pub fn fold_intent(&self, input: IntentFoldInput) -> Result<IntentFoldSubmission> {
-        let prompt = gear_opencode_intent_fold_prompt(&input)?;
-        let mut output = self.run(
+    fn discover_repository(
+        &self,
+        input: &IntentFoldInput,
+    ) -> Result<RepositoryDiscoverySubmission> {
+        let task_id = format!("repository_discovery_{}", input.goal_id);
+        let output = self.run(
             &input.route_decision,
             &input.goal_id,
             &format!("pending_{}", input.goal_id),
             0,
             None,
-            &format!("intent_fold_{}", input.goal_id),
+            &task_id,
+            crate::state::TaskKind::Spec,
+            input.scope.clone(),
+            gear_opencode_repository_discovery_prompt(input)?,
+        )?;
+        let store = StateStore::new(&self.workspace);
+        store.initialize()?;
+        let capture_commit = git_head_commit(&self.workspace)?;
+        let artifact = serde_json::json!({
+            "schema_version": 1,
+            "phase": "repository_discovery",
+            "goal_id": input.goal_id,
+            "task_id": task_id,
+            "execution_identity": output.execution_identity,
+            "raw_output_sha256": sha256_hex(&output.raw_output),
+            "raw_output": output.raw_output,
+            "worker_artifact_path": output.artifact_path,
+            "repository_observation_path": output.repository_observation_path,
+            "capture_commit": capture_commit,
+            "issued_at": timestamp(),
+        });
+        let artifact_path = store.write_artifact(
+            &input.goal_id,
+            "repository-discovery.json",
+            &format!("{}\n", serde_json::to_string_pretty(&artifact)?),
+        )?;
+        let raw_output = artifact["raw_output"]
+            .as_str()
+            .context("repository discovery artifact lost raw output")?
+            .to_string();
+        let analyst = serde_json::from_value(artifact["execution_identity"].clone())?;
+        Ok(RepositoryDiscoverySubmission {
+            raw_output,
+            analyst,
+            artifact_path: artifact_path.to_string_lossy().to_string(),
+            repository_evidence_path: artifact["repository_observation_path"]
+                .as_str()
+                .map(ToOwned::to_owned),
+        })
+    }
+
+    pub fn fold_intent(&self, input: IntentFoldInput) -> Result<IntentFoldSubmission> {
+        let repository_discovery = self
+            .discover_repository(&input)
+            .context("repository discovery failed before IntentFold")?;
+        let prompt = gear_opencode_intent_fold_prompt(&input, &repository_discovery)?;
+        let task_id = format!("intent_fold_{}", input.goal_id);
+        let model = intent_fold_model_label(&input.route_decision);
+        let diagnostic_store = StateStore::new(&self.workspace);
+        diagnostic_store.initialize()?;
+        let mut verdict = None;
+        let mut parse_failures = 0;
+        let mut last_parse_failure: Option<(String, String, Option<String>)> = None;
+        let output = self.run_with_follow_up(
+            &input.route_decision,
+            &input.goal_id,
+            &format!("pending_{}", input.goal_id),
+            0,
+            None,
+            &task_id,
             crate::state::TaskKind::Spec,
             input.scope.clone(),
             prompt,
+            |result, follow_up_index| {
+                let (raw_output, raw_output_path) = read_phase_output(result)?;
+                match IntentFoldVerdict::parse(&raw_output) {
+                    Ok(parsed_verdict) => {
+                        let requires_repair = parsed_verdict.decision
+                            == crate::plan_review::IntentFoldDecision::NeedsUser
+                            || !parsed_verdict.required_questions.is_empty();
+                        if requires_repair && follow_up_index < MAX_INTENT_REPAIRS {
+                            self.call_budget.reserve(&input.goal_id)?;
+                            let repair_prompt = gear_opencode_intent_repair_prompt(
+                                &input,
+                                &raw_output,
+                                follow_up_index + 1,
+                            )?;
+                            return Ok(Some(repair_prompt));
+                        }
+                        if let Some((parse_error, failed_output, failed_path)) =
+                            last_parse_failure.take()
+                        {
+                            write_intent_fold_recovery_artifact(
+                                &diagnostic_store,
+                                &input,
+                                &task_id,
+                                &model,
+                                parse_failures,
+                                &parse_error,
+                                &failed_output,
+                                failed_path.as_deref(),
+                                "recovered",
+                            )?;
+                        }
+                        verdict = Some(parsed_verdict);
+                        Ok(None)
+                    }
+                    Err(error) => {
+                        let parse_error = error.to_string();
+                        parse_failures = parse_failures.saturating_add(1);
+                        if follow_up_index >= MAX_INTENT_REPAIRS {
+                            write_intent_fold_recovery_artifact(
+                                &diagnostic_store,
+                                &input,
+                                &task_id,
+                                &model,
+                                parse_failures,
+                                &parse_error,
+                                &raw_output,
+                                raw_output_path.as_deref(),
+                                "failed",
+                            )?;
+                            bail!(
+                                "intent fold strict parse failed after {} recovery attempts; diagnostic: {}/{}: {}",
+                                follow_up_index,
+                                task_id,
+                                "intent-fold-recovery.json",
+                                parse_error
+                            );
+                        }
+                        write_intent_fold_recovery_artifact(
+                            &diagnostic_store,
+                            &input,
+                            &task_id,
+                            &model,
+                            parse_failures,
+                            &parse_error,
+                            &raw_output,
+                            raw_output_path.as_deref(),
+                            "retrying",
+                        )?;
+                        last_parse_failure =
+                            Some((parse_error.clone(), raw_output, raw_output_path));
+                        self.call_budget.reserve(&input.goal_id)?;
+                        let repair_prompt = gear_opencode_intent_parse_repair_prompt(
+                            &input,
+                            &last_parse_failure
+                                .as_ref()
+                                .map(|(_, output, _)| output.as_str())
+                                .unwrap_or_default(),
+                            follow_up_index + 1,
+                            &parse_error,
+                        )?;
+                        Ok(Some(repair_prompt))
+                    }
+                }
+            },
         )?;
-        for repair_attempt in 0..=MAX_INTENT_REPAIRS {
-            let verdict = IntentFoldVerdict::parse(&output.raw_output)?;
-            let requires_repair = verdict.decision
-                == crate::plan_review::IntentFoldDecision::NeedsUser
-                || !verdict.required_questions.is_empty();
-            if !requires_repair || repair_attempt >= MAX_INTENT_REPAIRS {
-                return Ok(IntentFoldSubmission {
-                    verdict,
-                    analyst: output.execution_identity,
-                    raw_output: output.raw_output,
-                    artifact_path: Some(output.artifact_path),
-                    repository_evidence_path: output.repository_observation_path,
-                });
-            }
-            let repair_prompt =
-                gear_opencode_intent_repair_prompt(&input, &output.raw_output, repair_attempt + 1)?;
-            output = self.run(
-                &input.route_decision,
-                &input.goal_id,
-                &format!("pending_{}", input.goal_id),
-                0,
-                None,
-                &format!(
-                    "intent_fold_{}_repair_{}",
-                    input.goal_id,
-                    repair_attempt + 1
-                ),
-                crate::state::TaskKind::Spec,
-                input.scope.clone(),
-                repair_prompt,
-            )?;
-        }
-        bail!("intent fold repair loop terminated unexpectedly")
+        let verdict = verdict.context("intent fold recovery completed without a verdict")?;
+        Ok(IntentFoldSubmission {
+            verdict,
+            analyst: output.execution_identity,
+            raw_output: output.raw_output,
+            artifact_path: Some(output.artifact_path),
+            repository_evidence_path: output.repository_observation_path,
+            repository_discovery: Some(repository_discovery),
+        })
     }
 
     pub fn plan(&self, input: PlannerInput) -> Result<PlannerSubmission> {
@@ -707,6 +875,17 @@ fn phase_role_name(phase: &crate::plan_graph::PhaseProfile) -> &'static str {
     }
 }
 
+fn phase_worker_transcript_path(session_dir: &Path, result_path: &Path) -> PathBuf {
+    let ledger_transcript = session_dir.join("transcript.jsonl");
+    if ledger_transcript.is_file() {
+        return ledger_transcript;
+    }
+    result_path
+        .parent()
+        .map(|worker_dir| worker_dir.join("transcript.jsonl"))
+        .unwrap_or(ledger_transcript)
+}
+
 fn write_model_call_ledger_entry(
     store: &StateStore,
     workspace: &Path,
@@ -721,7 +900,8 @@ fn write_model_call_ledger_entry(
 ) -> Result<ModelCallLedgerEntry> {
     let finished_at = timestamp();
     let session_id = execution.session_identity.session_id.clone();
-    let transcript_path = execution.session_dir.join("transcript.jsonl");
+    let transcript_path =
+        phase_worker_transcript_path(&execution.session_dir, &execution.result.result_path);
     let (transcript_sha256, observed_tool_count, observed_paths, observation_events) =
         if transcript_path.is_file() {
             let contents = std::fs::read_to_string(&transcript_path)?;
@@ -734,12 +914,15 @@ fn write_model_call_ledger_entry(
                     .as_ref()
                     .map(ToString::to_string)
                     .unwrap_or_else(|| line.to_string());
-                if serialized.contains("tool_name") || serialized.contains("\"tool\"") {
-                    tool_count = tool_count.saturating_add(1);
-                }
                 if let Some(value) = value.as_ref() {
                     let (operation, candidates, has_tool_marker) =
                         transcript_tool_observation(value);
+                    if has_tool_marker
+                        || serialized.contains("tool_name")
+                        || serialized.contains("\"tool\"")
+                    {
+                        tool_count = tool_count.saturating_add(1);
+                    }
                     if has_tool_marker {
                         let event_hash = sha256_hex(line);
                         if let Some(operation) = operation {
@@ -876,6 +1059,13 @@ fn transcript_tool_observation(value: &serde_json::Value) -> (Option<String>, Ve
                     candidates.push(path.to_string());
                 }
             }
+            if key == "command"
+                && let Some(command) = child.as_str()
+            {
+                let command_name = command.split_whitespace().next().unwrap_or_default();
+                operation = operation.or_else(|| observation_operation(command_name));
+                candidates.extend(command_path_candidates(command));
+            }
             let (nested_operation, nested_candidates, nested_marker) =
                 transcript_tool_observation(child);
             operation = operation.or(nested_operation);
@@ -890,13 +1080,44 @@ fn transcript_tool_observation(value: &serde_json::Value) -> (Option<String>, Ve
             candidates.extend(nested_candidates);
             has_tool_marker |= nested_marker;
         }
+    } else if let serde_json::Value::String(text) = value {
+        let mut nested_operation = None;
+        let mut nested_candidates = Vec::new();
+        let mut nested_marker = false;
+        for line in text.lines().filter(|line| !line.trim().is_empty()) {
+            if let Ok(nested) = serde_json::from_str::<serde_json::Value>(line) {
+                let (operation, candidates, has_tool_marker) = transcript_tool_observation(&nested);
+                nested_operation = nested_operation.or(operation);
+                nested_candidates.extend(candidates);
+                nested_marker |= has_tool_marker;
+            }
+        }
+        return (nested_operation, nested_candidates, nested_marker);
     }
     (operation, candidates, has_tool_marker)
 }
 
+fn command_path_candidates(command: &str) -> Vec<String> {
+    command
+        .split_whitespace()
+        .filter_map(|token| {
+            let token = token
+                .trim_matches(|character| matches!(character, '\'' | '"' | '`' | ';' | '|'))
+                .trim_end_matches("/*");
+            (token.starts_with('/') || token.starts_with("./") || token.contains('/'))
+                .then(|| token.to_string())
+        })
+        .collect()
+}
+
 fn observation_operation(tool_name: &str) -> Option<String> {
     let normalized = tool_name.to_ascii_lowercase();
-    if normalized.contains("read") {
+    if normalized.contains("read")
+        || matches!(
+            normalized.as_str(),
+            "cat" | "head" | "tail" | "sed" | "awk" | "cut" | "wc" | "test" | "stat" | "pwd"
+        )
+    {
         Some("read".to_string())
     } else if normalized.contains("search")
         || normalized.contains("grep")
@@ -948,8 +1169,8 @@ fn gear_opencode_review_repair_prompt(
 fn gear_opencode_strategist_prompt(input: &StrategistNextGoalInput) -> Result<String> {
     Ok(format!(
         "You are Gearbox StrategistNextGoal. Review the completed execution epoch and return only one strict JSON object.\n\
-Schema: {{\"schema_version\":1,\"goal_id\":string,\"epoch_id\":string,\"reviewed_status\":\"draft|planning|running|verifying|needs_user|blocked|limited|complete|failed\",\"decision\":\"complete|continue|needs_user|stop\",\"next_objective\":string|null,\"acceptance_signals\":[string],\"required_questions\":[string],\"evidence_refs\":[string],\"rationale\":string}}.\n\
-Use continue only for a bounded next objective consistent with the original request. Do not propose an unbounded loop. Use complete only when reviewed_status is complete.\n\
+Schema: {{\"schema_version\":1,\"goal_id\":string,\"epoch_id\":string,\"reviewed_status\":\"draft|planning|running|verifying|needs_user|blocked|limited|complete|failed\",\"decision\":\"complete|continue|needs_user|stop\",\"next_objective\":string|null,\"acceptance_signals\":[string],\"required_questions\":[string],\"evidence_refs\":[string],\"answerable_now\":boolean,\"rationale\":string}}.\n\
+Set answerable_now=true only when the current evidence_refs are sufficient to answer the user's core request now. An answerable verdict must be terminal (stop or complete) and must cite evidence. Use false when more implementation, investigation, or verification is needed. Use continue only for a bounded next objective consistent with the original request. Do not propose an unbounded loop. Use complete only when reviewed_status is complete.\n\
 Goal: {}\nEpoch: {}\nOriginal request: {}\nStatus: {}\nSummary: {}\nFinal report: {}\nPlan:\n{}\nBudget ledger:\n{}",
         input.goal_id,
         input.epoch_id,
@@ -969,10 +1190,21 @@ fn gear_opencode_planner_prompt(input: &PlannerInput) -> Result<String> {
         .map(serde_json::to_string_pretty)
         .transpose()?
         .unwrap_or_else(|| "none".to_string());
+    let repository_discovery = input
+        .repository_discovery
+        .as_ref()
+        .map(|discovery| {
+            format!(
+                "artifact_path={}\nanalyst={:?}\nfindings:\n{}",
+                discovery.artifact_path, discovery.analyst, discovery.raw_output
+            )
+        })
+        .unwrap_or_else(|| "none".to_string());
     Ok(format!(
-        "You are Gear's read-only planner. Return exactly one PlanGraphDraft JSON object with no markdown fence or prose. Do not rename fields, replace arrays with strings or objects, or use prose values for enums. The complete nested contract exemplar is below; copy its shapes and use only the enum values shown. Every task must define task_id, title, goal, deliverable, dependencies, parallel_wave, scope, required_capabilities, preferred_phase_profile, must_do, must_not_do, references, test, qa, artifacts, commit_boundary, and completion_predicates. Dependencies must point to earlier waves. TDD tasks must use the same RED and GREEN command. Include happy and failure QA evidence paths. Treat the sealed IntentFold receipt as a binding interpretation of the goal: preserve its constraints, mitigate its risks, and turn its acceptance signals into executable checks. Do not write code.\n\nSchema exemplar:\n{}\n\nGoal:\n{}\n\nIntentFold receipt:\n{}\n\nScope:\n{}\n\nVerification commands:\n{}",
+        "You are Gear's read-only planner. Return exactly one PlanGraphDraft JSON object with no markdown fence or prose. Do not rename fields, replace arrays with strings or objects, or use prose values for enums. The complete nested contract exemplar is below; copy its shapes and use only the enum values shown. Every task must define task_id, title, goal, deliverable, dependencies, parallel_wave, scope, required_capabilities, preferred_phase_profile, must_do, must_not_do, references, test, qa, artifacts, commit_boundary, and completion_predicates. Dependencies must point to earlier waves. TDD tasks must use the same RED and GREEN command. Include happy and failure QA evidence paths. Treat the sealed repository discovery findings and IntentFold receipt as binding context: preserve discovered constraints, cite relevant paths, mitigate risks, and turn acceptance signals into executable checks. Do not write code.\n\nSchema exemplar:\n{}\n\nGoal:\n{}\n\nRepository discovery (must precede planning):\n{}\n\nIntentFold receipt:\n{}\n\nScope:\n{}\n\nVerification commands:\n{}",
         PLAN_GRAPH_SCHEMA_EXEMPLAR,
         input.request,
+        repository_discovery,
         intent_fold,
         serde_json::to_string_pretty(&input.scope)?,
         serde_json::to_string_pretty(&input.verification_commands)?,
@@ -985,11 +1217,22 @@ fn gear_opencode_planner_repair_prompt(
     diagnostic: &crate::plan_graph::PlannerParseDiagnostic,
     attempt: usize,
 ) -> Result<String> {
+    let repository_discovery = input
+        .repository_discovery
+        .as_ref()
+        .map(|discovery| {
+            format!(
+                "artifact_path={}\nfindings:\n{}",
+                discovery.artifact_path, discovery.raw_output
+            )
+        })
+        .unwrap_or_else(|| "none".to_string());
     Ok(format!(
-        "You are the same Gear planner on fresh repair turn {attempt}. Return a complete PlanGraphDraft JSON object only; never return a patch, prose, or markdown fence. Preserve the request and IntentFold semantics. Correct only the schema errors identified by Rust and keep all valid semantic content. Use the exact nested shapes and enum values in the exemplar.\n\nSchema exemplar:\n{PLAN_GRAPH_SCHEMA_EXEMPLAR}\n\nRust diagnostic:\n{}\n\nMalformed output to repair:\n{}\n\nOriginal goal:\n{}\n\nIntentFold receipt:\n{}\n\nScope:\n{}\n\nVerification commands:\n{}",
+        "You are the same Gear planner on fresh repair turn {attempt}. Return a complete PlanGraphDraft JSON object only; never return a patch, prose, or markdown fence. Preserve the request, repository discovery findings, and IntentFold semantics. Correct only the schema errors identified by Rust and keep all valid semantic content. Use the exact nested shapes and enum values in the exemplar.\n\nSchema exemplar:\n{PLAN_GRAPH_SCHEMA_EXEMPLAR}\n\nRust diagnostic:\n{}\n\nMalformed output to repair:\n{}\n\nOriginal goal:\n{}\n\nRepository discovery findings:\n{}\n\nIntentFold receipt:\n{}\n\nScope:\n{}\n\nVerification commands:\n{}",
         serde_json::to_string_pretty(diagnostic)?,
         raw_output,
         input.request,
+        repository_discovery,
         input
             .intent_fold
             .as_ref()
@@ -1001,11 +1244,25 @@ fn gear_opencode_planner_repair_prompt(
     ))
 }
 
-fn gear_opencode_intent_fold_prompt(input: &IntentFoldInput) -> Result<String> {
+fn gear_opencode_repository_discovery_prompt(input: &IntentFoldInput) -> Result<String> {
     Ok(format!(
-        "You are Gear's Metis-style read-only intent analyst. Do not plan tasks and do not write code. Return exactly one IntentFoldVerdict JSON object with no markdown fence or prose. Required shape: {{\"schema_version\":1,\"goal_id\":\"exact goal id\",\"normalized_objective\":\"clear outcome\",\"assumptions\":[\"explicit inference\"],\"constraints\":[\"binding boundary\"],\"ambiguities\":[\"remaining ambiguity\"],\"required_questions\":[\"only questions that change the solution\"],\"risks\":[{{\"code\":\"stable_code\",\"severity\":\"low|medium|high\",\"description\":\"specific risk\",\"mitigation\":\"specific mitigation\"}}],\"acceptance_signals\":[\"observable result\"],\"decision\":\"ready|needs_user\",\"summary\":\"concise conclusion\"}}. Use ready when the user has specified the behavior, scope, and acceptance. Gear owns runtime mechanics: evidence is stored under `.gearbox-agent/artifacts/<goal_id>`, verification commands are supplied by Gear, and workspace scope is enforced before dispatch. Do not ask where these artifacts live, how to run commands, or how phases are sequenced. Use needs_user only for a real product or safety decision that repository inspection and the runtime contract cannot resolve.\n\nGoal id: {}\nRequest:\n{}\n\nScope:\n{}",
+        "You are Gear's read-only repository discovery worker. This is the mandatory context-first wave before IntentFold and planning. Inspect the current workspace and gather concrete facts: repository layout, relevant files/symbols, existing implementation seams, applicable local rules, verification commands, constraints, risks, and unresolved unknowns. Use read-only lookup/explorer behavior only; do not edit, create, delete, or format files, do not run implementation commands, and do not write a plan. Return a concise findings report for the next Gear phases. Include exact paths and line/symbol references when available, distinguish observations from hypotheses, and state when a question is inconclusive.\n\nGoal id: {}\nRequest:\n{}\n\nScope:\n{}",
         input.goal_id,
         input.request,
+        serde_json::to_string_pretty(&input.scope)?,
+    ))
+}
+
+fn gear_opencode_intent_fold_prompt(
+    input: &IntentFoldInput,
+    repository_discovery: &RepositoryDiscoverySubmission,
+) -> Result<String> {
+    Ok(format!(
+        "You are Gear's Metis-style read-only intent analyst. Do not plan tasks and do not write code. Return exactly one IntentFoldVerdict JSON object with no markdown fence or prose. Required shape: {{\"schema_version\":1,\"goal_id\":\"exact goal id\",\"normalized_objective\":\"clear outcome\",\"assumptions\":[\"explicit inference\"],\"constraints\":[\"binding boundary\"],\"ambiguities\":[\"remaining ambiguity\"],\"required_questions\":[\"only questions that change the solution\"],\"risks\":[{{\"code\":\"stable_code\",\"severity\":\"low|medium|high\",\"description\":\"specific risk\",\"mitigation\":\"specific mitigation\"}}],\"acceptance_signals\":[\"observable result\"],\"decision\":\"ready|needs_user\",\"summary\":\"concise conclusion\"}}. Use ready when the user has specified the behavior, scope, and acceptance. Gear owns runtime mechanics: evidence is stored under `.gearbox-agent/artifacts/<goal_id>`, verification commands are supplied by Gear, and workspace scope is enforced before dispatch. Do not ask where these artifacts live, how to run commands, or how phases are sequenced. Use needs_user only for a real product or safety decision that repository inspection and the runtime contract cannot resolve. Treat the prior discovery findings as evidence, preserve concrete paths and constraints, and do not silently replace an inconclusive observation with an assumption.\n\nGoal id: {}\nRequest:\n{}\n\nRepository discovery findings (completed before this turn):\nartifact_path={}\n{}\n\nScope:\n{}",
+        input.goal_id,
+        input.request,
+        repository_discovery.artifact_path,
+        repository_discovery.raw_output,
         serde_json::to_string_pretty(&input.scope)?,
     ))
 }
@@ -1022,6 +1279,67 @@ fn gear_opencode_intent_repair_prompt(
         serde_json::to_string_pretty(&Vec::<String>::new())?,
         raw_output,
     ))
+}
+
+fn gear_opencode_intent_parse_repair_prompt(
+    input: &IntentFoldInput,
+    raw_output: &str,
+    attempt: usize,
+    parse_error: &str,
+) -> Result<String> {
+    let prompt = gear_opencode_intent_repair_prompt(input, raw_output, attempt)?;
+    Ok(format!(
+        "{prompt}\n\nStrict parser error from the previous turn:\n{parse_error}\n\
+         Preserve the strict schema. Do not add fields outside IntentFoldVerdict."
+    ))
+}
+
+fn intent_fold_model_label(decision: &PhaseRouteDecision) -> String {
+    if let Some(model) = &decision.requested_model {
+        return model.qualified_model_id();
+    }
+    match &decision.candidate.model {
+        PhaseModelBinding::BackendDeclared(model) => {
+            let worker = decision
+                .worker_kind
+                .as_ref()
+                .map(WorkerKind::as_str)
+                .unwrap_or("unknown");
+            format!("{worker}/{model}")
+        }
+        _ => "unknown".to_string(),
+    }
+}
+
+fn write_intent_fold_recovery_artifact(
+    store: &StateStore,
+    input: &IntentFoldInput,
+    task_id: &str,
+    model: &str,
+    retry_count: usize,
+    parse_error: &str,
+    raw_output: &str,
+    raw_output_path: Option<&str>,
+    final_status: &str,
+) -> Result<()> {
+    let artifact = serde_json::json!({
+        "schema_version": 1,
+        "phase": "intent_fold",
+        "goal_id": input.goal_id,
+        "task_id": task_id,
+        "model": model,
+        "retry_count": retry_count,
+        "parse_error": parse_error,
+        "raw_output_sha256": format!("{:x}", Sha256::digest(raw_output.as_bytes())),
+        "raw_output_path": raw_output_path,
+        "final_status": final_status,
+    });
+    store.write_worker_file(
+        task_id,
+        "intent-fold-recovery.json",
+        &format!("{}\n", serde_json::to_string_pretty(&artifact)?),
+    )?;
+    Ok(())
 }
 
 fn gear_opencode_plan_critic_prompt(input: &PlanCriticInput) -> Result<String> {
@@ -1172,6 +1490,52 @@ mod tests {
     }
 
     #[test]
+    fn phase_transcript_falls_back_to_worker_artifact_transcript() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let session_dir = temp_dir.path().join("broker-session");
+        let result_path = temp_dir.path().join("workers/task/result.json");
+        let worker_transcript = result_path
+            .parent()
+            .context("worker result path has no parent")?
+            .join("transcript.jsonl");
+        std::fs::create_dir_all(
+            worker_transcript
+                .parent()
+                .context("missing transcript parent")?,
+        )?;
+        std::fs::write(&worker_transcript, "{}\n")?;
+        assert_eq!(
+            phase_worker_transcript_path(&session_dir, &result_path),
+            worker_transcript
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nested_opencode_transcript_delta_yields_read_observation() -> Result<()> {
+        let nested = serde_json::json!({
+            "type": "tool_use",
+            "tool": "bash",
+            "state": {
+                "input": {
+                    "command": "ls -la ./src/lib.rs"
+                }
+            }
+        });
+        let transcript_line = serde_json::json!({
+            "assistant_text_delta": {
+                "delta": serde_json::to_string(&nested)?
+            }
+        });
+        let (operation, candidates, has_tool_marker) =
+            transcript_tool_observation(&transcript_line);
+        assert_eq!(operation.as_deref(), Some("list"));
+        assert_eq!(candidates, vec!["./src/lib.rs"]);
+        assert!(has_tool_marker);
+        Ok(())
+    }
+
+    #[test]
     fn intent_fold_repairs_runtime_owned_questions_on_a_fresh_turn() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let counter_path = temp_dir.path().join("intent-turn-count");
@@ -1184,7 +1548,7 @@ count=0
 [ -f '{counter}' ] && count=$(cat '{counter}')
 count=$((count + 1))
 printf '%s' "$count" > '{counter}'
-if [ "$count" -eq 1 ]; then printf '%s' '{{"schema_version":1,"goal_id":"intent_goal","normalized_objective":"outcome","required_questions":["where are artifacts?"],"decision":"needs_user","summary":"needs runtime clarification"}}' > "$GEARBOX_WORKER_LAST_MESSAGE"; else printf '%s' '{{"schema_version":1,"goal_id":"intent_goal","normalized_objective":"outcome","acceptance_signals":["verified"],"decision":"ready","summary":"ready"}}' > "$GEARBOX_WORKER_LAST_MESSAGE"; fi
+if [ "$count" -eq 2 ]; then printf '%s' '{{"schema_version":1,"goal_id":"intent_goal","normalized_objective":"outcome","required_questions":["where are artifacts?"],"decision":"needs_user","summary":"needs runtime clarification"}}' > "$GEARBOX_WORKER_LAST_MESSAGE"; else printf '%s' '{{"schema_version":1,"goal_id":"intent_goal","normalized_objective":"outcome","acceptance_signals":["verified"],"decision":"ready","summary":"ready"}}' > "$GEARBOX_WORKER_LAST_MESSAGE"; fi
 "#,
                 counter = counter_path.to_string_lossy(),
             ),
@@ -1219,7 +1583,235 @@ if [ "$count" -eq 1 ]; then printf '%s' '{{"schema_version":1,"goal_id":"intent_
             submission.verdict.decision,
             crate::plan_review::IntentFoldDecision::Ready
         );
-        assert_eq!(std::fs::read_to_string(counter_path)?, "2");
+        assert_eq!(std::fs::read_to_string(counter_path)?, "3");
+        Ok(())
+    }
+
+    #[test]
+    fn repository_discovery_precedes_intent_fold_and_planner() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let counter_path = temp_dir.path().join("phase-turn-count");
+        let prompt_log = temp_dir.path().join("phase-prompts.log");
+        let policy_log = temp_dir.path().join("phase-policies.log");
+        let output_path = temp_dir.path().join("valid-plan.json");
+        std::fs::write(&output_path, PLAN_GRAPH_SCHEMA_EXEMPLAR)?;
+        let script_path = temp_dir.path().join("discovery-worker.sh");
+        std::fs::write(
+            &script_path,
+            format!(
+                r#"#!/bin/sh
+count=0
+[ -f '{counter}' ] && count=$(cat '{counter}')
+count=$((count + 1))
+printf '%s' "$count" > '{counter}'
+cat "$GEARBOX_WORKER_PROMPT" >> '{prompts}'
+echo '---TURN---' >> '{prompts}'
+printf '%s\n' "$GEARBOX_WORKER_TOOL_POLICY" >> '{policies}'
+if [ "$count" -eq 1 ]; then printf '%s' 'discovered paths: src/main.rs; constraint: preserve the public API' > "$GEARBOX_WORKER_LAST_MESSAGE";
+elif [ "$count" -eq 2 ]; then printf '%s' '{{"schema_version":1,"goal_id":"discovery_order_goal","normalized_objective":"outcome","acceptance_signals":["verified"],"decision":"ready","summary":"ready"}}' > "$GEARBOX_WORKER_LAST_MESSAGE";
+else cp '{plan}' "$GEARBOX_WORKER_LAST_MESSAGE"; fi
+"#,
+                counter = counter_path.to_string_lossy(),
+                prompts = prompt_log.to_string_lossy(),
+                policies = policy_log.to_string_lossy(),
+                plan = output_path.to_string_lossy(),
+            ),
+        )?;
+        let mut config = test_worker_config();
+        config.worker_command = Some(format!("sh {}", script_path.to_string_lossy()));
+        let broker_factory = Arc::new(PhaseBrokerFactory::new(
+            Arc::new(WorkerRegistry::default()),
+            temp_dir.path().join(".gearbox-agent"),
+        ));
+        let routes = PhaseRouteTable::opencode_only(OpenCodeModelProfiles {
+            planner: "openai/gpt-planner".to_string(),
+            executor: "deepseek/flash".to_string(),
+            reviewer: "openai/gpt-reviewer".to_string(),
+        })?;
+        let runner = OpenCodePhaseRunner {
+            broker_factory,
+            workspace: temp_dir.path().to_path_buf(),
+            worker_config: config,
+            cancellation_token: CancellationToken::new(),
+            call_budget: PhaseCallBudget::default(),
+        };
+        let decision =
+            routes.resolve(&PhaseProfile::Planner, &LiveModelInventory::default(), None)?;
+        let intent = runner.fold_intent(IntentFoldInput {
+            goal_id: "discovery_order_goal".to_string(),
+            request: "produce the explicit outcome".to_string(),
+            scope: Scope::new(Vec::new(), Vec::new(), 1),
+            route_decision: decision.clone(),
+        })?;
+        let discovery = intent
+            .repository_discovery
+            .clone()
+            .context("IntentFold must carry repository discovery evidence")?;
+        assert_eq!(std::fs::read_to_string(&counter_path)?, "2");
+        assert!(Path::new(&discovery.artifact_path).is_file());
+        let discovery_artifact: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&discovery.artifact_path)?)?;
+        assert_eq!(discovery_artifact["phase"], "repository_discovery");
+        assert_eq!(
+            discovery_artifact["task_id"],
+            "repository_discovery_discovery_order_goal"
+        );
+        assert!(
+            discovery_artifact["raw_output_sha256"]
+                .as_str()
+                .is_some_and(|hash| hash.len() == 64)
+        );
+        let receipt = crate::plan_review::IntentFoldReceipt::seal(
+            intent.verdict.clone(),
+            intent.analyst.clone(),
+            &intent.raw_output,
+            intent.artifact_path.clone(),
+            timestamp(),
+        )?;
+        let planner = runner.plan(PlannerInput {
+            goal_id: "discovery_order_goal".to_string(),
+            request: "produce the explicit outcome".to_string(),
+            scope: Scope::new(Vec::new(), Vec::new(), 1),
+            verification_commands: Vec::new(),
+            route_decision: decision,
+            intent_fold: Some(receipt),
+            repository_discovery: Some(discovery),
+        })?;
+        assert_eq!(planner.draft.tasks.len(), 1);
+        assert_eq!(std::fs::read_to_string(&counter_path)?, "3");
+        let prompts = std::fs::read_to_string(prompt_log)?;
+        assert!(prompts.contains("discovered paths: src/main.rs"));
+        assert!(prompts.contains("Repository discovery (must precede planning)"));
+        let policies = std::fs::read_to_string(policy_log)?;
+        assert_eq!(policies.matches("\"can_write\":false").count(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn intent_fold_recovers_unknown_field_on_same_task_session() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let counter_path = temp_dir.path().join("intent-parse-turn-count");
+        let script_path = temp_dir.path().join("intent-parse-worker.sh");
+        std::fs::write(
+            &script_path,
+            format!(
+                r#"#!/bin/sh
+count=0
+[ -f '{counter}' ] && count=$(cat '{counter}')
+count=$((count + 1))
+printf '%s' "$count" > '{counter}'
+if [ "$count" -eq 2 ]; then printf '%s' '{{"schema_version":1,"goal_id":"intent_parse_goal","normalized_objective":"outcome","decision":"ready","summary":"invalid","write":true}}' > "$GEARBOX_WORKER_LAST_MESSAGE"; else printf '%s' '{{"schema_version":1,"goal_id":"intent_parse_goal","normalized_objective":"outcome","acceptance_signals":["verified"],"decision":"ready","summary":"ready"}}' > "$GEARBOX_WORKER_LAST_MESSAGE"; fi
+"#,
+                counter = counter_path.to_string_lossy(),
+            ),
+        )?;
+        let mut config = test_worker_config();
+        config.worker_command = Some(format!("sh {}", script_path.to_string_lossy()));
+        let broker_factory = Arc::new(PhaseBrokerFactory::new(
+            Arc::new(WorkerRegistry::default()),
+            temp_dir.path().join(".gearbox-agent"),
+        ));
+        let routes = PhaseRouteTable::opencode_only(OpenCodeModelProfiles {
+            planner: "openai/gpt-planner".to_string(),
+            executor: "deepseek/flash".to_string(),
+            reviewer: "openai/gpt-reviewer".to_string(),
+        })?;
+        let runner = OpenCodePhaseRunner {
+            broker_factory,
+            workspace: temp_dir.path().to_path_buf(),
+            worker_config: config,
+            cancellation_token: CancellationToken::new(),
+            call_budget: PhaseCallBudget::default(),
+        };
+        let decision =
+            routes.resolve(&PhaseProfile::Planner, &LiveModelInventory::default(), None)?;
+        let submission = runner.fold_intent(IntentFoldInput {
+            goal_id: "intent_parse_goal".to_string(),
+            request: "produce the explicit outcome".to_string(),
+            scope: Scope::new(Vec::new(), Vec::new(), 1),
+            route_decision: decision,
+        })?;
+
+        assert_eq!(
+            submission.verdict.decision,
+            crate::plan_review::IntentFoldDecision::Ready
+        );
+        assert_eq!(std::fs::read_to_string(counter_path)?, "3");
+        let worker_dir =
+            StateStore::new(temp_dir.path()).worker_dir("intent_fold_intent_parse_goal");
+        assert!(worker_dir.join("follow-up-1.md").is_file());
+        assert!(worker_dir.join("transcript.jsonl").is_file());
+        let recovery: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
+            worker_dir.join("intent-fold-recovery.json"),
+        )?)?;
+        assert_eq!(recovery["final_status"], "recovered");
+        assert_eq!(recovery["retry_count"], 1);
+        assert!(
+            recovery["parse_error"]
+                .as_str()
+                .is_some_and(|error| error.contains("unknown field"))
+        );
+        assert!(
+            recovery["raw_output_sha256"]
+                .as_str()
+                .is_some_and(|hash| hash.len() == 64)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn intent_fold_exhausted_parse_recovery_writes_failure_diagnostic() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let script_path = temp_dir.path().join("intent-parse-failing-worker.sh");
+        std::fs::write(
+            &script_path,
+            r#"#!/bin/sh
+printf '%s' '{"schema_version":1,"goal_id":"intent_exhausted_goal","normalized_objective":"outcome","decision":"ready","summary":"invalid","write":true}' > "$GEARBOX_WORKER_LAST_MESSAGE"
+"#,
+        )?;
+        let mut config = test_worker_config();
+        config.worker_command = Some(format!("sh {}", script_path.to_string_lossy()));
+        let broker_factory = Arc::new(PhaseBrokerFactory::new(
+            Arc::new(WorkerRegistry::default()),
+            temp_dir.path().join(".gearbox-agent"),
+        ));
+        let routes = PhaseRouteTable::opencode_only(OpenCodeModelProfiles {
+            planner: "openai/gpt-planner".to_string(),
+            executor: "deepseek/flash".to_string(),
+            reviewer: "openai/gpt-reviewer".to_string(),
+        })?;
+        let runner = OpenCodePhaseRunner {
+            broker_factory,
+            workspace: temp_dir.path().to_path_buf(),
+            worker_config: config,
+            cancellation_token: CancellationToken::new(),
+            call_budget: PhaseCallBudget::default(),
+        };
+        let decision =
+            routes.resolve(&PhaseProfile::Planner, &LiveModelInventory::default(), None)?;
+        let error = runner
+            .fold_intent(IntentFoldInput {
+                goal_id: "intent_exhausted_goal".to_string(),
+                request: "produce the explicit outcome".to_string(),
+                scope: Scope::new(Vec::new(), Vec::new(), 1),
+                route_decision: decision,
+            })
+            .expect_err("malformed output must not become an IntentFold submission");
+        assert!(error.to_string().contains("strict parse failed"));
+
+        let worker_dir =
+            StateStore::new(temp_dir.path()).worker_dir("intent_fold_intent_exhausted_goal");
+        assert!(worker_dir.join("follow-up-1.md").is_file());
+        let recovery: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
+            worker_dir.join("intent-fold-recovery.json"),
+        )?)?;
+        assert_eq!(recovery["final_status"], "failed");
+        assert_eq!(recovery["retry_count"], 2);
+        assert!(
+            recovery["raw_output_path"]
+                .as_str()
+                .is_some_and(|path| !path.is_empty())
+        );
         Ok(())
     }
 
@@ -1261,6 +1853,7 @@ if [ "$count" -eq 1 ]; then printf '%s' '{{"schema_version":1,"goal_id":"intent_
             verification_commands: vec!["echo verify".to_string()],
             route_decision: planner_decision.clone(),
             intent_fold: None,
+            repository_discovery: None,
         })?;
         let second = runner.plan(PlannerInput {
             goal_id: "goal_b".to_string(),
@@ -1269,6 +1862,7 @@ if [ "$count" -eq 1 ]; then printf '%s' '{{"schema_version":1,"goal_id":"intent_
             verification_commands: vec!["echo verify".to_string()],
             route_decision: planner_decision,
             intent_fold: None,
+            repository_discovery: None,
         })?;
 
         // Two invocations must have independent execution identities.
@@ -1334,6 +1928,7 @@ if [ "$count" -eq 1 ]; then printf '%s' '{{"schema_version":1,"goal_id":"intent_
             verification_commands: Vec::new(),
             route_decision: decision,
             intent_fold: None,
+            repository_discovery: None,
         })?;
         assert_eq!(submission.draft.tasks.len(), 1);
         assert_eq!(std::fs::read_to_string(counter_path)?, "2");

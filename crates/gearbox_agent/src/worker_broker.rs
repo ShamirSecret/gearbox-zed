@@ -1367,6 +1367,86 @@ impl WorkerBroker {
         Ok(())
     }
 
+    /// Send a follow-up prompt after a completed turn without creating a new
+    /// broker session.
+    ///
+    /// Phase recovery uses the resident session handle while the broker is in
+    /// IdleSteering. The transition back to Active is recorded before the
+    /// handle is called so a failed follow-up still remains auditable and can
+    /// be cancelled by the caller.
+    pub fn follow_up_from_idle(&self, prompt: String) -> Result<()> {
+        let (handle, state_name, ledger_paths, ordinal) = {
+            let mut inner = self
+                .state
+                .lock()
+                .map_err(|e| anyhow::anyhow!("worker broker state mutex poisoned: {e}"))?;
+
+            if inner.lifecycle != LifecycleState::IdleSteering {
+                bail!(
+                    "follow_up_from_idle requires IdleSteering state, got {:?}",
+                    inner.lifecycle.name()
+                );
+            }
+
+            let identity = inner
+                .session_identity
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("no session identity"))?;
+            if !identity.supports(&BrokerCapability::FollowUp) {
+                bail!(
+                    "session {:?} does not advertise FollowUp capability",
+                    identity.session_id
+                );
+            }
+
+            let handle = inner
+                .session_handle
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("no session handle"))?
+                .clone();
+            let ledger_paths = inner
+                .ledger_paths
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("no ledger paths"))?;
+            let state_name = inner.lifecycle.name();
+            let ordinal = inner.next_ordinal();
+            inner.lifecycle = LifecycleState::Active;
+
+            (handle, state_name, ledger_paths, ordinal)
+        };
+
+        handle
+            .send_follow_up(prompt.clone())
+            .context("worker session follow_up from idle failed")?;
+
+        self.append_lifecycle_event_to(
+            Some(&state_name),
+            &format!(
+                "follow-up from idle: {}",
+                prompt.chars().take(80).collect::<String>()
+            ),
+            LifecycleStateName::Active,
+            &ledger_paths,
+        )?;
+
+        let receipt = self.make_interaction_receipt(
+            ordinal,
+            BrokerOutcome::FollowedUp,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        write_json(&ledger_paths.receipt_path(ordinal), &receipt)
+            .map_err(|e| LedgerWriteError {
+                path: ledger_paths.receipt_path(ordinal),
+                reason: format!("failed to write receipt: {e}"),
+            })
+            .with_context(|| "ledger write error")?;
+
+        Ok(())
+    }
+
     /// Send a steering prompt to the idle session.
     ///
     /// Only allowed when the session is in `IdleSteering` state and
@@ -2402,6 +2482,34 @@ impl PhaseBrokerFactory {
         phase_session_id: &str,
         request: WorkerStartRequest<'_>,
     ) -> Result<PhaseWorkerExecution> {
+        self.execute_worker_phase_with_follow_up(
+            phase_decision,
+            goal_id,
+            plan_id,
+            plan_revision,
+            task_id,
+            execution_id,
+            phase_session_id,
+            request,
+            |_result, _follow_up_index| Ok(None),
+        )
+    }
+
+    pub fn execute_worker_phase_with_follow_up<F>(
+        &self,
+        phase_decision: &PhaseRouteDecision,
+        goal_id: &str,
+        plan_id: &str,
+        plan_revision: usize,
+        task_id: &str,
+        execution_id: &str,
+        phase_session_id: &str,
+        request: WorkerStartRequest<'_>,
+        mut follow_up: F,
+    ) -> Result<PhaseWorkerExecution>
+    where
+        F: FnMut(&WorkerResult, usize) -> Result<Option<String>>,
+    {
         if phase_decision.worker_kind.is_none() {
             bail!(
                 "phase {:?} is not configured for a worker session",
@@ -2441,8 +2549,17 @@ impl PhaseBrokerFactory {
         let execution = (|| -> Result<PhaseWorkerExecution> {
             broker.resolve(phase_request)?;
             let handle = broker.start_via_broker(request)?;
+            let mut follow_up_index = 0;
+            let result = loop {
+                broker.wait()?;
+                let result = handle.wait_for_result()?;
+                let Some(prompt) = follow_up(&result, follow_up_index)? else {
+                    break result;
+                };
+                follow_up_index = follow_up_index.saturating_add(1);
+                broker.follow_up_from_idle(prompt)?;
+            };
             broker.wait_for_outcome()?;
-            let result = handle.wait_for_result()?;
             let usage = broker.latest_receipt()?.and_then(|receipt| receipt.usage);
             let session_identity = broker.session_identity()?;
             let session_dir = broker.session_ledger_dir()?;

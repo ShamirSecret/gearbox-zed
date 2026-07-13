@@ -215,6 +215,47 @@ pub fn git_snapshot(workspace: &Path) -> Result<DiffSnapshot> {
     })
 }
 
+/// Return the repository HEAD used to bind evidence captured in this workspace.
+/// Non-Git directories return `None`; callers decide whether that is compatible
+/// with the evidence gate they are enforcing.
+pub fn git_head_commit(workspace: &Path) -> Result<Option<String>> {
+    let repository_check = run_raw_git(workspace, &["rev-parse", "--is-inside-work-tree"])?;
+    if !repository_check.success {
+        let diagnostic = format!(
+            "{}{}",
+            repository_check.stdout.trim(),
+            repository_check.stderr.trim()
+        );
+        if diagnostic
+            .to_ascii_lowercase()
+            .contains("not a git repository")
+        {
+            return Ok(None);
+        }
+        bail!(
+            "failed to determine whether {} is a Git workspace: {}",
+            workspace.display(),
+            diagnostic.trim()
+        );
+    }
+    let result = run_raw_git(workspace, &["rev-parse", "HEAD"])?;
+    if !result.success {
+        bail!(
+            "failed to resolve Git HEAD in {}: {}",
+            workspace.display(),
+            result.stderr.trim()
+        );
+    }
+    if result.stdout.trim().is_empty() {
+        return Ok(None);
+    }
+    let commit = result.stdout.trim();
+    if commit.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(commit.to_string()))
+}
+
 /// Strip timestamp noise from `---`/`+++` header lines so that semantically
 /// identical diffs produced at different times hash to the same value.
 pub fn normalize_diff_patch(patch: &str) -> String {
@@ -425,6 +466,25 @@ mod tests {
         );
 
         assert_eq!(paths, vec!["src/main.rs".to_string(), "new.rs".to_string()]);
+    }
+
+    #[test]
+    fn git_head_commit_distinguishes_repository_and_non_repository() {
+        let repository = git_head_commit(Path::new(env!("CARGO_MANIFEST_DIR")))
+            .expect("repository HEAD lookup should succeed")
+            .expect("gearbox_agent should be inside a Git repository");
+        assert!(repository.len() >= 7);
+        assert!(
+            repository
+                .chars()
+                .all(|character| character.is_ascii_hexdigit())
+        );
+
+        let temp_dir = tempfile::tempdir().expect("failed to create temp directory");
+        assert_eq!(
+            git_head_commit(temp_dir.path()).expect("non-Git lookup should not error"),
+            None
+        );
     }
 
     #[test]

@@ -41,8 +41,9 @@ pub use tool_permissions::*;
 pub use tools::*;
 
 use acp_thread::{
-    AcpThread, AgentModelId, AgentModelSelector, AgentSessionInfo, AgentSessionList,
-    AgentSessionListRequest, AgentSessionListResponse, ClientUserMessageId, TokenUsageRatio,
+    AcpThread, AcpThreadEvent, AgentModelId, AgentModelSelector, AgentSessionInfo,
+    AgentSessionList, AgentSessionListRequest, AgentSessionListResponse, ClientUserMessageId,
+    TokenUsageRatio,
 };
 use agent_client_protocol::schema::v1 as acp;
 use agent_skills::{
@@ -5891,9 +5892,9 @@ impl NativeWorkerBackend for GearZedWorkerBackend {
                 store: request.store.clone(),
                 task_id: request.task.id.clone(),
                 prompt,
-                packet_path,
-                prompt_path,
-                worker_model,
+                packet_path: packet_path.clone(),
+                prompt_path: prompt_path.clone(),
+                worker_model: worker_model.clone(),
                 cancellation_token: cancellation_token.clone(),
                 state: state.clone(),
             }))
@@ -6426,6 +6427,7 @@ struct GearAcpBrokerJob {
     worker_model: Option<String>,
     cancellation_token: CancellationToken,
     state: Arc<(Mutex<GearAcpBrokerState>, Condvar)>,
+    session_id: Option<acp::SessionId>,
 }
 
 /// Mutable state shared between the foreground dispatcher and the session handle.
@@ -6437,8 +6439,10 @@ struct GearAcpBrokerState {
     usage: Option<BrokerUsage>,
     pending_interactions: VecDeque<GearAcpBrokerInteraction>,
     interaction_count: usize,
+    observed_tool_call_ids: HashSet<String>,
     /// Permission events recorded during the interaction.
     permission_events: Vec<BrokerPermissionEvidence>,
+    observed_permission_resolution_ids: HashSet<String>,
     event_hub: WorkerEventHub,
 }
 
@@ -6477,6 +6481,9 @@ impl GearAcpBrokerBackend {
 /// Session handle returned by `GearAcpBrokerBackend::start_zed_agent`.
 struct GearAcpBrokerSessionHandle {
     task_id: String,
+    store: gearbox_agent::state::StateStore,
+    packet_path: PathBuf,
+    worker_model: Option<String>,
     request_tx: async_channel::Sender<GearAcpBrokerDispatch>,
     state: Arc<(Mutex<GearAcpBrokerState>, Condvar)>,
     cancellation_token: CancellationToken,
@@ -6487,14 +6494,44 @@ impl GearAcpBrokerSessionHandle {
         &self,
         kind: GearAcpBrokerInteractionKind,
         prompt: String,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let (lock, _) = &*self.state;
         let mut state = lock.lock().expect("acp broker state poisoned");
+        let resume_session_id = state.result.as_ref().and_then(|_| state.session_id.clone());
         state.result = None;
-        state
-            .pending_interactions
-            .push_back(GearAcpBrokerInteraction { kind, prompt });
-        Ok(())
+        if resume_session_id.is_none() {
+            state
+                .pending_interactions
+                .push_back(GearAcpBrokerInteraction { kind, prompt });
+            return Ok(false);
+        }
+        state.interaction_count = state.interaction_count.saturating_add(1);
+        let interaction_index = state.interaction_count;
+        drop(state);
+
+        let prompt_path = self.store.write_worker_file(
+            &self.task_id,
+            &format!("{}-{}.md", kind.as_str(), interaction_index),
+            &format!(
+                "# ACP broker worker {}\n\n{}\n",
+                kind.as_str(),
+                prompt.trim()
+            ),
+        )?;
+        self.request_tx
+            .send_blocking(GearAcpBrokerDispatch::Run(GearAcpBrokerJob {
+                store: self.store.clone(),
+                task_id: self.task_id.clone(),
+                prompt,
+                packet_path: self.packet_path.clone(),
+                prompt_path,
+                worker_model: self.worker_model.clone(),
+                cancellation_token: self.cancellation_token.clone(),
+                state: self.state.clone(),
+                session_id: resume_session_id,
+            }))
+            .context("failed to queue terminal ACP worker revive")?;
+        Ok(true)
     }
 }
 
@@ -6597,16 +6634,20 @@ impl NativeWorkerBackend for GearAcpBrokerBackend {
                 store: request.store.clone(),
                 task_id: request.task.id.clone(),
                 prompt,
-                packet_path,
-                prompt_path,
-                worker_model,
+                packet_path: packet_path.clone(),
+                prompt_path: prompt_path.clone(),
+                worker_model: worker_model.clone(),
                 cancellation_token: cancellation_token.clone(),
                 state: state.clone(),
+                session_id: None,
             }))
             .context("failed to queue acp broker worker job")?;
 
         Ok(Arc::new(GearAcpBrokerSessionHandle {
             task_id: request.task.id.clone(),
+            store: request.store.clone(),
+            packet_path,
+            worker_model,
             request_tx: self.request_tx.clone(),
             state,
             cancellation_token,
@@ -6625,16 +6666,20 @@ impl WorkerSessionHandle for GearAcpBrokerSessionHandle {
 
     fn send_follow_up(&self, prompt: String) -> Result<()> {
         self.enqueue_interaction(GearAcpBrokerInteractionKind::FollowUp, prompt)
+            .map(|_| ())
     }
 
     fn steer(&self, prompt: String) -> Result<()> {
-        self.enqueue_interaction(GearAcpBrokerInteractionKind::Steer, prompt)?;
-        self.request_tx
-            .send_blocking(GearAcpBrokerDispatch::SetEndTurnAtBoundary {
-                task_id: self.task_id.clone(),
-                enabled: true,
-            })
-            .ok();
+        let terminal_revive =
+            self.enqueue_interaction(GearAcpBrokerInteractionKind::Steer, prompt)?;
+        if !terminal_revive {
+            self.request_tx
+                .send_blocking(GearAcpBrokerDispatch::SetEndTurnAtBoundary {
+                    task_id: self.task_id.clone(),
+                    enabled: true,
+                })
+                .ok();
+        }
         Ok(())
     }
 
@@ -6685,6 +6730,15 @@ impl WorkerSessionHandle for GearAcpBrokerSessionHandle {
             .event_hub
             .clone();
         event_hub.subscribe(listener)
+    }
+
+    fn reset_event_history(&self) -> Result<()> {
+        let state = self
+            .state
+            .0
+            .lock()
+            .map_err(|_| anyhow!("acp broker state poisoned"))?;
+        state.event_hub.clear_history()
     }
 
     fn wait_for_outcome(&self) -> Result<WorkerOutcome> {
@@ -6862,21 +6916,176 @@ fn emit_gear_acp_worker_event(job: &GearAcpBrokerJob, event: WorkerEvent) -> Res
     Ok(())
 }
 
-fn broker_usage_from_thread(
-    thread: &Thread,
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GearAcpToolCallObservation {
+    id: String,
+    tool_name: String,
+    arguments: String,
+}
+
+fn gear_acp_tool_call_observations(message: Option<&Message>) -> Vec<GearAcpToolCallObservation> {
+    let Some(agent_message) = message.and_then(Message::as_agent_message) else {
+        return Vec::new();
+    };
+
+    agent_message
+        .content
+        .iter()
+        .filter_map(|content| {
+            let AgentMessageContent::ToolUse(tool_use) = content else {
+                return None;
+            };
+            let arguments = if tool_use.raw_input.trim().is_empty() {
+                serde_json::to_string(&tool_use.input.to_display_json()).unwrap_or_default()
+            } else {
+                tool_use.raw_input.clone()
+            };
+            Some(GearAcpToolCallObservation {
+                id: tool_use.id.to_string(),
+                tool_name: tool_use.name.to_string(),
+                arguments,
+            })
+        })
+        .collect()
+}
+
+fn emit_gear_acp_tool_call_observations(
+    job: &GearAcpBrokerJob,
+    observations: impl IntoIterator<Item = GearAcpToolCallObservation>,
+) -> Result<()> {
+    for observation in observations {
+        let should_emit = {
+            let (lock, _) = &*job.state;
+            let mut state = lock.lock().expect("acp broker state poisoned");
+            state.observed_tool_call_ids.insert(observation.id)
+        };
+        if should_emit {
+            emit_gear_acp_worker_event(
+                job,
+                WorkerEvent::ToolCallStarted {
+                    kind: "acp".to_string(),
+                    tool_name: observation.tool_name,
+                    arguments: observation.arguments,
+                },
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn broker_permission_type_for_tool_kind(kind: &acp::ToolKind) -> BrokerPermissionType {
+    match kind {
+        acp::ToolKind::Read | acp::ToolKind::Search => BrokerPermissionType::ReadFile,
+        acp::ToolKind::Edit | acp::ToolKind::Delete | acp::ToolKind::Move => {
+            BrokerPermissionType::WriteFile
+        }
+        acp::ToolKind::Execute => BrokerPermissionType::ExecuteCommand,
+        acp::ToolKind::Fetch => BrokerPermissionType::NetworkAccess,
+        _ => BrokerPermissionType::EnvironmentAccess,
+    }
+}
+
+fn broker_permission_granted(status: &acp_thread::ToolCallStatus) -> bool {
+    matches!(
+        status,
+        acp_thread::ToolCallStatus::InProgress
+            | acp_thread::ToolCallStatus::Completed
+            | acp_thread::ToolCallStatus::Failed
+    )
+}
+
+fn record_gear_acp_permission_resolution(
+    store: &gearbox_agent::state::StateStore,
+    task_id: &str,
+    state: &Arc<(Mutex<GearAcpBrokerState>, Condvar)>,
+    acp_thread: &Entity<AcpThread>,
+    cx: &App,
+    tool_call_id: &acp::ToolCallId,
+) -> Result<()> {
+    let acp_thread = acp_thread.read(cx);
+    let Some((_, tool_call)) = acp_thread.tool_call(tool_call_id) else {
+        return Ok(());
+    };
+
+    let tool_name = tool_call
+        .tool_name
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "unknown".to_string());
+    let status = tool_call.status.to_string();
+    let permission_type = broker_permission_type_for_tool_kind(&tool_call.kind);
+    let granted = broker_permission_granted(&tool_call.status);
+
+    let model_context = {
+        let (lock, _) = &**state;
+        let mut state = lock.lock().expect("acp broker state poisoned");
+        let id = tool_call_id.to_string();
+        if !state.observed_permission_resolution_ids.insert(id) {
+            return Ok(());
+        }
+        state.session_id.as_ref().map(ToString::to_string)
+    };
+
+    let evidence = BrokerPermissionEvidence {
+        permission_type,
+        granted,
+        timestamp: gearbox_agent::state::timestamp(),
+        agent_name: "acp-broker".to_string(),
+        model_context,
+        reason: Some(format!(
+            "tool `{tool_name}` ({tool_call_id}) authorization resolved as {status}"
+        )),
+    };
+    let line =
+        serde_json::to_string(&evidence).context("failed to serialize ACP permission evidence")?;
+    if let Err(error) =
+        store.append_worker_file(task_id, "permission-events.jsonl", &format!("{line}\n"))
+    {
+        let (lock, _) = &**state;
+        lock.lock()
+            .expect("acp broker state poisoned")
+            .observed_permission_resolution_ids
+            .remove(&tool_call_id.to_string());
+        return Err(error);
+    }
+    let (lock, _) = &**state;
+    lock.lock()
+        .expect("acp broker state poisoned")
+        .permission_events
+        .push(evidence);
+    Ok(())
+}
+
+fn broker_usage_from_thread(thread: &Thread, model: Option<&str>, duration_ms: u64) -> BrokerUsage {
+    broker_usage_from_token_usage(thread.latest_token_usage().as_ref(), model, duration_ms)
+}
+
+fn broker_usage_from_token_usage(
+    usage: Option<&acp_thread::TokenUsage>,
     model: Option<&str>,
     duration_ms: u64,
-) -> Option<BrokerUsage> {
-    let usage = thread.latest_token_usage()?;
-    Some(BrokerUsage {
-        requested_tokens: Some(usage.input_tokens),
-        actual_tokens: Some(usage.output_tokens),
+) -> BrokerUsage {
+    let (requested_tokens, actual_tokens, unavailable_reason) = match usage {
+        Some(usage) => (
+            Some(usage.input_tokens),
+            Some(usage.output_tokens),
+            Some("native ACP provider did not report cost or cache telemetry".to_string()),
+        ),
+        None => (
+            None,
+            None,
+            Some("native ACP provider did not report token, cost, or cache telemetry".to_string()),
+        ),
+    };
+    BrokerUsage {
+        requested_tokens,
+        actual_tokens,
         model: model.unwrap_or("unknown").to_string(),
         duration_ms: Some(duration_ms),
         cost_micros: None,
         cache_hit: None,
-        unavailable_reason: None,
-    })
+        unavailable_reason,
+    }
 }
 
 fn merge_broker_usage(previous: Option<BrokerUsage>, current: BrokerUsage) -> BrokerUsage {
@@ -6892,11 +7101,27 @@ fn merge_broker_usage(previous: Option<BrokerUsage>, current: BrokerUsage) -> Br
             duration_ms: add(previous.duration_ms, current.duration_ms),
             cost_micros: add(previous.cost_micros, current.cost_micros),
             cache_hit: current.cache_hit.or(previous.cache_hit),
-            unavailable_reason: current.unavailable_reason.or(previous.unavailable_reason),
+            unavailable_reason: merge_broker_unavailable_reasons(
+                previous.unavailable_reason,
+                current.unavailable_reason,
+            ),
         }
     } else {
         current
     }
+}
+
+fn merge_broker_unavailable_reasons(
+    previous: Option<String>,
+    current: Option<String>,
+) -> Option<String> {
+    let mut reasons = Vec::new();
+    for reason in [previous, current].into_iter().flatten() {
+        if !reasons.iter().any(|existing| existing == &reason) {
+            reasons.push(reason);
+        }
+    }
+    (!reasons.is_empty()).then(|| reasons.join("; "))
 }
 
 /// Run an ACP broker worker session on the foreground thread.
@@ -6914,54 +7139,88 @@ async fn run_gear_acp_broker_worker(
 ) -> Result<WorkerResult> {
     let (parent_thread, subagent_thread, acp_thread, worker_session_id, applied_worker_model) =
         agent.update(cx, |agent, cx| -> Result<_> {
-            let requested_model = job
-                .worker_model
-                .as_ref()
-                .map(|model_id| {
-                    let available: Vec<_> = LanguageModelRegistry::global(cx)
-                        .read(cx)
-                        .available_models(cx)
-                        .collect();
-                    available
-                        .into_iter()
-                        .find(|m| format!("{}/{}", m.provider_id().0, m.id().0) == *model_id)
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("ACP broker requested unavailable model `{model_id}`")
-                        })
-                })
-                .transpose()?;
             let parent_session = agent
                 .sessions
                 .get(&parent_session_id)
                 .context("parent ACP broker session not found")?;
             let parent_thread = parent_session.thread.clone();
-            let current_depth = parent_thread.read(cx).depth();
-            if current_depth >= MAX_SUBAGENT_DEPTH {
-                anyhow::bail!("Maximum subagent depth ({MAX_SUBAGENT_DEPTH}) reached");
-            }
+            let (subagent_thread, acp_thread, worker_session_id, applied_worker_model) =
+                if let Some(resume_session_id) = job.session_id.clone() {
+                    let session = agent
+                        .sessions
+                        .get(&resume_session_id)
+                        .with_context(|| {
+                            format!(
+                                "ACP broker resident session `{resume_session_id}` is no longer available"
+                            )
+                        })?;
+                    let subagent_thread = session.thread.clone();
+                    let acp_thread = session.acp_thread.clone();
+                    let applied_worker_model = subagent_thread
+                        .read(cx)
+                        .model()
+                        .map(|model| format!("{}/{}", model.provider_id().0, model.id().0));
+                    (
+                        subagent_thread,
+                        acp_thread,
+                        resume_session_id,
+                        applied_worker_model,
+                    )
+                } else {
+                    let requested_model = job
+                        .worker_model
+                        .as_ref()
+                        .map(|model_id| {
+                            let available: Vec<_> = LanguageModelRegistry::global(cx)
+                                .read(cx)
+                                .available_models(cx)
+                                .collect();
+                            available
+                                .into_iter()
+                                .find(|m| {
+                                    format!("{}/{}", m.provider_id().0, m.id().0) == *model_id
+                                })
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "ACP broker requested unavailable model `{model_id}`"
+                                    )
+                                })
+                        })
+                        .transpose()?;
+                    let current_depth = parent_thread.read(cx).depth();
+                    if current_depth >= MAX_SUBAGENT_DEPTH {
+                        anyhow::bail!("Maximum subagent depth ({MAX_SUBAGENT_DEPTH}) reached");
+                    }
 
-            let subagent_thread = cx.new(|cx| {
-                let mut thread = Thread::new_subagent(&parent_thread, cx);
-                if let Some(model) = requested_model {
-                    thread.set_pinned_model(model, cx);
-                }
-                thread.set_title(format!("ACP Broker Worker {}", job.task_id).into(), cx);
-                thread
-            });
-            let worker_session_id = subagent_thread.read(cx).id().clone();
-            let applied_worker_model = subagent_thread
-                .read(cx)
-                .model()
-                .map(|model| format!("{}/{}", model.provider_id().0, model.id().0));
-            let acp_thread = agent.register_session(
-                subagent_thread.clone(),
-                parent_session.project_id,
-                1,
-                None,
-                crate::ZED_AGENT_ID.clone(),
-                "zed".into(),
-                cx,
-            );
+                    let subagent_thread = cx.new(|cx| {
+                        let mut thread = Thread::new_subagent(&parent_thread, cx);
+                        if let Some(model) = requested_model {
+                            thread.set_pinned_model(model, cx);
+                        }
+                        thread.set_title(format!("ACP Broker Worker {}", job.task_id).into(), cx);
+                        thread
+                    });
+                    let worker_session_id = subagent_thread.read(cx).id().clone();
+                    let applied_worker_model = subagent_thread
+                        .read(cx)
+                        .model()
+                        .map(|model| format!("{}/{}", model.provider_id().0, model.id().0));
+                    let acp_thread = agent.register_session(
+                        subagent_thread.clone(),
+                        parent_session.project_id,
+                        1,
+                        None,
+                        crate::ZED_AGENT_ID.clone(),
+                        "zed".into(),
+                        cx,
+                    );
+                    (
+                        subagent_thread,
+                        acp_thread,
+                        worker_session_id,
+                        applied_worker_model,
+                    )
+                };
             parent_thread.update(cx, |thread, _cx| {
                 thread.register_running_subagent(subagent_thread.downgrade())
             });
@@ -6996,6 +7255,25 @@ async fn run_gear_acp_broker_worker(
             &format!("{selection}\n"),
         )?;
     }
+
+    let _permission_subscription = {
+        let store = job.store.clone();
+        let task_id = job.task_id.clone();
+        let state = job.state.clone();
+        cx.subscribe(&acp_thread, move |acp_thread, event, cx| {
+            if let AcpThreadEvent::ToolAuthorizationReceived(tool_call_id) = event {
+                record_gear_acp_permission_resolution(
+                    &store,
+                    &task_id,
+                    &state,
+                    &acp_thread,
+                    cx,
+                    tool_call_id,
+                )
+                .log_err();
+            }
+        })
+    };
 
     let run_result = async {
         let mut next_prompt = job.prompt.clone();
@@ -7033,39 +7311,26 @@ async fn run_gear_acp_broker_worker(
                 }
             };
 
-            {
-                let (lock, _) = &*job.state;
-                let mut state = lock.lock().expect("acp broker state poisoned");
-                let session_id = state.session_id.as_ref().map(|id| id.to_string());
-                if let Some(ref _resp) = response {
-                    state.permission_events.push(BrokerPermissionEvidence {
-                        permission_type: BrokerPermissionType::ExecuteCommand,
-                        granted: false,
-                        timestamp: gearbox_agent::state::timestamp(),
-                        agent_name: "acp-broker".to_string(),
-                        model_context: session_id,
-                        reason: Some("interaction produced a response".to_string()),
-                    });
-                }
-            }
-
-            let assistant_text = subagent_thread.read_with(cx, |thread, _cx| {
-                thread
-                    .last_message()
-                    .and_then(|message| {
-                        let content = message
-                            .as_agent_message()?
-                            .content
-                            .iter()
-                            .filter_map(|content| match content {
-                                AgentMessageContent::Text(text) => Some(text.as_str()),
-                                _ => None,
-                            })
-                            .join("\n\n");
-                        (!content.is_empty()).then_some(content)
-                    })
-                    .unwrap_or_default()
-            });
+            let (assistant_text, tool_call_observations) =
+                subagent_thread.read_with(cx, |thread, _cx| {
+                    let message = thread.last_message();
+                    let assistant_text = message
+                        .and_then(Message::as_agent_message)
+                        .map(|agent_message| {
+                            agent_message
+                                .content
+                                .iter()
+                                .filter_map(|content| match content {
+                                    AgentMessageContent::Text(text) => Some(text.as_str()),
+                                    _ => None,
+                                })
+                                .join("\n\n")
+                        })
+                        .filter(|content| !content.is_empty())
+                        .unwrap_or_default();
+                    (assistant_text, gear_acp_tool_call_observations(message))
+                });
+            emit_gear_acp_tool_call_observations(&job, tool_call_observations)?;
             if !assistant_text.trim().is_empty() {
                 emit_gear_acp_worker_event(
                     &job,
@@ -7075,26 +7340,25 @@ async fn run_gear_acp_broker_worker(
                     },
                 )?;
             }
-            if let Some(usage) = subagent_thread.read_with(cx, |thread, _cx| {
+            let usage = subagent_thread.read_with(cx, |thread, _cx| {
                 broker_usage_from_thread(
                     thread,
                     applied_worker_model.as_deref(),
                     turn_started_at.elapsed().as_millis().min(u64::MAX as u128) as u64,
                 )
-            }) {
-                let usage = {
-                    let (lock, _) = &*job.state;
-                    let mut state = lock.lock().expect("acp broker state poisoned");
-                    let usage = merge_broker_usage(state.usage.take(), usage);
-                    state.usage = Some(usage.clone());
-                    usage
-                };
-                job.store.write_worker_file(
-                    &job.task_id,
-                    "usage.json",
-                    &format!("{}\n", serde_json::to_string_pretty(&usage)?),
-                )?;
-            }
+            });
+            let usage = {
+                let (lock, _) = &*job.state;
+                let mut state = lock.lock().expect("acp broker state poisoned");
+                let usage = merge_broker_usage(state.usage.take(), usage);
+                state.usage = Some(usage.clone());
+                usage
+            };
+            job.store.write_worker_file(
+                &job.task_id,
+                "usage.json",
+                &format!("{}\n", serde_json::to_string_pretty(&usage)?),
+            )?;
             emit_gear_acp_worker_event(
                 &job,
                 WorkerEvent::TurnFinished {
@@ -7197,15 +7461,6 @@ async fn run_gear_acp_broker_worker(
     parent_thread.update(cx, |thread, cx| {
         thread.unregister_running_subagent(&worker_session_id, cx)
     });
-    running_sessions
-        .lock()
-        .expect("running acp sessions poisoned")
-        .remove(&job.task_id);
-    if let Ok(close_task) =
-        agent.update(cx, |agent, cx| agent.close_session(&worker_session_id, cx))
-    {
-        close_task.await?;
-    }
 
     run_result
 }
@@ -7975,6 +8230,142 @@ mod internal_tests {
         }
     }
 
+    #[test]
+    fn gearbox_acp_tool_call_observations_preserve_ids_and_arguments() {
+        let message = Message::Agent(AgentMessage {
+            content: vec![
+                AgentMessageContent::ToolUse(language_model::LanguageModelToolUse {
+                    id: "tool-read".into(),
+                    name: "read_file".into(),
+                    raw_input: r#"{"path":"src/lib.rs"}"#.to_string(),
+                    input: language_model::LanguageModelToolUseInput::Json(
+                        json!({"path": "src/lib.rs"}),
+                    ),
+                    is_input_complete: true,
+                    thought_signature: None,
+                }),
+                AgentMessageContent::ToolUse(language_model::LanguageModelToolUse {
+                    id: "tool-edit".into(),
+                    name: "edit_file".into(),
+                    raw_input: String::new(),
+                    input: language_model::LanguageModelToolUseInput::Json(
+                        json!({"path": "src/main.rs", "patch": "same"}),
+                    ),
+                    is_input_complete: true,
+                    thought_signature: None,
+                }),
+            ],
+            tool_results: IndexMap::default(),
+            reasoning_details: None,
+        });
+
+        let observations = gear_acp_tool_call_observations(Some(&message));
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].id, "tool-read");
+        assert_eq!(observations[0].tool_name, "read_file");
+        assert_eq!(observations[0].arguments, r#"{"path":"src/lib.rs"}"#);
+        assert_eq!(observations[1].id, "tool-edit");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&observations[1].arguments).ok(),
+            Some(json!({"path": "src/main.rs", "patch": "same"}))
+        );
+    }
+
+    #[test]
+    fn gearbox_acp_tool_call_events_dedupe_replayed_ids() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let state = Arc::new((Mutex::new(GearAcpBrokerState::default()), Condvar::new()));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let _subscription = {
+            let event_hub = state
+                .0
+                .lock()
+                .map_err(|_| anyhow!("acp broker state poisoned"))?
+                .event_hub
+                .clone();
+            let events = events.clone();
+            event_hub.subscribe(Arc::new(move |event| {
+                events
+                    .lock()
+                    .expect("acp broker event capture mutex poisoned")
+                    .push(event);
+            }))?
+        };
+        let job = GearAcpBrokerJob {
+            store,
+            task_id: "task_acp_tool_events".to_string(),
+            prompt: "prompt".to_string(),
+            packet_path: temp_dir.path().join("packet.json"),
+            prompt_path: temp_dir.path().join("prompt.md"),
+            worker_model: None,
+            cancellation_token: CancellationToken::new(),
+            state,
+            session_id: None,
+        };
+        let observations = vec![GearAcpToolCallObservation {
+            id: "tool-1".to_string(),
+            tool_name: "read_file".to_string(),
+            arguments: r#"{"path":"src/lib.rs"}"#.to_string(),
+        }];
+        emit_gear_acp_tool_call_observations(&job, observations.clone())?;
+        emit_gear_acp_tool_call_observations(&job, observations)?;
+
+        let events = events
+            .lock()
+            .map_err(|_| anyhow!("acp broker event capture mutex poisoned"))?;
+        let tool_events = events
+            .iter()
+            .filter(|event| matches!(event, WorkerEvent::ToolCallStarted { .. }))
+            .count();
+        assert_eq!(tool_events, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn gearbox_acp_permission_type_tracks_tool_kind() {
+        assert_eq!(
+            broker_permission_type_for_tool_kind(&acp::ToolKind::Read),
+            BrokerPermissionType::ReadFile
+        );
+        assert_eq!(
+            broker_permission_type_for_tool_kind(&acp::ToolKind::Edit),
+            BrokerPermissionType::WriteFile
+        );
+        assert_eq!(
+            broker_permission_type_for_tool_kind(&acp::ToolKind::Execute),
+            BrokerPermissionType::ExecuteCommand
+        );
+        assert_eq!(
+            broker_permission_type_for_tool_kind(&acp::ToolKind::Fetch),
+            BrokerPermissionType::NetworkAccess
+        );
+        assert_eq!(
+            broker_permission_type_for_tool_kind(&acp::ToolKind::Think),
+            BrokerPermissionType::EnvironmentAccess
+        );
+    }
+
+    #[test]
+    fn gearbox_acp_permission_grant_only_accepts_non_terminal_denials() {
+        assert!(broker_permission_granted(
+            &acp_thread::ToolCallStatus::InProgress
+        ));
+        assert!(broker_permission_granted(
+            &acp_thread::ToolCallStatus::Completed
+        ));
+        assert!(broker_permission_granted(
+            &acp_thread::ToolCallStatus::Failed
+        ));
+        assert!(!broker_permission_granted(
+            &acp_thread::ToolCallStatus::Rejected
+        ));
+        assert!(!broker_permission_granted(
+            &acp_thread::ToolCallStatus::Canceled
+        ));
+    }
+
     fn coordinator_review_input(no_progress_signals: Vec<String>) -> CoordinatorReviewInput {
         CoordinatorReviewInput {
             goal_id: "goal_001".to_string(),
@@ -8169,6 +8560,7 @@ mod internal_tests {
             verification_commands: vec!["echo verify".to_string()],
             route_decision: decision,
             intent_fold: None,
+            repository_discovery: None,
         })?;
 
         assert_eq!(submission.draft, draft);
@@ -12274,6 +12666,70 @@ mod internal_tests {
         );
     }
 
+    #[test]
+    fn broker_usage_from_missing_token_telemetry_is_explicit() {
+        let unknown = broker_usage_from_token_usage(None, Some("provider/model"), 17);
+        assert_eq!(unknown.requested_tokens, None);
+        assert_eq!(unknown.actual_tokens, None);
+        assert_eq!(unknown.duration_ms, Some(17));
+        assert_eq!(unknown.cost_micros, None);
+        assert_eq!(unknown.cache_hit, None);
+        assert_eq!(
+            unknown.unavailable_reason.as_deref(),
+            Some("native ACP provider did not report token, cost, or cache telemetry")
+        );
+
+        let token_usage = acp_thread::TokenUsage {
+            max_tokens: 100,
+            used_tokens: 30,
+            input_tokens: 20,
+            output_tokens: 10,
+            max_output_tokens: Some(50),
+        };
+        let known = broker_usage_from_token_usage(Some(&token_usage), Some("provider/model"), 19);
+        assert_eq!(known.requested_tokens, Some(20));
+        assert_eq!(known.actual_tokens, Some(10));
+        assert_eq!(known.duration_ms, Some(19));
+        assert_eq!(
+            known.unavailable_reason.as_deref(),
+            Some("native ACP provider did not report cost or cache telemetry")
+        );
+    }
+
+    #[test]
+    fn merge_broker_usage_retains_unknown_reasons_across_turns() {
+        let previous = BrokerUsage {
+            requested_tokens: None,
+            actual_tokens: None,
+            model: "provider/model".to_string(),
+            duration_ms: Some(5),
+            cost_micros: None,
+            cache_hit: None,
+            unavailable_reason: Some(
+                "native ACP provider did not report token, cost, or cache telemetry".to_string(),
+            ),
+        };
+        let current = BrokerUsage {
+            requested_tokens: Some(20),
+            actual_tokens: Some(10),
+            model: "provider/model".to_string(),
+            duration_ms: Some(7),
+            cost_micros: None,
+            cache_hit: None,
+            unavailable_reason: Some(
+                "native ACP provider did not report cost or cache telemetry".to_string(),
+            ),
+        };
+
+        let merged = merge_broker_usage(Some(previous), current);
+
+        assert_eq!(merged.requested_tokens, None);
+        assert_eq!(merged.actual_tokens, None);
+        let reason = merged.unavailable_reason.as_deref().unwrap_or_default();
+        assert!(reason.contains("token, cost, or cache"));
+        assert!(reason.contains("cost or cache"));
+    }
+
     #[gpui::test]
     async fn gearbox_acp_worker_broker_lifecycle(cx: &mut TestAppContext) {
         use gearbox_agent::state::{
@@ -12393,17 +12849,84 @@ mod internal_tests {
         // Phase 3: wait for the first prompt — the dispatcher should have
         // created a subagent session via the ACP thread.
         wait_for_fake_completion(fake_model, cx).await;
+        for _ in 0..20 {
+            cx.run_until_parked();
+            cx.background_executor
+                .timer(Duration::from_millis(10))
+                .await;
+        }
         let first_session_id = handle
             .session_id()
             .expect("acp broker worker should expose its session id after first prompt starts");
 
+        fake_model.send_last_completion_stream_text_chunk("broker initial response");
+        fake_model.end_last_completion_stream();
+        for _ in 0..100 {
+            cx.run_until_parked();
+            let received_first_turn_finished = events.lock().is_ok_and(|events| {
+                events.iter().any(|event| {
+                    matches!(
+                        event,
+                        WorkerEvent::TurnFinished { kind, .. } if kind == "acp"
+                    )
+                })
+            });
+            if received_first_turn_finished {
+                break;
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(10))
+                .await;
+        }
+        let usage_path = store.worker_dir("task_acp_broker_001").join("usage.json");
+        let usage: BrokerUsage = serde_json::from_str(
+            &std::fs::read_to_string(&usage_path)
+                .expect("native ACP worker must persist an explicit usage artifact"),
+        )
+        .expect("native ACP usage artifact must remain valid JSON");
+        assert!(
+            usage.unavailable_reason.is_some(),
+            "fake ACP provider must not turn missing cost telemetry into a precise-looking record"
+        );
+
         // Phase 4: follow-up
+        let first_completion_count = fake_model.completion_count();
         handle
             .send_follow_up("Refine the result.".to_string())
             .unwrap();
+        for _ in 0..100 {
+            cx.run_until_parked();
+            if fake_model.completion_count() > first_completion_count {
+                break;
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(10))
+                .await;
+        }
+        assert!(
+            fake_model.completion_count() > first_completion_count,
+            "terminal follow-up should dispatch a new ACP turn"
+        );
         fake_model.send_last_completion_stream_text_chunk("broker follow-up response");
         fake_model.end_last_completion_stream();
-        wait_for_fake_completion(fake_model, cx).await;
+        for _ in 0..100 {
+            cx.run_until_parked();
+            let received_follow_up = events.lock().is_ok_and(|events| {
+                events.iter().any(|event| {
+                    matches!(
+                        event,
+                        WorkerEvent::AssistantTextDelta { kind, delta }
+                            if kind == "acp" && delta.contains("broker follow-up response")
+                    )
+                })
+            });
+            if received_follow_up {
+                break;
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(10))
+                .await;
+        }
         assert_eq!(
             handle.session_id().as_deref(),
             Some(first_session_id.as_str()),
@@ -12411,12 +12934,43 @@ mod internal_tests {
         );
 
         // Phase 5: steer
+        let second_completion_count = fake_model.completion_count();
         handle
             .steer("Steer into final review.".to_string())
             .unwrap();
+        for _ in 0..100 {
+            cx.run_until_parked();
+            if fake_model.completion_count() > second_completion_count {
+                break;
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(10))
+                .await;
+        }
+        assert!(
+            fake_model.completion_count() > second_completion_count,
+            "terminal steer should dispatch a new ACP turn"
+        );
         fake_model.send_last_completion_stream_text_chunk("broker steer response");
         fake_model.end_last_completion_stream();
-        wait_for_fake_completion(fake_model, cx).await;
+        for _ in 0..100 {
+            cx.run_until_parked();
+            let received_steer = events.lock().is_ok_and(|events| {
+                events.iter().any(|event| {
+                    matches!(
+                        event,
+                        WorkerEvent::AssistantTextDelta { kind, delta }
+                            if kind == "acp" && delta.contains("broker steer response")
+                    )
+                })
+            });
+            if received_steer {
+                break;
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(10))
+                .await;
+        }
         assert_eq!(
             handle.session_id().as_deref(),
             Some(first_session_id.as_str()),
