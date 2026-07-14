@@ -4006,7 +4006,7 @@ fn run_objective_controller(
             }
             run_outcome_from_objective_receipt(&store, receipt)?
         } else {
-            Orchestrator::run_single_goal_with_phase_runtime(
+            match Orchestrator::run_single_goal_with_phase_runtime(
                 options.clone(),
                 phase_runtime.clone(),
                 Some(active_node.goal_id.clone()),
@@ -4016,7 +4016,36 @@ fn run_objective_controller(
                     scope_hash: graph.scope_hash.clone(),
                     policy_hash: graph.policy_hash.clone(),
                 }),
-            )?
+            ) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    #[cfg(test)]
+                    if format!("{error:#}").contains("test seam: simulated crash") {
+                        return Err(error);
+                    }
+
+                    let settlement = settle_failed_objective_goal(
+                        &store,
+                        &options.event_sink,
+                        &objective_id,
+                        &mut graph,
+                        &active_node,
+                        &error,
+                    );
+                    let lease_release = objective_lease.release();
+                    if let Err(settlement_error) = settlement {
+                        return Err(error).context(format!(
+                            "failed to settle objective state after active goal error: {settlement_error:#}"
+                        ));
+                    }
+                    if let Err(release_error) = lease_release {
+                        return Err(error).context(format!(
+                            "failed to release objective lease after active goal error: {release_error:#}"
+                        ));
+                    }
+                    return Err(error);
+                }
+            }
         };
         let reservation_id = epoch_reservation_id;
         if store.objective_budget_ledger_path(&objective_id).exists() {
@@ -5562,6 +5591,70 @@ fn objective_status_for_goal(status: &GoalStatus) -> ObjectiveStatus {
             ObjectiveStatus::Failed
         }
     }
+}
+
+fn settle_failed_objective_goal(
+    store: &StateStore,
+    event_sink: &Option<EventSink>,
+    objective_id: &str,
+    graph: &mut ObjectiveGraph,
+    active_node: &crate::state::GoalGraphNode,
+    error: &anyhow::Error,
+) -> Result<()> {
+    let reason = format!("active goal failed before producing a terminal outcome: {error:#}");
+    if let Some(mut goal) = store.read_goal(&active_node.goal_id)? {
+        goal.status = GoalStatus::Failed;
+        goal.current_task_id = None;
+        goal.summary = reason.clone();
+        goal.updated_at = timestamp();
+        store.write_goal(&goal)?;
+    }
+    store.write_continuation_state(
+        &active_node.session_id,
+        &active_node.goal_id,
+        ContinuationStatus::Stopped,
+    )?;
+    store.append_goal_epoch_event(
+        &active_node.goal_id,
+        &active_node.epoch_id,
+        &format!("{}.aborted", active_node.epoch_id),
+        GoalEpochEventKind::Aborted,
+        json!({
+            "status": GoalStatus::Failed.as_str(),
+            "reason": reason,
+        }),
+    )?;
+    append_event(
+        store,
+        event_sink,
+        event(
+            &active_node.session_id,
+            Some(&active_node.goal_id),
+            None,
+            EventKind::GoalBlocked,
+            reason.clone(),
+            json!({ "status": GoalStatus::Failed.as_str() }),
+        ),
+    )?;
+    graph.update_active_node(
+        &active_node.goal_id,
+        GoalStatus::Failed,
+        None,
+        None,
+        None,
+        Some(reason.clone()),
+    )?;
+    graph.record_failure(graph.consecutive_failures.saturating_add(1))?;
+    graph.set_terminal(ObjectiveStatus::Failed, reason.clone())?;
+    store.write_objective_graph(graph)?;
+    append_objective_terminal_event(
+        store,
+        objective_id,
+        &ObjectiveStatus::Failed,
+        &reason,
+        &active_node.goal_id,
+    )?;
+    Ok(())
 }
 
 fn append_objective_terminal_event(
@@ -11882,6 +11975,73 @@ mod tests {
             .validate("goal-answerable", "epoch-answerable", &GoalStatus::Running)
             .expect_err("answerable continue must be rejected");
         assert!(non_terminal.to_string().contains("terminal"));
+        Ok(())
+    }
+
+    #[test]
+    fn objective_preplanning_error_settles_persisted_state() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let request = "Create one bounded artifact";
+        let session_id = "objective-preplanning-failure-session";
+        let mut phase_runtime = PhaseRuntime::legacy();
+        phase_runtime.intent_fold_hook = Some(Arc::new(|_| {
+            bail!("injected IntentFold failure before planning")
+        }));
+
+        let error = Orchestrator::run_objective_with_phase_runtime(
+            RunOptions {
+                request: request.to_string(),
+                workspace: temp_dir.path().to_path_buf(),
+                verification_commands: vec!["echo verify-ok".to_string()],
+                worker: objective_worker_for_test(),
+                allowed_paths: Vec::new(),
+                forbidden_paths: vec![".git".to_string()],
+                max_files_changed: 10,
+                install_dependencies: false,
+                event_sink: None,
+                cancellation_token: None,
+                max_iterations: 1,
+                max_provider_unknown_streak: DEFAULT_MAX_PROVIDER_UNKNOWN_STREAK,
+                max_child_depth: usize::MAX,
+                max_runtime_minutes: 1,
+                budget: None,
+                coordinator_model: None,
+                coordinator_brief: None,
+                coordinator_review_hook: None,
+                task_manager_control: None,
+                task_manager: None,
+                session_id: Some(session_id.to_string()),
+                continuation: true,
+            },
+            phase_runtime,
+            ObjectivePolicy::default(),
+        )
+        .expect_err("the injected pre-planning failure must be returned");
+        assert!(!format!("{error:#}").trim().is_empty());
+
+        let objective_id = objective_id_for(session_id, temp_dir.path(), request)?;
+        let goal_id = format!("goal_{objective_id}_000");
+        let store = StateStore::new(temp_dir.path());
+        let graph = store
+            .read_objective_graph(&objective_id)?
+            .context("objective graph should remain auditable after failure")?;
+        assert_eq!(graph.status, ObjectiveStatus::Failed);
+        assert!(graph.active_goal_id.is_none());
+        assert_eq!(graph.nodes[0].status, GoalStatus::Failed);
+
+        let goal: Goal = serde_json::from_str(&fs::read_to_string(
+            temp_dir
+                .path()
+                .join(".gearbox-agent/goals")
+                .join(format!("{goal_id}.json")),
+        )?)?;
+        assert_eq!(goal.status, GoalStatus::Failed);
+        assert!(
+            store
+                .read_objective_events(&objective_id)?
+                .iter()
+                .any(|event| event.kind == ObjectiveEventKind::Failed)
+        );
         Ok(())
     }
 

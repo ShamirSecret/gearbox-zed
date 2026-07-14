@@ -4667,6 +4667,11 @@ impl TaskManager {
                 }
             }
 
+            if !self.concurrency.acquire(&queued_task) {
+                self.queued_tasks.push_back(queued_task);
+                return Ok(());
+            }
+
             let handle = match self.registry.start(WorkerStartRequest {
                 store: &queued_task.store,
                 workspace: &queued_task.workspace,
@@ -4682,6 +4687,11 @@ impl TaskManager {
             }) {
                 Ok(handle) => handle,
                 Err(error) => {
+                    if !self.concurrency.release(&queued_task) {
+                        return Err(error).context(format!(
+                            "failed to release concurrency slot after worker start failed for {task_id}"
+                        ));
+                    }
                     let mut failed_record = self
                         .records
                         .remove(&task_id)
@@ -4740,11 +4750,6 @@ impl TaskManager {
                 record.root_session_id = self.session_scope.clone();
                 write_task_record(&queued_task.store, record)?;
                 append_task_lifecycle_event(&queued_task.store, record, Some(&transition))?;
-            }
-            if !self.concurrency.acquire(&queued_task) {
-                return Err(anyhow::anyhow!(
-                    "concurrency slot unexpectedly unavailable while starting task: {task_id}"
-                ));
             }
             let run_epoch = self
                 .records
@@ -6674,6 +6679,76 @@ mod tests {
             concurrency_key_for_task(&unconfigured_worker),
             "opencode:unconfigured"
         );
+    }
+
+    #[test]
+    fn fallback_route_waits_when_its_concurrency_key_is_full() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task = test_task("task_waiting_for_fallback_key");
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::Opencode,
+            worker_command: None,
+            worker_model: Some("openai/primary".to_string()),
+            worker_routes: vec![
+                WorkerRoute {
+                    worker_kind: WorkerKind::Opencode,
+                    worker_command: Some("printf primary".to_string()),
+                    worker_model: Some("openai/primary".to_string()),
+                },
+                WorkerRoute {
+                    worker_kind: WorkerKind::Opencode,
+                    worker_command: Some("printf fallback".to_string()),
+                    worker_model: Some("openai/fallback".to_string()),
+                },
+            ],
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 2,
+            max_parallel_workers: 2,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            require_worker: true,
+            default_worker_for_small_tasks: WorkerKind::Opencode,
+        };
+        let mut manager = TaskManager::new();
+        manager.apply_worker_config(&config);
+        manager.goal_unavailable_worker_models.insert(
+            task.goal_id.clone(),
+            HashMap::from([("openai/primary".to_string(), Instant::now())]),
+        );
+
+        let mut fallback_config = config.clone();
+        fallback_config.unavailable_worker_models = vec!["openai/primary".to_string()];
+        let occupied_fallback =
+            queued_task_for_concurrency_key("task_occupying_fallback_key", fallback_config, None);
+        assert!(manager.concurrency.acquire(&occupied_fallback));
+
+        let task_id = manager.start(WorkerStartRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &task,
+            route_attempt: 1,
+            goal: "wait for fallback model capacity",
+            verification_commands: &[],
+            config: &config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        })?;
+
+        assert_eq!(task_id, task.id);
+        assert!(manager.running_tasks.get(&task.id).is_none());
+        assert!(
+            manager
+                .queued_tasks
+                .iter()
+                .any(|queued_task| queued_task.task.id == task.id)
+        );
+        assert_eq!(manager.concurrency.running_workers, 1);
+        Ok(())
     }
 
     fn test_task_record(

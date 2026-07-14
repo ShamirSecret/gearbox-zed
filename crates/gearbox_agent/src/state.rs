@@ -4568,6 +4568,18 @@ impl StateStore {
         Ok(path)
     }
 
+    pub fn read_goal(&self, goal_id: &str) -> Result<Option<Goal>> {
+        let path = self.goals_dir().join(format!("{goal_id}.json"));
+        if !path.exists() {
+            return Ok(None);
+        }
+        let contents = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        Ok(Some(serde_json::from_str(&contents).with_context(
+            || format!("failed to parse {}", path.display()),
+        )?))
+    }
+
     pub fn write_tasks(&self, goal_id: &str, tasks: &[Task]) -> Result<PathBuf> {
         let path = self.tasks_dir().join(format!("{goal_id}.tasks.json"));
         write_json(&path, tasks)?;
