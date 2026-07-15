@@ -436,3 +436,418 @@ The shared changes above are an adapter boundary for `GEARBOX_GUI` native Gear s
 - 2026-07-14 GBX-075：`crates/agent/src/agent.rs` `[MOD]` — 新增 `gear_codex_acp_model_profiles_from_env()`、`gear_phase_table_uses_codex_acp()`、`gear_codex_acp_phase_worker_config()`；`gear_phase_route_table_from_env()` 在 OpenCode-only/legacy 之前优先尝试 CodexAcp route；`gear_phase_uses_opencode_worker()` 同时识别 `PhaseBackend::CodexAcp`；`resolve_phase_host_language_model()` 跳过 CodexAcp 的 direct model 解析。非 Gear Agent 行为不变。
 - 2026-07-14 Gear runtime-root：`StateStore`、Gear CLI/GUI bridge、ACP broker artifact path、worker evidence、Rust command lock/tmp 和 planner prompt 的新写入根统一为用户可见的 `.gear/`；旧 `.gearbox-agent/` 仅保留为迁移/取证兼容名称，未重命名 `gearbox_agent` crate 或上游内部标识。后续上游同步需保留 Gear-specific runtime-root 路由。
 - 2026-07-14 GBX-077 runtime/GUI alignment：`GearRuntimeSnapshot` now projects the persisted PlanGraph plus `PlanNodeRunLedger` as bounded work-order TODOs, and the Gear conversation panel renders task ids, dependencies, waves, and durable node status from that projection. This is a Gear-only UI surface; upstream Agent behavior remains unchanged.
+- 2026-07-15 GBX-084 GUI refresh bridge：`crates/agent/src/agent.rs` 的 Gear snapshot poll 在更新成功或失败状态后调用 Agent entity `cx.notify()`，确保 Gear-only runtime panel 能立即消费 durable snapshot/error 变化；普通 Agent 行为与数据路径不变。
+- 2026-07-15 GBX-085 session reopen bridge：`crates/agent/src/agent.rs` 为 Gear session 抽出可幂等恢复的 runtime snapshot poll；新建/重开 Gear session 均从 `.gear` 持久状态持续投影，运行中的 worker manager 仍额外提供 live task snapshot；普通 Agent 行为与数据路径不变。
+- 2026-07-15 GBX-086 work-order control bridge：共享 `crates/agent_ui/src/conversation_view/thread_view.rs` 的 Gear 计划工单条目现在可点击并选中对应 worker task（优先 durable `worker_task_id`），随后复用已有 Gear interrupt/cancel/retry/feedback 控制；普通 Agent UI 不改变。
+- 2026-07-15 GBX-087 route receipt projection：`crates/gearbox_agent/src/gui.rs` 从 `.gear` 的 phase-route receipts 投影每个 phase 的实际 backend/model/candidate/fallback/source 到 Gear lifecycle，`thread_view.rs` 显示 durable route receipts；普通 Agent UI 行为不变。
+- 2026-07-15 GBX-088 route evidence bridge：Gear GUI route 行增加可打开的 receipt artifact 路径；projection 对最多 64 个 receipt 做 bounded 解析并把损坏/不一致数量作为 `phase_route_errors` 显示，避免审计证据静默缺失；普通 Agent UI 行为不变。
+- 2026-07-15 GBX-089 serial work-order marker：`crates/gearbox_agent/src/plan_graph.rs` 增加 active-node serial scheduler regression，确认 capacity=1 且当前 node active 时只选择同一最早 wave 的下一个 node；`thread_view.rs` 用菱形 marker 显示当前 GUI-selected worker task，保持计划 TODO 与控制选择同步。
+- 2026-07-15 GBX-090 continuation failure recovery：共享 `crates/gearbox_agent/src/runtime.rs` 在 continuation resume 时把 durable `Failed` PlanNode 显式 requeue 为 `Runnable`，保留 attempt/worker/error 证据并记录 recovery epoch event；`state.rs` 提供受控 requeue API，Gear GUI 通过同一 snapshot 显示可重试工单；普通 Agent 行为不变。
+- 2026-07-15 GBX-091 plan contract hardening：`crates/gearbox_agent/src/plan_graph.rs` 现在要求 PlanGraph 顶层同时提供 `must_have`、`must_not_have`、`topology_lock` 和 `final_acceptance` 决策标准，避免模型只生成任务列表而缺少 OMO 式目标边界/最终验收；同文件增加缺失顶层验收的回归测试。Gear-only 行为；普通 Agent 不变。
+- 2026-07-15 GBX-090 continuation evidence repair：`crates/gearbox_agent/src/runtime.rs` 恢复跨进程 continuation 时继承上一轮 verification artifact，并在失败节点的后续成功尝试重新生成 GREEN evidence；`crates/gearbox_agent/src/gui.rs` 对预算 token/cost 汇总使用饱和加法，避免多轮默认预算导致 GUI snapshot 溢出 panic。Gear-only 行为；普通 Agent 不变。
+- 2026-07-15 GBX-092 plan projection cardinality：`crates/gearbox_agent/src/gui.rs` 的 Gear 计划进度改从完整 PlanGraph/PlanNodeRunLedger 计算，不再从 GUI 展示用的 128 条有界列表计算；只有 `Completed` 才计入完成，`GreenVerified/Reviewed` 保持中间态。新增 130 工单投影回归，保证长 OMO 式计划的 runtime 总数与 GUI 一致。Gear-only 行为；普通 Agent 不变。
+- 2026-07-15 GBX-093 OMO plan control contract：`PlanGraphDraft` 新增并校验顶层 `preflight`、`rollback`、`final_verification`；planner prompt、确定性 fallback、Markdown plan projection 和 Gear GUI lifecycle 均显示这些控制项。runtime 在计划开始时写入 preflight baseline，失败工单写入 rollback request，最终 verification wave 写入 plan-check artifact；rollback 默认只记录请求，不隐式修改用户工作树。Gear-only 行为；普通 Agent 不变。
+- 2026-07-15 GBX-094 rollback confirmation gate：Gear GUI 在存在 durable rollback request 且尚未确认时显示 `Confirm rollback`；共享 `crates/agent/src/agent.rs` 只记录带 session/epoch/请求 artifact 的确认 receipt，不执行隐式工作树 mutation，确认后 GUI 隐藏重复按钮。该安全门禁属于 Gear 控制层；普通 Agent 不变。
+- 2026-07-15 GBX-095 strategist next-goal projection：`crates/gearbox_agent/src/gui.rs` 有界解析 durable `strategist-next-goal-receipt.json`，把 decision、next objective、answerability、acceptance/questions/evidence 投影到 Gear lifecycle；`crates/agent_ui/src/conversation_view/thread_view.rs` 显示当前下一目标，保持 OMO goal pursuit 与 runtime/GUI 同源。普通 Agent UI 不变。
+- 2026-07-15 GBX-096 needs-user question projection：Gear GUI 在 next-goal verdict 含 `required_questions` 时显示有界问题列表；用户可复用已有 Gear composer 的 Follow Up/Steer 通道回答，问题仍来自 durable strategist receipt，不新增绕过 runtime 的写入口。普通 Agent UI 不变。
+- 2026-07-15 GBX-097 next-question composer bridge：`crates/agent_ui/src/conversation_view/thread_view.rs` 在 Gear next-goal questions 下增加 `Answer next question`，只把第一条问题填入现有 MessageEditor；发送仍复用 Follow Up/Steer 的 task/run-epoch 门禁，未新增直接 runtime 写入路径。普通 Agent UI 不变。
+- 2026-07-15 GBX-098 needs-user epoch resume：`ObjectiveGraph`/objective event ledger 新增 `UserAnswerAccepted` reopen transition；continuation controller 按 root session 找回 terminal needs_user objective，绑定新 epoch、保留旧证据并把用户回答追加到 resumed request 后再继续 active frontier。新增 graph/event 回归，防止回答形成全新孤立 objective。普通 Agent 行为不变。
+- 2026-07-15 GBX-099 objective frontier/history projection：`crates/gearbox_agent/src/gui.rs` 将 `.gear` ObjectiveGraph 最近 32 个 goal/epoch 节点投影为有界 history，保留 parent、status、request 和 terminal evidence；`crates/agent_ui/src/conversation_view/thread_view.rs` 在 Gear runtime 面板显示完整目标演进并高亮 active frontier。普通 Agent UI 不变。
+- 2026-07-15 GBX-100 work-order routing brief：`crates/gearbox_agent/src/runtime.rs` 在每个 PlanGraph 工单 dispatch 前生成绑定 goal/epoch/plan revision/attempt、路由模型、依赖、范围、TDD、验收和 artifact 的 `.gear` routing brief，并写入 durable task input；`crates/gearbox_agent/src/gui.rs` 与 `crates/agent_ui/src/conversation_view/thread_view.rs` 投影并显示 brief 路径。普通 Agent 行为不变。
+- 2026-07-15 GBX-101 planner decomposition quality gate：`crates/gearbox_agent/src/plan_review.rs` 在 deterministic verifier 的 Structure check 中加入高上限拆解检查，只有明确超过 8 个 scoped files 或 12 个 must-do steps 的单工单被拒绝；`crates/gearbox_agent/src/gui.rs` 从 durable verifier report 投影质量门状态、findings 和 artifact，`crates/agent_ui/src/conversation_view/thread_view.rs` 显示结果。Gear-only 行为；普通 Agent 不变。
+- 2026-07-15 GBX-102 planner decomposition protocol：共享 `crates/agent/src/agent.rs` 的 Gear planner/revision prompt 现在先按“目标边界→最小可验收工单→依赖波次→工单 contract”生成，明确单 deliverable、弱 worker 可执行、超过 8 scoped files/12 must-do 时拆分；新增 fake-model prompt contract 断言。普通 Agent planner 行为不变；Gear 测试路径同步使用 `.gear` runtime root。
+- 2026-07-15 GBX-103 work-order evidence projection：`crates/gearbox_agent/src/gui.rs` 从 durable `PlanNodeRun` 有界投影 RED、最多 8 条 GREEN 和 Review evidence 路径；`crates/agent_ui/src/conversation_view/thread_view.rs` 在每个 Gear TODO 行显示证据状态/路径摘要。普通 Agent UI 不变。
+- 2026-07-16 GBX-104 work-order completion gate：`crates/gearbox_agent/src/runtime.rs` 在 PlanNodeRun 进入 Completed 前先绑定 Review artifact、持久化每个 completion predicate 的 criterion evidence，并要求 GREEN、Review 与全部 criterion receipts 通过；不满足时节点保持 Failed 并记录可恢复原因，GUI 通过已有 task error/evidence projection 显示。普通 Agent 行为不变。
+- 2026-07-16 GBX-105 completion-gate repair receipt：当工单 evidence gate 失败时，`crates/gearbox_agent/src/runtime.rs` 额外写入有界 work-order repair request artifact，并把路径绑定到 PlanNodeRun error；continuation 仍只重排 Failed 节点，GUI 通过当前工单错误/证据行显示 repair 路径。普通 Agent 行为不变。
+- 2026-07-16 GBX-106 work-order contract metadata projection：`crates/gearbox_agent/src/gui.rs` 将 PlanTaskContract 的 size/risk/commit boundary 投影到有界 GUI TODO；`crates/agent_ui/src/conversation_view/thread_view.rs` 显示这些执行边界，并在 Failed 工单显示 Resume Gear requeue 提示。普通 Agent UI 不变。
+- 2026-07-16 GBX-107 plan boundary projection：`crates/gearbox_agent/src/gui.rs` 将 PlanGraph 顶层 `must_have`、`must_not_have`、`topology_lock`、`final_acceptance` 有界投影到 Gear lifecycle；`crates/agent_ui/src/conversation_view/thread_view.rs` 在 Work Orders 面板显示这些目标边界。普通 Agent UI 不变。
+- 2026-07-16 GBX-108 plan approval projection：`crates/gearbox_agent/src/gui.rs` 读取 durable `PlanApprovalState`，投影 approval status、revision count、critic receipt hash 和 approval artifact；`crates/agent_ui/src/conversation_view/thread_view.rs` 显示 PlanCritic/Oracle approval gate。普通 Agent UI 不变。
+- 2026-07-16 GBX-109 per-work-order preflight：`crates/gearbox_agent/src/runtime.rs` 在每次 PlanGraph 工单 dispatch 前记录 baseline changed-file count/hash、allowed/forbidden/write scope、max files 和 dependencies 到 `.gear` preflight artifact；`crates/gearbox_agent/src/gui.rs` 与 `thread_view.rs` 投影并显示该路径。普通 Agent UI 不变。
+- 2026-07-16 GBX-110 final verification receipt projection：`crates/gearbox_agent/src/gui.rs` 校验 durable `final-verification-wave.json` 与当前 PlanGraph 绑定，投影 passed/failed/invalid、receipt hash 和 artifact；`crates/agent_ui/src/conversation_view/thread_view.rs` 显示最终 verification receipt 状态。普通 Agent UI 不变。
+- 2026-07-16 GBX-111 selected work-order contract projection：`crates/gearbox_agent/src/gui.rs` 将每个 PlanTaskContract 的 bounded `must_do`、`must_not_do` 和 completion predicates 投影到 snapshot；`crates/agent_ui/src/conversation_view/thread_view.rs` 在选中工单下直接展开执行 contract。普通 Agent UI 不变。
+- 2026-07-16 GBX-112 selected work-order test/QA projection：`crates/gearbox_agent/src/gui.rs` 有界投影 test strategy、最多 8 条 verification commands 和 QA scenarios；`crates/agent_ui/src/conversation_view/thread_view.rs` 在选中工单详情中显示 TEST/VERIFY/QA contract。普通 Agent UI 不变。
+- 2026-07-15 GBX-113 selected work-order boundary projection：`crates/gearbox_agent/src/gui.rs` 将 PlanTaskContract 的 required capabilities、references、required artifacts、allowed/forbidden/write scope 和 max files changed 有界投影到 Gear snapshot；`crates/agent_ui/src/conversation_view/thread_view.rs` 在选中工单详情显示这些契约边界。普通 Agent UI 不变。
+- 2026-07-15 GBX-114 canonical OMO plan projection：`crates/gearbox_agent/src/product.rs` 从同一个 PlanGraph 输出 OMO 风格的 TL;DR/Scope/Verification/Execution/Todos/Final verification/Commit/Success sections，并用 `[ ]` 标记工单与 completion predicates；`crates/gearbox_agent/src/gui.rs` 和 `crates/agent_ui/src/conversation_view/thread_view.rs` 投影 canonical `plan.md` 路径，同时继续以 runtime ledger 作为实时状态源。普通 Agent 行为不变。
+- 2026-07-15 GBX-115 continuation plan reuse：`crates/gearbox_agent/src/runtime.rs` 在普通 continuation 中读取并校验已批准/未审阅 PlanGraph，复用同一 plan revision/hash 和 PlanNodeRun ledger；仅 NeedsUser 且请求改变时重新规划。新增 `PlanReused` event，`gui.rs`/`thread_view.rs` 投影并显示复用状态。普通 Agent 行为不变。
+- 2026-07-15 GBX-116 final verification wave projection：`crates/gearbox_agent/src/gui.rs` 从绑定的 `FinalVerificationWaveReceipt` 有界投影四个 final dimensions；`product.rs` canonical `plan.md` 固定输出 OMO F1-F4 checklist；`agent_ui` 逐项显示 final checks，实时状态仍来自 `.gear` receipt。普通 Agent 行为不变。
+- 2026-07-15 GBX-117 plan context projection：`PlanGraphDraft`/planner schema 新增可选 assumptions、findings、decisions、open_questions；`product.rs` canonical Markdown 与 `gui.rs`/`thread_view.rs` 有界投影这些 OMO durable-draft context。普通 Agent 行为不变。
+- 2026-07-15 GBX-118 adversarial QA contract：`PlanQaContract` 新增兼容旧计划的 `adversarial_path`，planner/exemplar 要求记录适用 trigger 或 not-applicable 证据；`product.rs`、`gui.rs`、`thread_view.rs` 有界投影该 QA 类别。普通 Agent 行为不变。
+- 2026-07-15 GBX-119 open-question approval gate：`plan_review.rs` 的 deterministic Structure verifier 现在把 `PlanGraphDraft.open_questions` 中的未解决问题作为阻塞 finding，因而 PlanCritic 不能批准 decision-incomplete 计划；Gear GUI 将该上下文明确标为 approval blocked。普通 Agent 行为不变。
+- 2026-07-15 GBX-120 live plan checkbox projection：`product.rs` 新增从 `PlanNodeRunLedger` 投影 `[ ]/[~]/[x]/[!]` 的 canonical plan 渲染；runtime 在工单状态持久化后刷新同一 `.gear` `plan.md`，使 OMO 风格 TODO 文件、runtime ledger 与 GUI 状态保持同源。普通 Agent 行为不变。
+- 2026-07-15 GBX-121 final-wave checkbox projection：`product.rs` 的 F1-F4 Final Verification Wave 现在可从 `FinalVerificationWaveReceipt` 投影 `[x]/[!]`，runtime 写入最终 receipt 后刷新 canonical `plan.md`；GUI 继续读取同一 receipt。普通 Agent 行为不变。
+- 2026-07-15 GBX-122 dependency matrix projection：canonical `plan.md` 新增 OMO 风格依赖矩阵，直接从 PlanGraph task dependencies/parallel wave 生成；Gear GUI 已从同一 PlanGraph 显示工单 dependencies/wave，不新增状态副本。普通 Agent 行为不变。
+- 2026-07-15 GBX-123 milestone projection：canonical `plan.md` 新增按 parallel wave 聚合的 `## Milestones`，Gear GUI lifecycle/thread view 从同一 PlanGraph 投影 bounded milestone 摘要；最终 F1-F4 波次也纳入同一视图。普通 Agent 行为不变。
+- 2026-07-15 GBX-124 acceptance checklist projection：canonical `plan.md` 新增从每个 task completion predicate 与顶层 final acceptance 聚合的 `## Acceptance checklist`；Gear GUI lifecycle/thread view 投影同一有界清单，避免只显示分散工单验收。普通 Agent 行为不变。
+- 2026-07-15 GBX-125 acceptance evidence status projection：`product.rs`、`gui.rs` 从 `PlanNodeRun.criterion_evidence` 投影验收清单 `[ ]/[x]/[!]`；最终 acceptance 同时绑定所有 criterion receipts 与 `FinalVerificationWaveReceipt`，runtime 写 evidence/receipt 后 canonical plan 与 GUI 均反映同一结果。普通 Agent 行为不变。
+- 2026-07-15 GBX-126 commit boundary execution brief：runtime 的 work-order routing brief 和 preflight artifact 现在显式记录 `PlanTaskContract.commit_boundary`；不自动 commit/push，worker 仍按计划承担提交或保持 no-commit，GUI 继续显示同一边界。普通 Agent 行为不变。
+- 2026-07-15 GBX-127 commit boundary evidence gate：`PlanNodeRun` 新增兼容旧 ledger 的 commit-boundary evidence/status；runtime 捕获 dispatch 前后 HEAD，对 `NoCommit`/`AfterTask`/`AfterWave` 生成 evidence，并在 completion gate 拒绝明确失败的边界；GUI 显示 evidence path 与 satisfied 状态。Gear 仍不自动 commit/push。普通 Agent 行为不变。
+- 2026-07-15 GBX-128 plan commit evidence projection：`product.rs` 的每个 canonical 工单详情现在同时显示 commit boundary evidence marker/path/status；runtime ledger、`.gear/plan.md` 和 GUI 使用同一 commit evidence。普通 Agent 行为不变。
+- 2026-07-15 GBX-129 rollback plan section：canonical `plan.md` 将 rollback actions 单独投影为 `## Rollback Plan`；Gear GUI 已从同一 durable plan/rollback artifacts 显示 rollback actions 与 pending confirmation。普通 Agent 行为不变。
+- 2026-07-15 GBX-130 plan artifact freshness projection：Gear GUI 对 `.gear/plan.md` 读取并校验当前 PlanGraph.plan_hash，投影 `current/stale/invalid/missing` 状态；thread view 显示该状态，避免只因文件存在就误报计划与 runtime 同步。普通 Agent 行为不变。
+- 2026-07-15 GBX-131 QA scenario evidence gate：`PlanNodeRun` 复用 attempt-bound criterion evidence 记录每个 happy/failure/adversarial QA scenario 的 `qa:<kind>:<name>` receipt；runtime 仅在声明 evidence path 对应 workspace artifact 存在时标记 Pass，缺失时写入 Blocked/Fail marker，并在工单 completion gate 中要求全部 QA scenario 通过。canonical `plan.md` 与 Gear GUI acceptance checklist 显示场景级 `[ ]/[x]/[!]` 状态。普通 Agent 行为不变。
+- 2026-07-15 GBX-132 QA 状态与 planner 提示同步：Gear GUI 的选中工单详情现在显示每个 QA 场景的 `[ ]/[x]/[!]`、类别和 evidence path；Gear OpenCode planner 与 Zed Agent planner prompt 都明确要求 happy/failure/adversarial QA，adversarial 不适用时必须留下 not-applicable trigger check。普通 Agent 的非 Gear planner 行为不变。
+- 2026-07-15 GBX-133 broker lifecycle GUI projection：`crates/gearbox_agent/src/gui.rs` 有界扫描 `.gear/broker-sessions` 的 durable `session-identity.json`/`terminal-outcome.json`，把 active/terminal phase session 状态投影到 `GearRuntimeLifecycle`；`crates/agent_ui/src/conversation_view/thread_view.rs` 在 Work Orders 面板显示 broker session lifecycle。状态只读自 runtime ledger，不创建 GUI 副本。普通 Agent UI 不变。
+- 2026-07-16 GBX-134 broker lifecycle goal isolation：broker session GUI projection 现在按当前 `Goal.id` 过滤 `.gear/broker-sessions`，避免多目标长会话把其他目标的 worker lifecycle 混入当前 Work Orders 面板；无 goal 时不构造目标摘要。普通 Agent UI 不变。
+- 2026-07-16 GBX-135 OMO role projection：canonical `plan.md`、`GearRuntimePlanTaskSummary` 和 Gear thread view 从 `preferred_phase_profile` 推导并显示 OMO 风格 `build/review` Role；不新增计划字段或 GUI 状态副本。普通 Agent UI 行为不变。
+- 2026-07-16 GBX-136 commit intent projection：`PlanTaskContract` 新增向后兼容的可选 `commit_message`，planner prompt、canonical plan、routing brief/preflight artifact、Gear snapshot 和 thread view 均显示该 OMO-style commit intent；空消息被拒绝，Gear 仍不自动 commit/push。普通 Agent 行为不变。
+- 2026-07-16 GBX-137 required artifact final gate：runtime final PlanCompliance verification 现在检查每个 required task artifact（延后 runtime 自己在 final wave 后生成的收尾文件），缺失时 final receipt 失败并记录 missing artifact evidence；Gear GUI selected work order 将 required artifact 从静态路径投影为 `[ ]/[x]` 文件存在状态。普通 Agent 行为不变。
+### GBX-138 — OMO `Blocked by` dependency projection
+
+- `crates/gearbox_agent/src/product.rs` now renders the existing task dependency list as both `Dependencies` and the OMO-compatible `Blocked by` label.
+- `crates/agent_ui/src/conversation_view/thread_view.rs` exposes the same dependency list in task rows and selected-task details, without introducing a second state source.
+- This is a presentation alignment only; scheduling and completion continue to read `PlanTaskContract.dependencies`.
+### GBX-139 — OMO ordered execution steps in plan contracts
+
+- `crates/gearbox_agent/src/plan_graph.rs` adds typed `execution_steps` with stable IDs, expected observations, optional evidence paths, legacy fallback, validation, and worker stop/constraint instructions.
+- `crates/gearbox_agent/src/product.rs` and `crates/gearbox_agent/src/gui.rs` project the ordered steps into canonical plan output and runtime GUI snapshots; `crates/agent_ui/src/conversation_view/thread_view.rs` displays them for the selected task.
+- Planner prompts in `crates/agent/src/agent.rs` and `crates/gearbox_agent/src/open_code_phase_runtime.rs` require step-complete JSON and prohibit skipping/reordering; Gear still delegates execution and never commits automatically.
+### GBX-140 — execution step lifecycle ledger and GUI projection
+
+- `crates/gearbox_agent/src/state.rs` adds durable `PlanStepRun` records under each `PlanNodeRun`, with pending/running/completed/blocked states and resume reset semantics; old ledgers remain readable through serde defaults.
+- `crates/gearbox_agent/src/runtime.rs` updates the step ledger at worker start, failure, completion-gate failure, successful completion, and continuation requeue. The node ledger remains the single source of truth.
+- `crates/gearbox_agent/src/gui.rs` and `crates/agent_ui/src/conversation_view/thread_view.rs` project step status, evidence, and blocking errors into the runtime GUI.
+### GBX-141 — worker step evidence receipt gate
+
+- `crates/gearbox_agent/src/workers.rs` parses `completed_steps` and `step_evidence` sections from the worker's durable output and advertises them in the worker report contract.
+- `crates/gearbox_agent/src/plan_graph.rs` adds `execution_steps_evidence_required`; new planner contracts opt into explicit step receipts while legacy deterministic plans remain readable and stage-compatible.
+- `crates/gearbox_agent/src/runtime.rs` rejects a strict worker completion with missing, unknown, or incomplete step IDs, persists evidence paths, and includes all step receipts in the completion gate.
+- `crates/gearbox_agent/src/gui.rs` and `crates/agent_ui/src/conversation_view/thread_view.rs` show step evidence paths and errors from the durable ledger.
+### GBX-142 — WORK_ORDER_EVIDENCE 路径与质量分类投影
+
+- `crates/gearbox_agent/src/state.rs` extends `PlanNodeRun` with worker result/outcome/last-message paths and `WorkerEvidenceQuality` (`proved`, `fixture_only`, `blocked_not_verified`, `failed`).
+- `crates/gearbox_agent/src/runtime.rs` records those paths at worker settle and upgrades quality only after the full completion gate; failed or incomplete evidence remains visibly unverified.
+- The same node record now keeps worker `changed_files`, `commands_run`, and `known_failures`, matching OMO's exact evidence report without trusting summary prose.
+- `crates/gearbox_agent/src/gui.rs` and `crates/agent_ui/src/conversation_view/thread_view.rs` project the same paths and classification into task rows and selected-task details.
+
+### GBX-143 — OMO 工单契约字段补齐
+
+- `crates/gearbox_agent/src/plan_graph.rs` 为 Gear 专属 `PlanTaskContract` 增加向后兼容的 `inputs`、`preconditions`、`evidence`、`rollback` 和 `budget` 字段，并将它们投影为 worker 约束；旧计划缺省为空仍可读取。
+- `crates/gearbox_agent/src/open_code_phase_runtime.rs` 与共享 `crates/agent/src/agent.rs` 的 Gear planner 提示同步要求这些字段，避免把 OMO 工单级证据、恢复和资源边界隐藏在 `must_do` 或 prose 中。
+- 这是 Gear 计划协议增强，不改变上游 Agent 的默认 planner 行为；共享提示修改仅在 Gear planner 路径生效。
+
+### GBX-144 — OMO 资源门禁的只读健康快照
+
+- `crates/gearbox_agent/src/gui.rs` 增加兼容旧快照的进程健康投影，读取 Linux `/proc/*/comm` 中的 `cargo`、`rustc`、`rust-analyzer`、`opencode`、`codex` 计数，并标记 Rust 进程是否超过两项；不会由 Gear 自动杀进程或把观察结果升级为硬门禁。
+- `crates/agent_ui/src/conversation_view/thread_view.rs` 显示同一 runtime 快照中的进程计数和超限提示，避免 GUI 只显示 TaskManager 子任务数而遗漏外部 analyzer/build 进程。
+- 这是 Gearbox GUI 隔离层的资源可观测性修改；普通 Zed Agent UI 不改变。
+
+### GBX-145 — OMO 工单级计划上下文 GUI/Canonical 投影
+
+- `crates/gearbox_agent/src/product.rs` 将 task-level `inputs`、`preconditions`、`evidence`、`rollback`、`budget` 写入 canonical `plan.md`，不再只保留在 JSON worker contract 中。
+- `crates/gearbox_agent/src/gui.rs` 从同一个 `PlanTaskContract` 投影这些字段；`crates/agent_ui/src/conversation_view/thread_view.rs` 在选中工单中显示它们，保持 runtime、canonical plan 与 GUI 同源。
+- 共享 UI 仅增加 Gear 快照字段的显示，不改变普通 Zed Agent UI。
+
+### GBX-146 — OMO 工单 preflight durable gate
+
+- `crates/gearbox_agent/src/state.rs` 的 `PlanNodeRun` 现在持久化 `preflight_path` 与 `preflight_satisfied`，旧 ledger 缺省为未满足。
+- `crates/gearbox_agent/src/runtime.rs` 在 worker dispatch 前写入并保存工单 preflight receipt；completion gate 要求该 receipt 存在且满足，避免只写文件但状态不可恢复。
+- `crates/gearbox_agent/src/gui.rs` 优先从 durable node ledger 投影 preflight 状态，GUI 不再依赖目录扫描推断状态。
+
+### GBX-147 — OMO preflight 四项检查结构化门禁
+
+- `crates/gearbox_agent/src/state.rs` 增加 `PlanPreflightCheck`，`PlanNodeRun` 持久化 `scope_check`、`forbidden_check`、`dependency_check`、`acceptance_check`、`validation_check` 结果。
+- `crates/gearbox_agent/src/runtime.rs` 在 worker dispatch 前计算这些检查，任一失败即停止 dispatch；preflight artifact 同时记录逐项结果，completion gate 继续要求整组 receipt。
+- `crates/gearbox_agent/src/gui.rs` 与 `crates/agent_ui/src/conversation_view/thread_view.rs` 从同一 ledger 显示逐项检查，避免 GUI 只显示一个笼统的 preflight 标记。
+
+### GBX-148 — OMO 工单实际路由回执投影
+
+- `crates/gearbox_agent/src/gui.rs` 对每个工单读取已校验的 `TaskRouteDecisionReceipt`，投影实际 worker、model 和 route hint；旧快照字段通过 serde 默认兼容。
+- `crates/agent_ui/src/conversation_view/thread_view.rs` 在工单行显示 actual route，避免只显示全局 phase route 而无法逐工单审计 fallback。
+- Gear 仍以 durable route receipt 为实际事实，不把计划中的 phase profile 或 UI 标签冒充实际模型。
+
+### GBX-149 — OMO preflight attempt 隔离
+
+- `PlanNodeRunLedger::requeue_failed_for_resume` 在新 continuation attempt 前清除旧 `preflight_path`、`preflight_satisfied` 与逐项检查，保留失败 worker identity/error 供审计。
+- 下一个 attempt 必须重新执行并持久化 preflight，避免旧 receipt 在恢复后被 completion gate 或 GUI 误认为当前尝试证据。
+
+### GBX-150 — 严格 planner 工单上下文校验
+
+- `crates/gearbox_agent/src/plan_graph.rs` 对启用 `execution_steps_evidence_required` 的新 planner 工单强制要求非空 `inputs`、`preconditions`、`evidence`、`rollback`。
+- 旧 deterministic/legacy planner 计划仍按 serde 默认值读取；只有新严格契约触发门禁，避免兼容性破坏。
+
+### GBX-151 — 独立 review bundle GUI 投影
+
+- `crates/gearbox_agent/src/gui.rs` 从 durable `ReviewEpochBundle.roles` 投影 reviewer role、execution/session identity 与 receipt path，不再只显示 bundle 是否 complete。
+- `crates/agent_ui/src/conversation_view/thread_view.rs` 显示每个 review role 的证据摘要，保持 OMO 独立审查链与 GUI 同源。
+
+### GBX-152 — WORK_ORDER_EVIDENCE 后继与 plan gap 投影
+
+- `crates/gearbox_agent/src/workers.rs` 解析 worker `next_steps` 与 `plan_gap` 段落，并把它们加入明确的 continuation evidence contract。
+- `crates/gearbox_agent/src/state.rs`、`runtime.rs`、`gui.rs` 和 `crates/agent_ui/src/conversation_view/thread_view.rs` 持久化并显示这些后继信息；plan gap 不会被 summary 文本吞掉。
+
+### GBX-153 — OMO 工单 execution decision 与 skip reason
+
+- `PlanNodeRun` 新增 `PlanWorkOrderDecision` 与 `worker_decision_reason`，明确区分 executed、skipped、blocked、not_recorded。
+- runtime 从 worker terminal status 和 plan gap/known failure 写入决策原因；skipped 没有原因时 ledger validation 失败，不允许无理由跳过。
+- Gear GUI 显示决策和原因；skipped 不会被映射为已验证完成。
+
+### GBX-154 — OMO 依赖阻塞状态 canonical 计划投影
+
+- `crates/gearbox_agent/src/product.rs` 的 canonical `plan.md` 现在将 `PlanNodeRunLedger` 中的依赖状态投影到 `Blocked by`，不再重复打印静态 dependencies；缺失 ledger 记录显示为 `not_recorded`。
+- 这是 Gear 专属计划文档投影，不改变上游共享计划或普通 Zed UI。
+
+### GBX-155 — PlannerModel 强制逐工单步骤证据
+
+- `crates/gearbox_agent/src/plan_graph.rs` 现在对带 session-bound planner receipt 的新 `PlannerModel` 工单拒绝未启用 `execution_steps_evidence_required` 的计划，避免新模型通过关闭字段绕过 OMO 式逐步执行和证据回执；sessionless coordinator brief 与 `DeterministicFallback` 保留旧计划兼容路径。
+- `crates/agent_ui/src/conversation_view/thread_view.rs` 的 Gear 任务行和选中任务详情同步显示依赖实际状态及 `STEP EVIDENCE REQUIRED`，避免 GUI 将弱计划显示成可执行计划。
+
+### GBX-156 — OMO TODO 状态的 canonical 计划投影
+
+- `crates/gearbox_agent/src/product.rs` 根据 `PlanNodeRunStatus` 渲染 `must_do` 的 `[ ]`、`[~]`、`[x]`、`[!]` 标记，避免 runtime 已完成而 `plan.md` 仍显示全部未完成。
+- `crates/agent_ui/src/conversation_view/thread_view.rs` 在选中工单的 `MUST` 条目上显示同一任务状态，保持 canonical 计划和 GUI 使用同一 ledger 语义。
+- 这是 ledger 到 Gear canonical 文档的状态投影；逐步骤状态仍以 `PlanStepRun` 为权威，不新增第二套可写状态。
+
+### GBX-157 — OMO 串行工单调度审计
+
+- 审计确认新 PlanGraph runtime 使用 `runnable_wave(..., 1)`，只有当前工单通过 terminal completion gate 后才加入 `completed_plan_tasks`，因此不会批量跳过工单或并行执行同一 wave。
+- GUI 的 `serial_work_orders`、完成数、当前工单和 next 工单来自同一 runtime snapshot；旧并行 helper 无调用点，不代表当前执行模式。
+
+### GBX-158 — PlanCritic 审批链 GUI 投影
+
+- `crates/agent_ui/src/conversation_view/thread_view.rs` 显示 runtime snapshot 中的计划审批状态、修订次数、Critic receipt 短 hash 和最终验证 receipt 状态。
+- 共享 UI 只消费 Gear snapshot，不改变上游审批逻辑；GUI 不从临时目录自行推断审批状态。
+
+### GBX-159 — Worker 反馈摘要 GUI 投影
+
+- `crates/gearbox_agent/src/gui.rs` 从 durable `worker_last_message_path` 读取最多 1200 字节的 `worker_last_message_excerpt`，并保持原始路径与 ledger 证据不变。
+- `crates/agent_ui/src/conversation_view/thread_view.rs` 显示实际 `WORKER FEEDBACK`，同时保留 next steps、plan gap 和 known failures；受限摘要避免长对话将全文复制进 GUI snapshot。
+
+### GBX-160 — Worker 路由与模型事实审计
+
+- 审计确认每个工单的实际 worker/model 来自 durable `TaskRouteDecisionReceipt`，GUI 显示 `actual-route`，不会使用计划 profile 冒充实际模型。
+- lifecycle 同时投影当前 worker kind/model、intensity、phase route receipts 和 route errors；本轮未发现需要改变路由事实的缺口。
+
+### GBX-161 — 最终验收与下一目标 GUI 审计
+
+- 审计确认 GUI 已显示 final receipt 状态/hash/artifact、逐项 final checks、stop reason、Next goal 的 objective/questions/signals/evidence refs。
+- 这些值全部来自 `GearRuntimeSnapshot`；本轮未发现需要修改的 runtime/GUI 状态偏差。
+
+### GBX-162 — Runtime/GUI 持续刷新审计
+
+- 审计确认 `agent/src/agent.rs` 为 Gear session 启动 200ms snapshot loop，从 durable `.gear` state 和 live TaskManager 重建快照并 `cx.notify()`；ledger 变化不会因事件 sequence 不变而停留在旧 GUI。
+- snapshot 错误通过 `gear_runtime_snapshot_error` 投影到 GUI；本轮未发现 stale snapshot 缺口。
+
+### GBX-163 — Execution ownership durable/GUI 投影
+
+- runtime 在 durable `PhaseRouteSelected` event 中记录 delegated、worker kind/task、route reason；ownership gate 仍由 runtime 负责。
+- `crates/gearbox_agent/src/gui.rs` 与 `crates/agent_ui/src/conversation_view/thread_view.rs` 投影 execution ownership，明确 Gear 是否把实现委派给 worker，避免 GUI 无法审计 direct-edit 边界。
+
+### GBX-164 — OMO 增量工单上下文与 Gear 计划投影
+
+- `PlanTaskContract` 增加 `already_in_working_tree` 与 `still_needed`，保留 OMO 工单中“已有内容/剩余工作”的增量语义，同时继续以 typed PlanGraph JSON 为唯一真源。
+- planner prompt 明确要求一个工单对应一个可独立验证的目标；canonical `plan.md` 与 Gear GUI 同步显示两类上下文，避免 worker 把已完成内容重复实现或跳过剩余步骤。
+- 该字段为 serde 默认兼容字段，不改变上游共享源码；GUI 只投影 runtime snapshot，不建立第二套计划状态。
+
+### GBX-165 — PlanCritic/Revision 增量语义审查
+
+- `crates/gearbox_agent/src/open_code_phase_runtime.rs` 的 PlanCritic、Oracle 和 Revision prompts 现在明确检查 `already_in_working_tree`、`still_needed` 与 must_do/steps/artifacts/completion predicates 的覆盖关系。
+- 审查要求每个工单保持一个可独立验证目标，但将文件边界作为证据和风险，而不是精准硬门禁；Revision 不得通过泛化 must_do 或扩大范围隐藏遗漏工作。
+- 该行为只增强 Gearbox 专属 phase prompt，不修改上游共享源码；GUI 继续读取同一 PlanGraph snapshot。
+
+### GBX-166 — 下一目标验收信号与证据引用 GUI 投影
+
+- `crates/agent_ui/src/conversation_view/thread_view.rs` 在 Gear 的 Next goal 区域显示 strategist receipt 中的 `acceptance_signals` 与 `evidence_refs`。
+- 这些值与 `next_objective`、`required_questions` 一样来自 durable `strategist-next-goal-receipt.json` 的 runtime snapshot，避免 GUI 只显示下一目标文字而丢失目标完成依据。
+- 这是 Gear 条件界面投影，不改变上游 agent 语义或计划状态。
+
+### GBX-167 — TaskManager 操作结果 durable/GUI 投影
+
+- `crates/gearbox_agent/src/task_manager.rs` 从 bounded `task-command-events.jsonl` 投影最近一次 command 的 action、accepted、reason、epoch 和 timestamp 到 `TaskSnapshot.last_command`。
+- `crates/agent_ui/src/conversation_view/thread_view.rs` 在任务管理器中显示最近一次 command 的结果和原因，区分 accepted/rejected；GUI 不再把 messageability 当成 command 已生效的证明。
+- 读取只保留有限尾部，避免长期 follow-up/steer 事件使 snapshot 或 GUI 内存增长。
+
+### GBX-168 — PlanCritic findings/revision instructions GUI 投影
+
+- `crates/gearbox_agent/src/state.rs` 增加按 goal/revision 读取持久化 `PlanCriticReceipt` 的 bounded API；`crates/gearbox_agent/src/gui.rs` 将最多 8 条 findings（单条最多 600 字符）和 revision instructions（最多 1200 字符）投影到 `GearRuntimeReviewSummary`。
+- `crates/agent_ui/src/conversation_view/thread_view.rs` 在 review detail 中显示审查发现与修订指令，使 GUI 能审计 OMO 式“计划—审查—修订”闭环，而不是只显示 Approved/Rejected 状态。
+- 同时补齐 durable TaskManager snapshot 的 `continuation_hint` 字段初始化，修复本轮 `cargo check` 暴露的结构体初始化错误。
+- 以上均为 Gearbox 专属 runtime/条件 GUI 层，不改变上游 agent 默认行为。
+
+### GBX-169 — OMO 工单 WHY/HOW 结构化对齐
+
+- `crates/gearbox_agent/src/plan_graph.rs` 的 `PlanTaskContract` 增加 `rationale`（WHY）和有序 `approach`（HOW）；session-bound PlannerModel 计划必须提供两者，避免把动机、方案和 must_do 混成一段泛化描述。
+- `crates/gearbox_agent/src/open_code_phase_runtime.rs` 的 Planner、PlanCritic、Oracle、Revision prompts 都把 WHY/HOW 纳入生成、审查和修订语义；worker goal/constraints 也收到同一份上下文。
+- `crates/gearbox_agent/src/product.rs` 的 canonical `plan.md`、`crates/gearbox_agent/src/gui.rs` 与 `crates/agent_ui/src/conversation_view/thread_view.rs` 同步显示 WHY/HOW，保持 PlanGraph、Markdown、runtime snapshot、GUI 同源。
+- 这是 OMO 计划格式的增强性对齐，不改变文件边界软约束或 runtime 的证据门禁；旧持久化计划通过 serde 默认字段继续可读，只有新 session-bound planner 计划要求完整字段。
+
+### GBX-170 — Planner draft strict validation 对齐
+
+- 修复 `validate_planner_draft` 使用 sessionless `PlannerReceipt` 导致新 planner draft 绕过 WHY/HOW 严格校验的问题；planner 输出验证现在显式使用 session-bound validation receipt。
+- 旧 sessionless 持久化计划仍可读取；只有新 planner 输出、repair 输出和 artifact recovery 必须满足 rationale/approach，避免模型生成不完整计划后才在更晚阶段失败。
+- 增加 worker prompt、canonical plan 渲染和 strict validation 回归断言；GUI 继续使用同一 PlanTaskContract 投影。
+
+### GBX-171 — 真实 build_plan_graph 入口严格校验
+
+- `crates/gearbox_agent/src/runtime.rs::build_plan_graph` 在解析 coordinator brief 后显式调用 `validate_planner_draft`，修复实际 legacy planner 入口使用 sessionless `PlannerReceipt` 而绕过新工单契约的问题。
+- `PLAN_GRAPH_SCHEMA_EXEMPLAR` 补齐 rationale/approach；OpenCode artifact recovery、schema repair、repository discovery/planner 测试均继续通过。
+- 仅更新 Gearbox runtime 测试夹具以声明新 planner 工单的 step evidence；不放宽严格校验。
+
+### GBX-172 — 独立 Oracle 审查反馈 GUI 投影
+
+- `crates/gearbox_agent/src/state.rs` 增加有界 `read_plan_oracle_receipt`，读取与当前 goal/revision 绑定的持久化 Oracle receipt。
+- `crates/gearbox_agent/src/gui.rs` 将 Oracle findings 和 revision instructions 投影到 `GearRuntimeReviewSummary`，与主 PlanCritic 反馈分开保留。
+- `crates/agent_ui/src/conversation_view/thread_view.rs` 显示 Oracle findings/修订指令；读取只保留最多 8 条、每条 600 字符、指令 1200 字符，避免长审查输出拖垮 GUI。
+- Oracle receipt 原本已参与 runtime approval/complete 门禁，本轮只补齐用户可见的同源投影，不改变审查判定策略。
+
+### GBX-173 — 多审查者 decision GUI 投影
+
+- `GearRuntimeReviewSummary` 增加 `critic_decision` 与 `oracle_decision`，从各自 typed receipt 直接投影；GUI review detail 不再要求用户通过 receipt hash 推断审查结论。
+- decision 与 findings/instructions 分字段保持 durable review 语义，仍受 bounded snapshot 约束；不改变 runtime approval gate。
+
+### GBX-174 — Review receipt PlanGraph binding GUI 校验
+
+- `crates/gearbox_agent/src/gui.rs` 在投影 Critic/Oracle receipt 前同时校验 `plan_id` 和 `plan_hash` 与当前 PlanGraph，避免同一 goal/revision 下残留的旧 receipt 污染 GUI。
+- 不匹配的 receipt 被视为不可投影；runtime 原有 approval/receipt 验证仍是最终门禁，GUI 不自行批准计划。
+
+### GBX-175 — Unreviewed PlanGraph planning GUI 投影
+
+- `crates/gearbox_agent/src/gui.rs` 新增 `visible_plan`：GUI 计划列表优先读取 canonical PlanGraph，批准前没有 canonical 时回退到 durable `.unreviewed.plan.json`。
+- approval、review receipt 和 final verification 仍只使用 canonical PlanGraph；本轮只让 planning 阶段的 TODO/工单可见，不改变任何执行或批准门禁。
+- 增加 unreviewed graph GUI projection 回归测试，证明 runtime durable planning state 能在批准前显示。
+
+### GBX-176 — Unreviewed revision 版本选择 GUI 对齐
+
+- `visible_plan` 在 canonical 与 unreviewed graph 同时存在时选择更高 revision；同 revision 仍 canonical 优先。
+- 这样 PlanCritic revision 期间 GUI 能显示最新候选 TODO，而 approval、review receipt 和 final verification 继续只绑定 canonical graph。
+- 增加 newer-unreviewed revision 回归测试，保持 runtime 与 GUI 的计划版本语义一致。
+
+### GBX-177 — Visible plan provenance GUI 对齐
+
+- `GearRuntimeLifecycle` 增加 visible plan revision/source/candidate 标记；当 GUI 显示 unreviewed revision 时明确标注 candidate，避免与旧 canonical approval 状态混淆。
+- approval、review receipt 和 final verification 仍使用 canonical graph；provenance 只解释 GUI 当前显示内容，不改变门禁。
+
+### GBX-178 — Work-order goal/deliverable GUI 投影
+
+- `GearRuntimePlanTaskSummary` 增加 bounded `goal` 与 `deliverable`，从 PlanTaskContract 投影到 GUI 选中工单详情。
+- GUI 现在同时显示 GOAL、DELIVERABLE、WHY、HOW、步骤和证据，完整呈现 OMO 工单的执行意图；不新增第二套计划状态。
+
+### GBX-179 — Candidate/approval lifecycle 语义对齐
+
+- `crates/gearbox_agent/src/gui.rs` 的 `plan_approval_summary` 改为始终绑定 canonical PlanGraph；visible unreviewed candidate 由 provenance 单独标注，不再把旧 approval 误报为 stale。
+- GUI 同时表达“canonical approval 状态”和“当前可见 candidate revision”，保持 OMO 计划修订中的审查语义清晰。
+
+### GBX-180 — Candidate execution ledger 绑定 GUI 对齐
+
+- `crates/gearbox_agent/src/gui.rs` 仅在 `PlanNodeRunLedger.plan_id/plan_hash` 与当前 visible PlanGraph 一致时投影执行状态；显示新 unreviewed revision 时不再复用旧 revision 的 Completed/Running 状态。
+- 旧 ledger 仍保留在 durable state，等待对应 canonical/visible plan；GUI 不删除、不重写执行证据。
+
+### GBX-181 — Parent session provenance GUI 投影
+
+- `TaskSnapshot` 增加 durable `parent_session_id`，live/durable snapshot 均从 TaskRecord 投影。
+- Agent UI task manager 显示 parent session，补齐 OMO completion notification/continuation 回到哪个父对话的可审计信息；不改变 notifier 调度。
+
+### GBX-182 — Completion notification epoch GUI 投影
+
+- `TaskSnapshot` 增加 durable `notification_failed_epoch`，live/durable snapshot 均从 `TaskRecord` 投影，GUI 可区分 pending、notified 与 failed completion notification。
+- Agent UI task manager 在任务头部显示通知状态与 epoch；失败状态来自 runtime 已记录的失败 epoch，不改变 `CompletionNotifier` 的调度、重试或持久化语义。
+
+### GBX-183 — OMO 计划视图与生成回执对齐
+
+- `crates/gearbox_agent/src/product.rs` 的 PlanGraph Markdown 视图新增计划生成回执（provider/model/session）与明确的 work-order protocol，直接呈现 OMO 的“单工单、严格步骤、证据后推进、失败回审”语义。
+- 仍以结构化 PlanGraph 为唯一真实源；Markdown、GUI 对话和 runtime 执行状态均从同一 graph/ledger 投影，不引入第二套计划状态。
+
+### GBX-184 — Ordered execution step prefix gate
+
+- `PlanNodeRun::apply_worker_step_evidence` 现在拒绝报告后续步骤而未完成前置步骤的 worker 证据；已完成步骤可在后续 attempt 中继续提交，保持可恢复性。
+- runtime 将该错误写入 `PlanNodeRun` 的 failed/error 与 step lifecycle，现有 GUI execution step projection 会同步显示阻塞步骤；不改变计划 schema 或 worker 路由。
+
+### GBX-185 — Worker step receipt prompt 对齐
+
+- `workers.rs` 的 worker packet 明确要求 `completed_steps` 只能是连续前缀，禁止跳过早期步骤；与 runtime 的 prefix gate 保持同一契约。
+- 该提示只强化执行者协议，实际状态仍由 runtime 验证，失败会沿既有 PlanNodeRun/GUI projection 路径持久化。
+
+### GBX-186 — Step contract failure event audit
+
+- `WorkerFinished` event payload 现在同时记录 `step_evidence_error` 与 `plan_contract_status`，区分 worker 进程成功和计划契约接受，避免 durable event stream 把跳步证据误读为工单成功。
+- PlanNode ledger 与 GUI 仍是状态真源；本轮只补充事件审计字段，不改变 worker 重试/continuation 行为。
+
+### GBX-187 — Plan contract status GUI projection
+
+- `GearRuntimePlanTaskSummary` 增加 `contract_status`，从 `PlanNodeRunStatus` 投影 `pending/accepted/failed`；Agent UI 在工单摘要中同时显示 worker status 与 contract status。
+- 这样 worker 进程成功但 step/证据契约失败时，GUI 不再只显示笼统 worker 状态；不新增第二套状态机，仍以 PlanNode ledger 为真源。
+
+### GBX-188 — Blocked contract status semantics
+
+- `contract_status` 将 `NeedsUser/Cancelled` 投影为 `blocked`，与 `Failed` 区分；GUI 不把等待用户或取消误报为契约失败。
+- 状态仍由 `PlanNodeRunStatus` 单向投影，兼容旧 GUI payload 的 serde default。
+
+### GBX-189 — Visible plan review revision 对齐
+
+- `GearRuntimePlanTaskSummary` 只使用与 visible PlanGraph 的 `plan_id/plan_hash` 匹配的 `PlanNodeRunLedger`；candidate revision 不再复用旧版本的工单状态、worker session 或 attempt。
+- `GearRuntimeReviewSummary` 同样绑定 visible PlanGraph 的 revision/hash，candidate 计划显示自身的 critic/oracle 结果；canonical approval 与 final verification 仍保持 canonical 语义。
+
+### GBX-190 — Candidate final verification GUI 隔离
+
+- visible plan 是 unreviewed candidate 时，GUI 不再投影 canonical PlanGraph 的 final-verification receipt/checks；candidate 只显示自身的验证要求，避免把旧版本证据误报为新版本已验证。
+- visible plan 与 canonical graph 一致时保持原有 approval/final-verification 投影；不新增 GUI 状态副本。
+
+### GBX-191 — Strategist next-goal receipt GUI 对齐
+
+- GUI 对带 schema 的 `StrategistNextGoalReceipt` 校验 receipt hash 以及当前 goal/epoch/status 绑定；无效 typed receipt 不进入 snapshot。
+- 无 schema 的旧 receipt 保留兼容读取路径；下一目标决策仍以 runtime 持久化 receipt 为唯一来源，不创建 GUI 状态副本。
+
+### GBX-192 — OMO 计划覆盖率 GUI 投影
+
+- `crates/gearbox_agent/src/gui.rs` 从当前 visible `PlanGraph` 与匹配的 `PlanNodeRunLedger` 计算工单、完成谓词和 QA 场景覆盖率；没有当前 attempt 的证据时不计为满足。
+- `crates/agent_ui/src/conversation_view/thread_view.rs` 在 Work Orders 面板显示覆盖率，继续只消费 runtime snapshot，不维护 GUI 计划状态副本。
+- 共享 UI 改动仅增加 Gearbox runtime 面板字段；上游普通 Agent 对话路径不变。
+
+### GBX-193 — OMO 计划 revision diff GUI 投影
+
+- GUI 从 `.gear/plans/revision-*.plan.json` 读取当前 visible revision 的相邻候选，只比较已持久化且通过 PlanGraph 校验的任务和 objective。
+- `GearRuntimePlanRevisionDiff` 仅投影 added/removed/changed task id 与 objective 是否变化；不改变 canonical plan、approval 或 runtime 调度。
+- Work Orders 面板显示 revision 变化摘要；仍以 runtime snapshot 为唯一 GUI 来源。
+
+### GBX-194 — Live PlanCritic repair observation path 边界
+
+- 真实 OpenCode 单 epoch smoke 暴露 PlanCritic repair 的 repository-observation atomic 临时文件名超过 `NAME_MAX`；task/session 组件改为 32 字节有界并保留旧 64 字节路径读取兼容。
+- 共享状态路径策略只影响 Gearbox observation artifact；上游普通 Agent 路径不变。
+
+### GBX-195 — PlanCritic typed schema repair prompt
+
+- 真实 Hy3 PlanCritic 输出采用 OMO 风格的顶层 `verdict/status/findings.evidence_refs`，导致严格 Gear receipt repair 失败；初始 PlanCritic、Oracle 和 repair prompt 现在都嵌入完整 typed verdict/finding skeleton。
+- 明确 `evidence_refs` 只能位于 check 内，finding 必须包含 `dimension/severity/code/task_id/path/message/required_change`；不放宽 `deny_unknown_fields`，继续 fail closed。
+
+### GBX-196 — Review observation blocker GUI projection
+
+- `GearRuntimeReviewSummary` 从 durable `ReviewEpochBundle` 的 observation receipt 投影不可用、无效或 `Unverified` 阻断原因及路径；不把缺少 repository tool evidence 的审查显示成普通 pending。
+- Agent UI Work Orders 面板显示 `Review blocker`，保留 runtime 的 fail-closed approval gate；只增加解释性投影，不放宽 observation 验证。
+
+### GBX-197 — OMO Todo session lifecycle GUI projection
+
+- OMO `boulder.json` 为每个 Todo 持久化 agent、session、started/ended/status；Gear 的 `PlanNodeSessionBinding` 已有同等 durable 生命周期，但之前 GUI 只显示 session ID。
+- `GearRuntimePlanTaskSummary` 现在投影 binding 的 `status`、`created_at`（started）和 `updated_at`（terminal/last update），Agent UI Work Orders 卡片同步显示这些字段。
+- 仍以 PlanNodeSessionBinding 为 runtime 真源；没有创建 GUI 私有 session 状态，也不改变 worker 生命周期或恢复语义。
+- 对终止或 superseded binding，GUI 额外派生 `ended_at` 与 `elapsed_ms`；活跃 binding 的 elapsed 从 created_at 计算到当前 snapshot 时间，不能伪造终止时间。
+
+### GBX-198 — OMO Todo session history GUI projection
+
+- OMO `boulder.json.task_sessions` 保留同一 Todo 的多次 session/agent/category 记录；Gear GUI 之前只读取当前 attempt 的 binding。
+- `GearRuntimePlanTaskSummary.worker_session_history` 现在从同一 PlanNode 的 bounded durable bindings（最多 8 次 attempt）投影 session、worker kind/model、状态、时间和 elapsed；当前 session 字段继续指向最新 attempt。
+- Work Orders 选中工单时显示 session history；历史列表只读 runtime artifacts，不维护 GUI 私有状态，也不改变重试/恢复调度。
+
+### GBX-199 — OMO Todo session aggregate GUI projection
+
+- 从 GBX-198 的 bounded session history 派生 attempt 总数、route 变化 fallback 次数和累计 elapsed；不重复持久化或把 GUI 计算结果用于预算/计费。
+- Work Orders 选中工单时显示 session aggregate，fallback 仅按相邻 binding 的 worker kind/model 变化计数，普通同 route retry 不会被误报为 fallback。
+
+### GBX-200 — OMO Todo category and fallback reason GUI projection
+
+- `TaskRouteDecisionReceipt` 已持久化 `worker_category`、`route_reason` 和每次 route 的 `fallback_count`；之前 session history 只显示 worker kind/model，丢失 OMO 的 agent/category/fallback 解释。
+- session history 现在绑定并校验对应 route receipt 的 plan identity/hash，再投影 category、route reason 和 receipt fallback count；没有匹配 receipt 时不猜测、不伪造。
+- aggregate 优先使用 receipt fallback count；只有全历史缺少 route metadata 时才使用 worker kind/model 变化作为 bounded 兼容推断。
+
+### GBX-202 — OMO current execution step GUI projection
+
+- `crates/agent_ui/src/conversation_view/thread_view.rs` 从 runtime snapshot 的 durable `execution_steps` 派生工单摘要中的 `current-step`；第一条非 `Completed` 步骤作为当前步骤，全部完成时显示 complete。
+- 不新增 GUI 状态副本、不改变 PlanNode 调度；上游普通对话路径不受影响，Gearbox Work Orders 继续只读 runtime 投影。
+
+### GBX-203 — OMO strict step evidence worker gate
+
+- `crates/gearbox_agent/src/runtime.rs` 对声明 `execution_steps_evidence_required` 的计划统一要求 delegated worker；fixture/non-delegated 执行不再绕过 `completed_steps` 证据而进入 `GreenVerified`。
+- 普通兼容计划继续允许 deterministic fallback；严格计划失败原因写入 PlanNode，现有 GUI `contract_status`、step error 和 `current-step` 投影会同步显示阻塞。
+
+### GBX-204 — OpenCode phase transport output recovery
+
+- `crates/gearbox_agent/src/open_code_phase_runtime.rs` 递归解包 OpenCode `--format json` 的 `part.text`、`worker_stdout.output` 和 `assistant_text_delta.delta`，并在 stdout 不含模型文本时读取同一 worker 的 transcript/partial-output。
+- 这只修复 phase transport 到 typed parser 的边界，不放宽 PlanGraph schema 或 PlanCritic 的 repository-observation fail-closed 语义；上游普通 Agent 输出路径不变。

@@ -12,14 +12,25 @@ pub const PLAN_GRAPH_SCHEMA_VERSION: u32 = 1;
 /// synchronized with the typed draft by exercising it in the unit tests below.
 pub const PLAN_GRAPH_SCHEMA_EXEMPLAR: &str = r#"{
   "objective": "observable outcome",
+  "assumptions": ["reversible default and rationale"],
+  "findings": ["path:line — repository fact"],
+  "decisions": ["decision — rationale"],
+  "open_questions": [],
   "must_have": ["acceptance signal"],
   "must_not_have": ["forbidden change"],
   "topology_lock": ["task_a"],
+  "preflight": ["record baseline before editing"],
+  "rollback": ["restore the bounded change if final verification fails"],
+  "final_verification": ["run the final verification wave and persist evidence"],
   "tasks": [{
     "task_id": "task_a",
     "title": "Implement the bounded change",
     "goal": "Deliver the requested behavior",
     "deliverable": "verified implementation",
+    "rationale": "The requested behavior is missing from the current repository baseline",
+    "approach": ["Inspect the existing seam, implement the bounded change, and verify it"],
+    "already_in_working_tree": ["the existing seam is present"],
+    "still_needed": ["add the missing behavior and evidence"],
     "dependencies": [],
     "parallel_wave": 0,
     "scope": {
@@ -30,7 +41,11 @@ pub const PLAN_GRAPH_SCHEMA_EXEMPLAR: &str = r#"{
     },
     "required_capabilities": ["file_write"],
     "preferred_phase_profile": "executor_quick",
+    "inputs": ["read the repository discovery artifact"],
+    "preconditions": ["the baseline has been recorded"],
     "must_do": ["implement the behavior"],
+    "execution_steps": [{"step_id": "step-001", "action": "implement the behavior", "expected_observation": "the bounded change is present", "evidence_path": null}],
+    "execution_steps_evidence_required": true,
     "must_not_do": ["modify forbidden paths"],
     "references": [{"path": "src/example.rs", "reason": "implementation entry point"}],
     "test": {
@@ -41,10 +56,15 @@ pub const PLAN_GRAPH_SCHEMA_EXEMPLAR: &str = r#"{
     },
     "qa": {
       "happy_path": [{"name": "happy", "steps": ["run the verification"], "expected_result": "behavior is present", "evidence_path": ".gear/artifacts/qa.log"}],
-      "failure_path": [{"name": "failure", "steps": ["capture the failure"], "expected_result": "failure is diagnosable", "evidence_path": ".gear/artifacts/qa.log"}]
+      "failure_path": [{"name": "failure", "steps": ["capture the failure"], "expected_result": "failure is diagnosable", "evidence_path": ".gear/artifacts/qa.log"}],
+      "adversarial_path": [{"name": "adversarial-not-applicable", "steps": ["check the trigger map"], "expected_result": "no applicable adversarial trigger", "evidence_path": ".gear/artifacts/qa.log"}]
     },
     "artifacts": [{"path": ".gear/artifacts/final-report.md", "description": "verification report", "required": true}],
+    "evidence": ["record the command exit status and changed paths"],
+    "rollback": ["restore the task-scoped changes if verification fails"],
+    "budget": {"max_attempts": 2, "max_commands": 3, "max_duration_seconds": null},
     "commit_boundary": "no_commit",
+    "commit_message": null,
     "completion_predicates": ["verification evidence exists"]
   }],
   "final_acceptance": ["the observable outcome is verified"]
@@ -79,12 +99,31 @@ pub struct PlannerReceipt {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanGraphDraft {
     pub objective: String,
+    /// OMO-style planning context. These explain the evidence and reversible
+    /// defaults behind the sealed task graph without becoming worker TODOs.
+    #[serde(default)]
+    pub assumptions: Vec<String>,
+    #[serde(default)]
+    pub findings: Vec<String>,
+    #[serde(default)]
+    pub decisions: Vec<String>,
+    #[serde(default)]
+    pub open_questions: Vec<String>,
     #[serde(default)]
     pub must_have: Vec<String>,
     #[serde(default)]
     pub must_not_have: Vec<String>,
     #[serde(default)]
     pub topology_lock: Vec<String>,
+    /// OMO-style plan-level execution controls. These are intentionally
+    /// declarative: runtime records their evidence, while workers execute
+    /// only the approved task contracts.
+    #[serde(default)]
+    pub preflight: Vec<String>,
+    #[serde(default)]
+    pub rollback: Vec<String>,
+    #[serde(default)]
+    pub final_verification: Vec<String>,
     pub tasks: Vec<PlanTaskContract>,
     #[serde(default)]
     pub final_acceptance: Vec<String>,
@@ -110,6 +149,17 @@ pub struct PlanTaskContract {
     pub title: String,
     pub goal: String,
     pub deliverable: String,
+    /// OMO-style task rationale: why this work order is needed now.
+    #[serde(default)]
+    pub rationale: String,
+    /// OMO-style bounded approach: how the worker should reach the deliverable.
+    #[serde(default)]
+    pub approach: Vec<String>,
+    /// OMO-compatible incremental context for this work order.
+    #[serde(default)]
+    pub already_in_working_tree: Vec<String>,
+    #[serde(default)]
+    pub still_needed: Vec<String>,
     #[serde(default)]
     pub dependencies: Vec<String>,
     pub parallel_wave: usize,
@@ -117,15 +167,60 @@ pub struct PlanTaskContract {
     #[serde(default)]
     pub required_capabilities: Vec<String>,
     pub preferred_phase_profile: PhaseProfile,
+    /// OMO's explicit task intake: what the executor must read before editing.
+    #[serde(default)]
+    pub inputs: Vec<String>,
+    /// Conditions that must be true before this work order can start.
+    #[serde(default)]
+    pub preconditions: Vec<String>,
     pub must_do: Vec<String>,
+    /// Ordered OMO-style execution instructions. Workers must complete these
+    /// in order and report the expected observation for each step.
+    #[serde(default)]
+    pub execution_steps: Vec<PlanExecutionStep>,
+    /// New planner contracts require explicit worker step receipts. Legacy
+    /// deterministic plans keep stage-derived compatibility until regenerated.
+    #[serde(default)]
+    pub execution_steps_evidence_required: bool,
     pub must_not_do: Vec<String>,
     #[serde(default)]
     pub references: Vec<PlanReference>,
     pub test: PlanTestContract,
     pub qa: PlanQaContract,
     pub artifacts: Vec<PlanArtifactContract>,
+    /// Evidence obligations are separate from deliverables so a task cannot
+    /// claim completion merely because a file was changed.
+    #[serde(default)]
+    pub evidence: Vec<String>,
+    #[serde(default)]
+    pub rollback: Vec<String>,
+    #[serde(default)]
+    pub budget: PlanTaskBudget,
     pub commit_boundary: CommitBoundary,
+    /// Optional OMO-style commit intent. Gear never commits automatically;
+    /// this is an auditable instruction for the delegated worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_message: Option<String>,
     pub completion_predicates: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanTaskBudget {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_attempts: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_commands: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_duration_seconds: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanExecutionStep {
+    pub step_id: String,
+    pub action: String,
+    pub expected_observation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_path: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -279,6 +374,8 @@ pub struct CommandExpectation {
 pub struct PlanQaContract {
     pub happy_path: Vec<QaScenario>,
     pub failure_path: Vec<QaScenario>,
+    #[serde(default)]
+    pub adversarial_path: Vec<QaScenario>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -347,6 +444,19 @@ impl PlanGraph {
         if self.draft.objective.trim().is_empty() {
             bail!("PlanGraph objective cannot be empty");
         }
+        for (field, values) in [
+            ("must_have", &self.draft.must_have),
+            ("must_not_have", &self.draft.must_not_have),
+            ("topology_lock", &self.draft.topology_lock),
+            ("preflight", &self.draft.preflight),
+            ("rollback", &self.draft.rollback),
+            ("final_verification", &self.draft.final_verification),
+            ("final_acceptance", &self.draft.final_acceptance),
+        ] {
+            if values.is_empty() || values.iter().any(|value| value.trim().is_empty()) {
+                bail!("PlanGraph {field} must contain non-empty decision criteria");
+            }
+        }
         if self.draft.tasks.is_empty() {
             bail!("PlanGraph must contain at least one task");
         }
@@ -374,6 +484,34 @@ impl PlanGraph {
         let mut tasks_by_id = HashMap::new();
         for task in &self.draft.tasks {
             task.validate()?;
+            // A session-bound planner receipt identifies the new OMO-style
+            // planner protocol. Sessionless coordinator briefs are legacy
+            // persisted plans and remain readable during migration.
+            // WHY/HOW context is part of every planner contract, including
+            // sessionless validation and persisted legacy migration drafts.
+            if self.source == PlanSource::PlannerModel
+                && self
+                    .planner
+                    .as_ref()
+                    .and_then(|planner| planner.session_id.as_ref())
+                    .is_some()
+                && !task.execution_steps_evidence_required
+            {
+                bail!(
+                    "planner-model task `{}` must require ordered step evidence",
+                    task.task_id
+                );
+            }
+            if self.source == PlanSource::PlannerModel
+                && (task.rationale.trim().is_empty()
+                    || task.approach.is_empty()
+                    || task.approach.iter().any(|item| item.trim().is_empty()))
+            {
+                bail!(
+                    "planner-model task `{}` must define a rationale and bounded approach",
+                    task.task_id
+                );
+            }
             if tasks_by_id.insert(task.task_id.as_str(), task).is_some() {
                 bail!("duplicate PlanGraph task id `{}`", task.task_id);
             }
@@ -475,6 +613,18 @@ impl PlanGraph {
             .map(|task| format!("{}: {}", task.task_id, task.deliverable))
             .collect::<Vec<_>>()
             .join("; ");
+        contract.already_in_working_tree = self
+            .draft
+            .tasks
+            .iter()
+            .flat_map(|task| task.already_in_working_tree.iter().cloned())
+            .collect();
+        contract.still_needed = self
+            .draft
+            .tasks
+            .iter()
+            .flat_map(|task| task.still_needed.iter().cloned())
+            .collect();
         contract.dependencies.clear();
         contract.parallel_wave = 0;
         contract.must_do = self
@@ -483,6 +633,29 @@ impl PlanGraph {
             .iter()
             .flat_map(|task| task.must_do.iter().cloned())
             .collect();
+        contract.execution_steps = self
+            .draft
+            .tasks
+            .iter()
+            .flat_map(|task| {
+                task.execution_steps
+                    .iter()
+                    .cloned()
+                    .map(|step| PlanExecutionStep {
+                        step_id: format!("{}::{}", task.task_id, step.step_id),
+                        ..step
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        if contract.execution_steps.is_empty() {
+            contract.execution_steps = execution_steps_from_must_do(&contract.must_do);
+        }
+        contract.execution_steps_evidence_required = self
+            .draft
+            .tasks
+            .iter()
+            .any(|task| task.execution_steps_evidence_required);
         contract.must_not_do = self
             .draft
             .must_not_have
@@ -555,13 +728,86 @@ impl PlanTaskContract {
                 self.task_id
             );
         }
+        for (field, values) in [
+            ("already_in_working_tree", &self.already_in_working_tree),
+            ("still_needed", &self.still_needed),
+        ] {
+            if values.iter().any(|value| value.trim().is_empty()) {
+                bail!("PlanGraph task `{}` has a blank {field} item", self.task_id);
+            }
+        }
+        for (field, values) in [
+            ("inputs", &self.inputs),
+            ("preconditions", &self.preconditions),
+            ("evidence", &self.evidence),
+            ("rollback", &self.rollback),
+        ] {
+            if values.iter().any(|value| value.trim().is_empty()) {
+                bail!("PlanGraph task `{}` has a blank {field} item", self.task_id);
+            }
+        }
+        if self.execution_steps_evidence_required {
+            for (field, values) in [
+                ("inputs", &self.inputs),
+                ("preconditions", &self.preconditions),
+                ("evidence", &self.evidence),
+                ("rollback", &self.rollback),
+            ] {
+                if values.is_empty() {
+                    bail!(
+                        "strict PlanGraph task `{}` must define non-empty {field}",
+                        self.task_id
+                    );
+                }
+            }
+        }
+        if self.budget.max_attempts == Some(0)
+            || self.budget.max_commands == Some(0)
+            || self.budget.max_duration_seconds == Some(0)
+        {
+            bail!(
+                "PlanGraph task `{}` has a zero execution budget",
+                self.task_id
+            );
+        }
+        if !self.execution_steps.is_empty() {
+            let mut seen = HashSet::new();
+            for step in &self.execution_steps {
+                if step.step_id.trim().is_empty()
+                    || step.action.trim().is_empty()
+                    || step.expected_observation.trim().is_empty()
+                    || !seen.insert(step.step_id.as_str())
+                {
+                    bail!(
+                        "PlanGraph task `{}` has invalid or duplicate execution step",
+                        self.task_id
+                    );
+                }
+            }
+        }
+        if self
+            .commit_message
+            .as_deref()
+            .is_some_and(|message| message.trim().is_empty())
+        {
+            bail!(
+                "PlanGraph task `{}` has an empty commit message",
+                self.task_id
+            );
+        }
         if self.qa.happy_path.is_empty() || self.qa.failure_path.is_empty() {
             bail!(
                 "PlanGraph task `{}` must define happy and failure QA",
                 self.task_id
             );
         }
-        for scenario in self.qa.happy_path.iter().chain(self.qa.failure_path.iter()) {
+        for scenario in self
+            .qa
+            .happy_path
+            .iter()
+            .chain(self.qa.failure_path.iter())
+            .chain(self.qa.adversarial_path.iter())
+        {
             if scenario.name.trim().is_empty()
                 || scenario.steps.is_empty()
                 || scenario.expected_result.trim().is_empty()
@@ -633,15 +879,49 @@ impl PlanTaskContract {
 
     pub fn worker_goal(&self, execution_request: &str) -> String {
         format!(
-            "Approved goal: {}\n\nApproved deliverable: {}\n\nCurrent turn instruction: {}\n\nDo not redesign the plan. Return a typed plan gap if the contract cannot be executed as written.",
-            self.goal, self.deliverable, execution_request
+            "Approved goal: {}\n\nWHY: {}\n\nApproved deliverable: {}\n\nHOW:\n{}\n\nCurrent turn instruction: {}\n\nExecute the numbered STEP constraints in order. Do not skip, reorder, or replace a step; report a typed plan gap when a step or its expected observation cannot be completed. Do not redesign the plan.",
+            self.goal,
+            self.rationale,
+            self.deliverable,
+            self.approach.join("\n"),
+            execution_request
         )
     }
 
     pub fn worker_constraints(&self) -> Vec<String> {
-        self.must_do
+        self.inputs
             .iter()
-            .map(|requirement| format!("MUST: {requirement}"))
+            .map(|input| format!("INPUT: read `{input}` before editing"))
+            .chain(
+                self.preconditions
+                    .iter()
+                    .map(|condition| format!("PRECONDITION: verify {condition}")),
+            )
+            .chain(std::iter::once(format!("WHY: {}", self.rationale)))
+            .chain(self.approach.iter().map(|step| format!("HOW: {step}")))
+            .chain(
+                self.execution_steps_or_legacy()
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, step)| {
+                        format!(
+                            "STEP {:02} [{}]: {} -> expect {}{}",
+                            index + 1,
+                            step.step_id,
+                            step.action,
+                            step.expected_observation,
+                            step.evidence_path
+                                .as_deref()
+                                .map(|path| format!("; evidence `{path}`"))
+                                .unwrap_or_default()
+                        )
+                    }),
+            )
+            .chain(
+                self.must_do
+                    .iter()
+                    .map(|requirement| format!("MUST: {requirement}")),
+            )
             .chain(
                 self.must_not_do
                     .iter()
@@ -655,6 +935,31 @@ impl PlanTaskContract {
                     self.scope.write_scope.join(", ")
                 }
             )))
+            .chain(
+                self.evidence
+                    .iter()
+                    .map(|requirement| format!("EVIDENCE: {requirement}")),
+            )
+            .chain(
+                self.rollback
+                    .iter()
+                    .map(|instruction| format!("ROLLBACK: {instruction}")),
+            )
+            .chain(
+                self.budget
+                    .max_attempts
+                    .map(|value| format!("BUDGET: max_attempts={value}")),
+            )
+            .chain(
+                self.budget
+                    .max_commands
+                    .map(|value| format!("BUDGET: max_commands={value}")),
+            )
+            .chain(
+                self.budget
+                    .max_duration_seconds
+                    .map(|value| format!("BUDGET: max_duration_seconds={value}")),
+            )
             .collect()
     }
 
@@ -689,6 +994,14 @@ impl PlanTaskContract {
         .into_iter()
         .map(ToString::to_string)
         .chain(
+            self.execution_steps_evidence_required
+                .then(|| "completed_steps".to_string()),
+        )
+        .chain(
+            self.execution_steps_evidence_required
+                .then(|| "step_evidence".to_string()),
+        )
+        .chain(
             self.artifacts
                 .iter()
                 .filter(|artifact| artifact.required)
@@ -699,6 +1012,7 @@ impl PlanTaskContract {
 
     pub fn worker_stop_conditions(&self) -> Vec<String> {
         vec![
+            "Execute the approved steps in order; stop and report a plan gap when the next step cannot be completed or its expected observation is absent.".to_string(),
             "The approved scope, dependency, or acceptance contract is incomplete.".to_string(),
             "Execution requires a forbidden path or unapproved irreversible action.".to_string(),
             "RED fails for an environment or syntax reason instead of the planned missing behavior."
@@ -706,6 +1020,27 @@ impl PlanTaskContract {
             "The same root cause fails twice without new evidence.".to_string(),
         ]
     }
+
+    pub fn execution_steps_or_legacy(&self) -> Vec<PlanExecutionStep> {
+        if self.execution_steps.is_empty() {
+            execution_steps_from_must_do(&self.must_do)
+        } else {
+            self.execution_steps.clone()
+        }
+    }
+}
+
+fn execution_steps_from_must_do(must_do: &[String]) -> Vec<PlanExecutionStep> {
+    must_do
+        .iter()
+        .enumerate()
+        .map(|(index, action)| PlanExecutionStep {
+            step_id: format!("step-{:03}", index + 1),
+            action: action.clone(),
+            expected_observation: "the step's stated change or check is complete".to_string(),
+            evidence_path: None,
+        })
+        .collect()
 }
 
 pub fn deterministic_fallback_draft(
@@ -740,16 +1075,47 @@ pub fn deterministic_fallback_draft(
     };
     PlanGraphDraft {
         objective: objective.to_string(),
+        assumptions: vec![
+            "Prefer a reversible local implementation when the request leaves details open."
+                .to_string(),
+        ],
+        findings: Vec::new(),
+        decisions: vec![
+            "Keep the first implementation inside the declared repository scope.".to_string(),
+        ],
+        open_questions: Vec::new(),
         must_have: vec!["Satisfy the original objective with inspectable evidence.".to_string()],
         must_not_have: vec!["Do not expand scope beyond the original objective.".to_string()],
         topology_lock: vec![
             "Preserve the existing repository architecture unless required.".to_string(),
+        ],
+        preflight: vec![
+            "Record the repository baseline and verify the requested scope before editing."
+                .to_string(),
+        ],
+        rollback: vec![
+            "If final verification fails, preserve evidence and revert only this plan's changes."
+                .to_string(),
+        ],
+        final_verification: vec![
+            "Run the final verification wave and persist its receipt before completion."
+                .to_string(),
         ],
         tasks: vec![PlanTaskContract {
             task_id: "task_003".to_string(),
             title: "Execute the bounded implementation contract".to_string(),
             goal: objective.to_string(),
             deliverable: "A minimal verified implementation of the requested change.".to_string(),
+            rationale: "The requested change is not implemented in the current repository baseline.".to_string(),
+            approach: vec![
+                "Inspect the existing seam, implement only the requested behavior, then verify the result.".to_string(),
+            ],
+            already_in_working_tree: vec![
+                "The repository baseline and discovery evidence are already recorded.".to_string(),
+            ],
+            still_needed: vec![
+                "Implement the requested behavior and persist verification evidence.".to_string(),
+            ],
             dependencies: Vec::new(),
             parallel_wave: 0,
             scope: PlanTaskScope {
@@ -760,11 +1126,42 @@ pub fn deterministic_fallback_draft(
             },
             required_capabilities: vec!["read".to_string(), "edit".to_string(), "test".to_string()],
             preferred_phase_profile: PhaseProfile::ExecutorQuick,
+            inputs: vec![
+                "Read the repository baseline and the referenced implementation seam before editing."
+                    .to_string(),
+            ],
+            preconditions: vec![
+                "The declared scope and verification commands are available.".to_string(),
+            ],
             must_do: vec![
                 "Inspect relevant repository code before editing.".to_string(),
                 "Make the smallest change that satisfies the objective.".to_string(),
                 "Record verification and known failures.".to_string(),
             ],
+            execution_steps: vec![
+                PlanExecutionStep {
+                    step_id: "step-001".to_string(),
+                    action: "Inspect relevant repository code before editing.".to_string(),
+                    expected_observation: "The implementation seam and baseline are recorded."
+                        .to_string(),
+                    evidence_path: Some(".gear/artifacts/verification.md".to_string()),
+                },
+                PlanExecutionStep {
+                    step_id: "step-002".to_string(),
+                    action: "Make the smallest change that satisfies the objective.".to_string(),
+                    expected_observation: "The requested behavior is implemented within scope."
+                        .to_string(),
+                    evidence_path: None,
+                },
+                PlanExecutionStep {
+                    step_id: "step-003".to_string(),
+                    action: "Record verification and known failures.".to_string(),
+                    expected_observation: "Verification evidence and remaining failures are explicit."
+                        .to_string(),
+                    evidence_path: Some(".gear/artifacts/verification.md".to_string()),
+                },
+            ],
+            execution_steps_evidence_required: false,
             must_not_do: vec!["Do not redesign unrelated code.".to_string()],
             references: Vec::new(),
             test,
@@ -785,6 +1182,25 @@ pub fn deterministic_fallback_draft(
                         .to_string(),
                     evidence_path: ".gear/artifacts/verification.md".to_string(),
                 }],
+                adversarial_path: vec![QaScenario {
+                    name: "adversarial-not-applicable".to_string(),
+                    steps: vec!["Check the OMO trigger map for this narrow fallback task.".to_string()],
+                    expected_result: "No additional adversarial trigger applies; the reason is recorded."
+                        .to_string(),
+                    evidence_path: ".gear/artifacts/verification.md".to_string(),
+                }],
+            },
+            evidence: vec![
+                "Record changed paths, commands, exit status, and known failures.".to_string(),
+            ],
+            rollback: vec![
+                "Preserve evidence and revert only this task's bounded changes if verification fails."
+                    .to_string(),
+            ],
+            budget: PlanTaskBudget {
+                max_attempts: Some(2),
+                max_commands: Some(3),
+                max_duration_seconds: None,
             },
             artifacts: vec![PlanArtifactContract {
                 path: ".gear/artifacts/final-report.md".to_string(),
@@ -792,6 +1208,7 @@ pub fn deterministic_fallback_draft(
                 required: true,
             }],
             commit_boundary: CommitBoundary::NoCommit,
+            commit_message: None,
             completion_predicates: vec![
                 "The requested change is implemented within scope.".to_string(),
                 "Verification evidence is recorded.".to_string(),
@@ -894,6 +1311,9 @@ pub fn validate_planner_draft(goal_id: &str, draft: &PlanGraphDraft) -> Result<(
         Some(PlannerReceipt {
             provider_id: "planner-validation".to_string(),
             model_id: "planner-validation".to_string(),
+            // Draft validation must not invent a live planner session. The
+            // session-bound ordered-evidence gate is enforced when the
+            // runtime seals an actual planner submission.
             session_id: None,
         }),
         draft.clone(),
@@ -979,6 +1399,7 @@ mod tests {
         assert_eq!(draft.objective, "canonical objective");
         assert_eq!(draft.tasks.len(), 1);
         assert_eq!(draft.tasks[0].task_id, "task_a");
+        assert_eq!(draft.tasks[0].commit_message, None);
     }
 
     fn valid_draft() -> PlanGraphDraft {
@@ -986,6 +1407,7 @@ mod tests {
         let mut draft =
             deterministic_fallback_draft("Implement feature", &scope, &["cargo test".to_string()]);
         let task = &mut draft.tasks[0];
+        task.execution_steps_evidence_required = true;
         task.test.strategy = TestStrategy::Tdd;
         task.test.red = Some(CommandExpectation {
             command: "cargo test feature".to_string(),
@@ -1009,6 +1431,29 @@ mod tests {
             PhaseProfile::ExecutorQuick
         );
         assert_eq!(draft.tasks[0].test.strategy, TestStrategy::TestsAfter);
+        assert_eq!(draft.tasks[0].inputs.len(), 1);
+        assert_eq!(draft.tasks[0].preconditions.len(), 1);
+        assert_eq!(draft.tasks[0].evidence.len(), 1);
+        assert_eq!(draft.tasks[0].rollback.len(), 1);
+        assert_eq!(draft.tasks[0].budget.max_attempts, Some(2));
+        Ok(())
+    }
+
+    #[test]
+    fn commit_message_is_optional_but_cannot_be_blank() -> Result<()> {
+        let mut draft = valid_draft();
+        draft.tasks[0].commit_message = Some("feat: implement bounded behavior".to_string());
+        PlanGraph::seal(
+            "goal-1",
+            1,
+            PlanSource::DeterministicFallback,
+            None,
+            draft.clone(),
+        )?;
+        draft.tasks[0].commit_message = Some("  ".to_string());
+        let error = PlanGraph::seal("goal-1", 1, PlanSource::DeterministicFallback, None, draft)
+            .expect_err("blank commit intent must be rejected");
+        assert!(error.to_string().contains("commit message"));
         Ok(())
     }
 
@@ -1027,7 +1472,7 @@ mod tests {
         Some(PlannerReceipt {
             provider_id: "test-provider".to_string(),
             model_id: "test-model".to_string(),
-            session_id: None,
+            session_id: Some("planner-session".to_string()),
         })
     }
 
@@ -1041,6 +1486,100 @@ mod tests {
             valid_draft(),
         )?;
         Ok(())
+    }
+
+    #[test]
+    fn execution_steps_are_ordered_worker_constraints_and_invalid_steps_reject() -> Result<()> {
+        let draft = valid_draft();
+        let task = &draft.tasks[0];
+        let constraints = task.worker_constraints();
+        assert!(constraints.iter().any(|line| line.starts_with("STEP 01")));
+        assert!(constraints.iter().any(|line| line.starts_with("STEP 02")));
+        assert!(constraints.iter().any(|line| line.starts_with("WHY: ")));
+        assert!(constraints.iter().any(|line| line.starts_with("HOW: ")));
+        assert!(task.worker_goal("continue").contains("WHY: "));
+
+        let mut invalid = draft;
+        invalid.tasks[0].execution_steps[1].step_id =
+            invalid.tasks[0].execution_steps[0].step_id.clone();
+        assert!(
+            PlanGraph::seal(
+                "goal-steps",
+                1,
+                PlanSource::PlannerModel,
+                planner_receipt(),
+                invalid,
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn strict_step_evidence_is_an_explicit_new_plan_contract() {
+        let mut draft = valid_draft();
+        draft.tasks[0].execution_steps_evidence_required = true;
+        let outputs = draft.tasks[0].worker_required_outputs();
+        assert!(outputs.iter().any(|output| output == "completed_steps"));
+        assert!(outputs.iter().any(|output| output == "step_evidence"));
+    }
+
+    #[test]
+    fn strict_planner_contract_rejects_missing_omo_task_context() {
+        let mut draft = valid_draft();
+        draft.tasks[0].execution_steps_evidence_required = true;
+        draft.tasks[0].rollback.clear();
+        let error = PlanGraph::seal(
+            "goal-strict-context",
+            1,
+            PlanSource::PlannerModel,
+            planner_receipt(),
+            draft,
+        )
+        .expect_err("strict planner tasks must carry rollback context");
+        assert!(error.to_string().contains("rollback"));
+    }
+
+    #[test]
+    fn strict_planner_contract_requires_why_and_how() {
+        let mut draft = valid_draft();
+        draft.tasks[0].rationale.clear();
+        let error = validate_planner_draft("goal-strict-why-how", &draft)
+            .expect_err("strict planner tasks must carry OMO WHY/HOW context");
+        assert!(error.to_string().contains("rationale"));
+    }
+
+    #[test]
+    fn draft_validation_does_not_invent_a_live_session_evidence_gate() -> Result<()> {
+        let mut draft = valid_draft();
+        draft.tasks[0].execution_steps_evidence_required = false;
+        validate_planner_draft("goal-sessionless-draft", &draft)?;
+
+        let error = PlanGraph::seal(
+            "goal-session-bound",
+            1,
+            PlanSource::PlannerModel,
+            planner_receipt(),
+            draft,
+        )
+        .expect_err("a live planner receipt must require ordered step evidence");
+        assert!(error.to_string().contains("ordered step evidence"));
+        Ok(())
+    }
+
+    #[test]
+    fn planner_model_rejects_legacy_non_strict_work_order() {
+        let mut draft = valid_draft();
+        draft.tasks[0].execution_steps_evidence_required = false;
+        let error = PlanGraph::seal(
+            "goal-strict-steps",
+            1,
+            PlanSource::PlannerModel,
+            planner_receipt(),
+            draft,
+        )
+        .expect_err("planner-model tasks must opt into ordered step evidence");
+        assert!(error.to_string().contains("ordered step evidence"));
     }
 
     #[test]
@@ -1152,6 +1691,22 @@ mod tests {
     }
 
     #[test]
+    fn plan_graph_requires_goal_level_decision_criteria() -> Result<()> {
+        let mut draft = valid_draft();
+        draft.final_acceptance.clear();
+        let error = PlanGraph::seal(
+            "goal-1",
+            1,
+            PlanSource::PlannerModel,
+            planner_receipt(),
+            draft,
+        )
+        .expect_err("a plan without final acceptance must be rejected");
+        assert!(error.to_string().contains("final_acceptance"));
+        Ok(())
+    }
+
+    #[test]
     fn runnable_tasks_returns_all_ready_nodes_without_active_nodes() -> Result<()> {
         let scope = Scope::new(vec!["src".to_string()], vec![".git".to_string()], 4);
         let mut draft = deterministic_fallback_draft("graph", &scope, &[]);
@@ -1194,6 +1749,13 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["node_a", "node_b"]
         );
+        let serial_wave = graph.runnable_wave(&HashSet::new(), &HashSet::new(), 1)?;
+        assert_eq!(serial_wave.len(), 1);
+        assert_eq!(serial_wave[0].task_id, "node_a");
+        let active = HashSet::from([String::from("node_a")]);
+        let serial_wave = graph.runnable_wave(&HashSet::new(), &active, 1)?;
+        assert_eq!(serial_wave.len(), 1);
+        assert_eq!(serial_wave[0].task_id, "node_b");
         Ok(())
     }
 
@@ -1243,6 +1805,9 @@ mod tests {
         node.attempt = 1;
         node.green_evidence_paths.push("green.md".to_string());
         node.review_evidence_path = Some("review.md".to_string());
+        for step in &mut node.execution_steps {
+            step.status = crate::state::PlanStepRunStatus::Completed;
+        }
         ledger.validate()?;
         let temp_dir = tempfile::tempdir()?;
         let store = crate::state::StateStore::new(temp_dir.path());
@@ -1250,6 +1815,59 @@ mod tests {
         let path = store.write_plan_node_runs(&ledger)?;
         assert!(path.is_file());
         assert_eq!(store.read_plan_node_runs("goal")?, Some(ledger));
+        Ok(())
+    }
+
+    #[test]
+    fn plan_node_steps_persist_running_blocked_and_resume_states() -> Result<()> {
+        let scope = Scope::new(vec!["src".to_string()], vec![".git".to_string()], 4);
+        let graph = PlanGraph::seal(
+            "goal-steps",
+            1,
+            PlanSource::DeterministicFallback,
+            None,
+            deterministic_fallback_draft("graph", &scope, &[]),
+        )?;
+        let mut ledger = crate::state::PlanNodeRunLedger::from_plan("goal-steps", "epoch", &graph)?;
+        let node = ledger.node_mut("task_003")?;
+        assert!(
+            node.execution_steps
+                .iter()
+                .all(|step| { step.status == crate::state::PlanStepRunStatus::Pending })
+        );
+        node.status = crate::state::PlanNodeRunStatus::Running;
+        node.sync_step_lifecycle(None);
+        assert_eq!(
+            node.execution_steps[0].status,
+            crate::state::PlanStepRunStatus::Running
+        );
+        let completed = vec![node.execution_steps[0].step_id.clone()];
+        let evidence = HashMap::from([(completed[0].clone(), ".gear/steps/001.md".to_string())]);
+        assert_eq!(
+            node.apply_worker_step_evidence(&completed, &evidence)?
+                .len(),
+            2
+        );
+        assert_eq!(
+            node.execution_steps[0].evidence_path.as_deref(),
+            Some(".gear/steps/001.md")
+        );
+        node.status = crate::state::PlanNodeRunStatus::Failed;
+        node.sync_step_lifecycle(Some("worker stopped"));
+        assert_eq!(
+            node.execution_steps[1].status,
+            crate::state::PlanStepRunStatus::Blocked
+        );
+        ledger.requeue_failed_for_resume();
+        assert_eq!(
+            ledger.nodes[0].execution_steps[0].status,
+            crate::state::PlanStepRunStatus::Completed
+        );
+        assert!(
+            ledger.nodes[0].execution_steps[1..]
+                .iter()
+                .all(|step| { step.status == crate::state::PlanStepRunStatus::Pending })
+        );
         Ok(())
     }
 

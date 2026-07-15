@@ -4182,12 +4182,10 @@ impl BufferLspData {
             document_symbols.remove_server_data(for_server);
         }
 
-        self.lsp_requests.retain(|key, _| {
-            key.server_queried != Some(for_server)
-        });
-        self.chunk_lsp_requests.retain(|key, _| {
-            key.server_queried != Some(for_server)
-        });
+        self.lsp_requests
+            .retain(|key, _| key.server_queried != Some(for_server));
+        self.chunk_lsp_requests
+            .retain(|key, _| key.server_queried != Some(for_server));
     }
 
     #[cfg(any(test, feature = "test-support"))]

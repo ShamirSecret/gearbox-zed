@@ -988,10 +988,52 @@ fn verifier_check(
 }
 
 fn structure_findings(plan: &PlanGraph) -> Vec<String> {
-    plan.validate()
+    let mut findings = plan
+        .validate()
         .err()
         .map(|error| vec![format!("PlanGraph validation failed: {error:#}")])
-        .unwrap_or_default()
+        .unwrap_or_default();
+    findings.extend(
+        plan.draft
+            .open_questions
+            .iter()
+            .map(|question| format!("unresolved planning question blocks approval: {}", question)),
+    );
+    findings.extend(decomposition_findings(plan));
+    findings
+}
+
+/// Keep the planner's work orders independently executable without imposing
+/// an artificial exact file boundary. These are deliberately high ceilings:
+/// normal multi-file tasks remain valid, while a single node that effectively
+/// contains an entire feature is sent back for decomposition.
+fn decomposition_findings(plan: &PlanGraph) -> Vec<String> {
+    const MAX_FILES_PER_WORK_ORDER: usize = 8;
+    const MAX_MUST_DO_ITEMS_PER_WORK_ORDER: usize = 12;
+    let mut findings = Vec::new();
+    for task in &plan.draft.tasks {
+        let file_count = task
+            .scope
+            .allowed_files
+            .len()
+            .max(task.scope.write_scope.len());
+        if file_count > MAX_FILES_PER_WORK_ORDER {
+            findings.push(format!(
+                "task `{}` is too broad for one work order ({} scoped files, max_files_changed={}): split it into independently verifiable work orders",
+                task.task_id,
+                file_count,
+                task.scope.max_files_changed
+            ));
+        }
+        if task.must_do.len() > MAX_MUST_DO_ITEMS_PER_WORK_ORDER {
+            findings.push(format!(
+                "task `{}` contains {} must-do steps; split hidden substeps into separate work orders",
+                task.task_id,
+                task.must_do.len()
+            ));
+        }
+    }
+    findings
 }
 
 fn reference_findings(plan: &PlanGraph, workspace_root: &Path) -> Vec<String> {
@@ -1548,6 +1590,7 @@ mod tests {
         let mut draft =
             deterministic_fallback_draft("Implement feature", &scope, &["cargo test".to_string()]);
         let task = draft.tasks.first_mut().context("fixture task missing")?;
+        task.execution_steps_evidence_required = true;
         task.references.push(PlanReference {
             path: "src/lib.rs".to_string(),
             reason: "Existing implementation entry point".to_string(),
@@ -1777,10 +1820,36 @@ mod tests {
     }
 
     #[test]
+    fn verifier_blocks_plans_with_unresolved_open_questions() -> Result<()> {
+        let fixture = fixture()?;
+        let mut draft = fixture.plan.draft.clone();
+        draft.open_questions = vec!["Which persistence boundary owns the migration?".to_string()];
+        let plan = PlanGraph::seal(
+            "goal-1",
+            2,
+            PlanSource::PlannerModel,
+            fixture.plan.planner.clone(),
+            draft,
+        )?;
+        let report = PlanVerifierReport::verify(&plan, fixture._temp_dir.path())?;
+        let structure = report
+            .check(PlanVerifierDimension::Structure)
+            .context("structure check missing")?;
+        assert!(!report.passed());
+        assert!(!structure.passed);
+        assert!(
+            structure
+                .findings
+                .iter()
+                .any(|finding| finding.contains("unresolved planning question"))
+        );
+        Ok(())
+    }
+
+    #[test]
     fn verifier_catches_structural_tdd_qa_and_acceptance_gaps() -> Result<()> {
         let fixture = fixture()?;
         let mut draft = fixture.plan.draft.clone();
-        draft.final_acceptance.clear();
         let task = draft.tasks.first_mut().context("fixture task missing")?;
         task.test.strategy = TestStrategy::Tdd;
         task.test.red = Some(CommandExpectation {
@@ -1826,6 +1895,41 @@ mod tests {
                 .check(PlanVerifierDimension::AcceptanceContract)
                 .context("acceptance check missing")?
                 .passed
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn verifier_rejects_work_orders_that_hide_too_many_steps_or_files() -> Result<()> {
+        let fixture = fixture()?;
+        let mut draft = fixture.plan.draft.clone();
+        let task = draft.tasks.first_mut().context("fixture task missing")?;
+        task.scope.allowed_files = (0..9).map(|index| format!("src/file-{index}.rs")).collect();
+        task.scope.max_files_changed = 9;
+        task.must_do = (0..13).map(|index| format!("step-{index}")).collect();
+        let plan = PlanGraph::seal(
+            "goal-1",
+            2,
+            PlanSource::PlannerModel,
+            fixture.plan.planner.clone(),
+            draft,
+        )?;
+        let report = PlanVerifierReport::verify(&plan, fixture._temp_dir.path())?;
+        let structure = report
+            .check(PlanVerifierDimension::Structure)
+            .context("structure check missing")?;
+        assert!(!structure.passed);
+        assert!(
+            structure
+                .findings
+                .iter()
+                .any(|finding| finding.contains("too broad"))
+        );
+        assert!(
+            structure
+                .findings
+                .iter()
+                .any(|finding| finding.contains("hidden substeps"))
         );
         Ok(())
     }

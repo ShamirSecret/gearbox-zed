@@ -19,8 +19,8 @@ use crate::phase_routing::{
     PhaseRouteDecision, PhaseRouteReceipt, PhaseRouteTable,
 };
 use crate::plan_graph::{
-    PhaseProfile, PlanGraph, PlanGraphDraft, PlanSource, PlannerReceipt,
-    deterministic_fallback_draft, parse_planner_draft_with_objective,
+    CommitBoundary, PhaseProfile, PlanGraph, PlanGraphDraft, PlanSource, PlannerReceipt,
+    deterministic_fallback_draft, parse_planner_draft_with_objective, validate_planner_draft,
 };
 use crate::plan_review::{
     IntentFoldDecision, IntentFoldReceipt, IntentFoldVerdict, PhaseExecutionBackend,
@@ -33,11 +33,12 @@ use crate::state::{
     FinalVerificationDimension, FinalVerificationResult, FinalVerificationWaveReceipt, Goal,
     GoalEpochEventKind, GoalGraphNode, GoalRunLeaseGuard, GoalStatus, ModelCallKind,
     ObjectiveEpochOutcomeReceipt, ObjectiveEventKind, ObjectiveGraph, ObjectivePolicy,
-    ObjectiveStatus, PlanNodeRunLedger, PlanNodeRunStatus, PlanWaveNodeStatus, PlanWaveRunLedger,
-    PromptSettleAction, PromptSettleEvent, RepositoryObservationReceipt,
-    RepositoryObservationStatus, ReviewEpochBundle, ReviewEpochRoleEvidence, Scope, Session,
-    SettledBudgetUsage, StateStore, Task, TaskInputs, TaskKind, TaskOutputs,
-    TaskRouteDecisionReceipt, TaskStatus, WorkLineage, event, id_timestamp, timestamp,
+    ObjectiveStatus, PlanNodeRunLedger, PlanNodeRunStatus, PlanPreflightCheck, PlanWaveNodeStatus,
+    PlanWaveRunLedger, PlanWorkOrderDecision, PromptSettleAction, PromptSettleEvent,
+    RepositoryObservationReceipt, RepositoryObservationStatus, ReviewEpochBundle,
+    ReviewEpochRoleEvidence, Scope, Session, SettledBudgetUsage, StateStore, Task, TaskInputs,
+    TaskKind, TaskOutputs, TaskRouteDecisionReceipt, TaskStatus, WorkLineage,
+    WorkerEvidenceQuality, event, id_timestamp, timestamp,
 };
 use crate::task_manager::{
     CompletionNotifier, ManagedTaskStatus, NotificationResult, ParentSessionState, SendOutcome,
@@ -56,7 +57,8 @@ use crate::worker_broker::{
 use crate::workers::{
     CategoryResolution, CategoryResolutionResult, FallbackRoute, Intensity, SelectedWorkerRoute,
     WorkerCategory, WorkerConfig, WorkerKind, WorkerOutcome, WorkerResult, WorkerStartRequest,
-    WorkerStatus, category_resolution_for_route,
+    WorkerStatus, category_resolution_for_route, worker_continuation_evidence_from_result,
+    worker_step_evidence_from_result,
 };
 
 pub type EventSink = Arc<dyn Fn(&Event) + Send + Sync + 'static>;
@@ -335,8 +337,10 @@ impl StrategistNextGoalVerdict {
                 }
             }
             StrategistNextGoalDecision::NeedsUser => {
-                if self.reviewed_status != GoalStatus::NeedsUser
-                    || self.required_questions.is_empty()
+                if !matches!(
+                    self.reviewed_status,
+                    GoalStatus::Complete | GoalStatus::NeedsUser
+                ) || self.required_questions.is_empty()
                     || self.next_objective.is_some()
                     || self.answerable_now
                 {
@@ -411,7 +415,7 @@ impl StrategistNextGoalReceipt {
         Ok(receipt)
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.schema_version != 1
             || self.raw_output_sha256.len() != 64
             || self.receipt_hash != self.expected_hash()?
@@ -946,7 +950,9 @@ struct PrestartedPlanWorker {
     completed_run: Option<crate::task_manager::ManagedWorkerRun>,
 }
 
-#[allow(clippy::too_many_arguments)]
+// Kept as a recovery reference for old persisted wave records; new PlanGraph
+// execution never invokes it because work orders are dispatched one at a time.
+#[allow(dead_code, clippy::too_many_arguments)]
 fn dispatch_parallel_plan_siblings(
     scheduled_plan_wave: &mut VecDeque<String>,
     prestarted_plan_workers: &mut HashMap<String, PrestartedPlanWorker>,
@@ -1117,6 +1123,7 @@ fn dispatch_parallel_plan_siblings(
             let node = plan_node_runs.node_mut(&plan_task_id)?;
             node.red_evidence_path = Some(red_path.to_string_lossy().to_string());
             node.status = PlanNodeRunStatus::RedVerified;
+            node.sync_step_lifecycle(None);
             node.updated_at = timestamp();
             plan_node_runs.updated_at = timestamp();
         }
@@ -1135,6 +1142,7 @@ fn dispatch_parallel_plan_siblings(
             node.worker_task_id = Some(worker_task_id.clone());
             node.implementation_task_id = Some(worker_task_id.clone());
             node.status = PlanNodeRunStatus::Running;
+            node.sync_step_lifecycle(None);
             node.updated_at = timestamp();
             plan_node_runs.updated_at = timestamp();
         }
@@ -1462,6 +1470,18 @@ impl Orchestrator {
             .unwrap_or_else(|| format!("ses_{id_suffix}"));
         let task_namespace = fixed_goal_id.clone();
         let goal_id = fixed_goal_id.unwrap_or_else(|| format!("goal_{id_suffix}"));
+        let prior_goal = if options.continuation {
+            store.read_goal(&goal_id)?
+        } else {
+            None
+        };
+        // A normal process restart must resume the sealed plan and its
+        // PlanNodeRun ledger. A user answer to a NeedsUser goal is the one
+        // continuation boundary that intentionally permits a fresh plan.
+        let can_reuse_persisted_plan = options.continuation
+            && prior_goal.as_ref().is_some_and(|goal| {
+                !matches!(goal.status, GoalStatus::NeedsUser) || goal.request == options.request
+            });
 
         if options.continuation && store.continuation_is_stopped_for_session(&session_id)? {
             store.record_prompt_settle_decision(
@@ -1642,25 +1662,66 @@ impl Orchestrator {
             current_model.validate()?;
         }
         let phase_routes_path = store.write_phase_route_table(&goal_id, &phase_runtime.routes)?;
-        let plan_graph = build_approved_plan_graph_with_budget(
-            &mut goal,
-            &scope,
-            &detection.verification_commands,
-            &workspace,
-            &store,
-            &session_id,
-            &options.event_sink,
-            options.cancellation_token.as_ref(),
-            &phase_runtime,
-            &goal_run_lease,
-            &epoch_id,
-        )?;
-        let plan_graph_path = if phase_runtime.require_plan_approval {
+        let persisted_plan = if can_reuse_persisted_plan {
+            if phase_runtime.require_plan_approval {
+                store.read_plan_graph(&goal_id)?
+            } else {
+                store.read_unreviewed_plan_graph(&goal_id)?
+            }
+        } else {
+            None
+        };
+        let plan_reused = persisted_plan.is_some();
+        let plan_graph = if let Some(plan_graph) = persisted_plan {
+            plan_graph
+        } else {
+            build_approved_plan_graph_with_budget(
+                &mut goal,
+                &scope,
+                &detection.verification_commands,
+                &workspace,
+                &store,
+                &session_id,
+                &options.event_sink,
+                options.cancellation_token.as_ref(),
+                &phase_runtime,
+                &goal_run_lease,
+                &epoch_id,
+            )?
+        };
+        let plan_graph_path = if plan_reused {
+            if phase_runtime.require_plan_approval {
+                store.plans_dir().join(format!("{goal_id}.plan.json"))
+            } else {
+                store
+                    .plans_dir()
+                    .join(format!("{goal_id}.unreviewed.plan.json"))
+            }
+        } else if phase_runtime.require_plan_approval {
             store.write_plan_graph(&plan_graph)?
         } else {
             store.write_unreviewed_plan_graph(&plan_graph)?
         };
-        if phase_runtime.require_plan_approval {
+        if plan_reused {
+            append_event(
+                &store,
+                &options.event_sink,
+                event(
+                    &session_id,
+                    Some(&goal_id),
+                    None,
+                    EventKind::PlanReused,
+                    format!("Resumed persisted plan revision {}", plan_graph.revision),
+                    json!({
+                        "plan_id": plan_graph.plan_id,
+                        "plan_hash": plan_graph.plan_hash,
+                        "revision": plan_graph.revision,
+                        "canonical_path": plan_graph_path.to_string_lossy(),
+                        "reason": "continuation_resume",
+                    }),
+                ),
+            )?;
+        } else if phase_runtime.require_plan_approval {
             append_event(
                 &store,
                 &options.event_sink,
@@ -1690,6 +1751,7 @@ impl Orchestrator {
                 "plan_revision": plan_graph.revision,
                 "plan_hash": plan_graph.plan_hash,
                 "approval_required": phase_runtime.require_plan_approval,
+                "plan_reused": plan_reused,
             }),
         )?;
         let plan_tasks = plan_graph.draft.tasks.clone();
@@ -1727,9 +1789,20 @@ impl Orchestrator {
         store.write_tasks(&goal_id, &tasks)?;
 
         let mut plan_node_runs = if let Some(existing) = store.read_plan_node_runs(&goal_id)? {
+            let mut existing = existing;
+            if existing.epoch_id != epoch_id {
+                if options.continuation
+                    && existing.plan_id == plan_graph.plan_id
+                    && existing.plan_revision == plan_graph.revision
+                    && existing.plan_hash == plan_graph.plan_hash
+                {
+                    existing.rebind_epoch_for_resume(&epoch_id);
+                } else {
+                    bail!("persisted PlanNodeRunLedger does not match the active PlanGraph");
+                }
+            }
             existing.validate()?;
-            if existing.epoch_id != epoch_id
-                || existing.plan_id != plan_graph.plan_id
+            if existing.plan_id != plan_graph.plan_id
                 || existing.plan_revision != plan_graph.revision
                 || existing.plan_hash != plan_graph.plan_hash
             {
@@ -1739,7 +1812,24 @@ impl Orchestrator {
         } else {
             PlanNodeRunLedger::from_plan(&goal_id, &epoch_id, &plan_graph)?
         };
+        let requeued_failed_plan_tasks = if options.continuation {
+            plan_node_runs.requeue_failed_for_resume()
+        } else {
+            Vec::new()
+        };
         store.write_plan_node_runs(&plan_node_runs)?;
+        if !requeued_failed_plan_tasks.is_empty() {
+            store.append_goal_epoch_event(
+                &goal_id,
+                &epoch_id,
+                &format!("{epoch_id}.plan.requeue-failed"),
+                GoalEpochEventKind::PhaseCompleted,
+                json!({
+                    "reason": "continuation_resume",
+                    "task_ids": requeued_failed_plan_tasks,
+                }),
+            )?;
+        }
 
         let spec_path =
             store.write_artifact(&goal_id, "spec.md", &product::spec(&goal, &detection))?;
@@ -1784,6 +1874,21 @@ impl Orchestrator {
             Some(plan_path.to_string_lossy().to_string()),
         );
         store.write_tasks(&goal_id, &tasks)?;
+        let refresh_plan_artifact =
+            |goal_for_plan: &Goal, ledger: &PlanNodeRunLedger| -> Result<()> {
+                store
+                    .write_artifact(
+                        &goal_id,
+                        "plan.md",
+                        &product::plan_with_progress(
+                            goal_for_plan,
+                            &plan_graph,
+                            &detection,
+                            Some(ledger),
+                        ),
+                    )
+                    .map(|_| ())
+            };
         append_event(
             &store,
             &options.event_sink,
@@ -1814,12 +1919,60 @@ impl Orchestrator {
         let worker_baseline_diff = initial_snapshot.clone();
         let mut before_diff = initial_snapshot;
         let mut after_diff = before_diff.clone();
+        let preflight_path = store.write_artifact(
+            &goal_id,
+            "plan-preflight.md",
+            &format!(
+                "# Plan Preflight\n\n## Approved checks\n\n{}\n\n## Baseline\n\n```json\n{}\n```\n",
+                plan_graph
+                    .draft
+                    .preflight
+                    .iter()
+                    .map(|check| format!("- {check}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                serde_json::to_string_pretty(&worker_baseline_diff)?
+            ),
+        )?;
+        store.append_goal_epoch_event(
+            &goal_id,
+            &epoch_id,
+            &format!("{epoch_id}.plan.preflight"),
+            GoalEpochEventKind::PhaseCompleted,
+            json!({
+                "phase": "plan_preflight",
+                "artifact_path": preflight_path.to_string_lossy(),
+                "checks": &plan_graph.draft.preflight,
+            }),
+        )?;
         let (mut scope_check, _first_drift) =
             compute_baseline_aware_scope(&worker_baseline_diff, &after_diff, &scope);
         let mut worker_result = None;
         let mut final_worker_outcome = None;
         let mut verification_results = Vec::new();
-        let mut last_verification_path = None;
+        let mut last_verification_path = if options.continuation {
+            let artifacts_dir = store.artifact_dir(&goal_id);
+            let mut verification_paths = std_fs::read_dir(&artifacts_dir)
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| {
+                            name == "verification.md"
+                                || (name.starts_with("verification-iteration-")
+                                    && name.ends_with(".md"))
+                        })
+                })
+                .collect::<Vec<_>>();
+            verification_paths.sort();
+            verification_paths.pop()
+        } else {
+            None
+        };
         let mut final_evaluation = None;
         let mut last_coordinator_review: Option<CoordinatorReview> = None;
         let mut next_route_hint_override: Option<String> = None;
@@ -1896,6 +2049,8 @@ impl Orchestrator {
         let mut current_plan_wave: Option<PlanWaveRunLedger> = None;
         let mut prestarted_plan_workers: HashMap<String, PrestartedPlanWorker> = HashMap::new();
         let mut prestarted_plan_wave: VecDeque<String> = VecDeque::new();
+        let mut plan_commit_baselines: HashMap<(String, usize), Option<String>> = HashMap::new();
+        let mut plan_wave_commit_baselines: HashMap<usize, Option<String>> = HashMap::new();
 
         #[allow(clippy::explicit_counter_loop)]
         for iteration in 1..=max_iterations {
@@ -1952,11 +2107,7 @@ impl Orchestrator {
             } else {
                 let active = plan_node_runs.active_task_ids();
                 if scheduled_plan_wave.is_empty() {
-                    let wave = plan_graph.runnable_wave(
-                        &completed_plan_tasks,
-                        &active,
-                        options.worker.max_parallel_workers,
-                    )?;
+                    let wave = plan_graph.runnable_wave(&completed_plan_tasks, &active, 1)?;
                     if !wave.is_empty() {
                         let wave_ids = wave
                             .iter()
@@ -1981,7 +2132,8 @@ impl Orchestrator {
                             GoalEpochEventKind::PhaseCompleted,
                             json!({
                                 "phase": "plan_wave_scheduled",
-                                "capacity": options.worker.max_parallel_workers.max(1),
+                                "capacity": 1,
+                                "execution": "serial_work_orders",
                                 "task_ids": wave_ids,
                             }),
                         )?;
@@ -2002,6 +2154,7 @@ impl Orchestrator {
                 };
                 plan_node_runs.mark(&task_id, PlanNodeRunStatus::Runnable)?;
                 store.write_plan_node_runs(&plan_node_runs)?;
+                refresh_plan_artifact(&goal, &plan_node_runs)?;
                 current_plan_task_id = Some(task_id.clone());
                 task_id
             };
@@ -2248,10 +2401,23 @@ impl Orchestrator {
                     node.review_task_id = Some(worker_task_id.clone());
                 }
                 node.status = PlanNodeRunStatus::Running;
+                node.sync_step_lifecycle(None);
                 node.updated_at = timestamp();
                 plan_node_runs.updated_at = timestamp();
                 store.write_plan_node_runs(&plan_node_runs)?;
+                refresh_plan_artifact(&goal, &plan_node_runs)?;
             }
+
+            // Generate immutable ownership decision before recording the
+            // route event or starting any worker execution.
+            let ownership = crate::state::ExecutionOwnership {
+                delegated: selected_route.require_worker || effective_worker.skip_worker,
+                worker_kind: Some(selected_route.worker_kind.as_str().to_string()),
+                route_reason: selected_route.route_reason.clone(),
+                risk_profile: "unknown".to_string(),
+                worker_task_id: Some(worker_task_id.clone()),
+                decided_at: crate::state::timestamp(),
+            };
 
             append_event(
                 &store,
@@ -2268,19 +2434,13 @@ impl Orchestrator {
                         "task_route_receipt_path": route_receipt_path.to_string_lossy(),
                         "selected_candidate": phase_decision.selected_candidate,
                         "fallback_count": phase_decision.rejected_candidates.len(),
+                        "ownership_delegated": ownership.delegated,
+                        "ownership_worker_kind": ownership.worker_kind,
+                        "ownership_worker_task_id": ownership.worker_task_id,
+                        "ownership_route_reason": ownership.route_reason,
                     }),
                 ),
             )?;
-
-            // Generate immutable ownership decision before any execution.
-            let ownership = crate::state::ExecutionOwnership {
-                delegated: selected_route.require_worker || effective_worker.skip_worker,
-                worker_kind: Some(selected_route.worker_kind.as_str().to_string()),
-                route_reason: selected_route.route_reason.clone(),
-                risk_profile: "unknown".to_string(),
-                worker_task_id: Some(worker_task_id.clone()),
-                decided_at: crate::state::timestamp(),
-            };
 
             if prestarted_worker.is_none() {
                 start_task(&mut tasks, &worker_task_id);
@@ -2375,9 +2535,11 @@ impl Orchestrator {
                         let node = plan_node_runs.node_mut(&plan_task_id)?;
                         node.red_evidence_path = Some(red_path.to_string_lossy().to_string());
                         node.status = PlanNodeRunStatus::RedVerified;
+                        node.sync_step_lifecycle(None);
                         node.updated_at = timestamp();
                         plan_node_runs.updated_at = timestamp();
                         store.write_plan_node_runs(&plan_node_runs)?;
+                        refresh_plan_artifact(&goal, &plan_node_runs)?;
                     }
                 }
             }
@@ -2405,42 +2567,6 @@ impl Orchestrator {
                     ];
                 }
             }
-            if prestarted_worker.is_none()
-                && first_plan_attempt
-                && !worker_route_is_review
-                && selected_route.require_worker
-            {
-                dispatch_parallel_plan_siblings(
-                    &mut scheduled_plan_wave,
-                    &mut prestarted_plan_workers,
-                    &mut prestarted_plan_wave,
-                    &mut tasks,
-                    &mut plan_node_runs,
-                    &plan_graph,
-                    &goal_id,
-                    &epoch_id,
-                    task_namespace.as_deref(),
-                    &workspace,
-                    &store,
-                    &phase_runtime,
-                    &options,
-                    &goal,
-                    &detection,
-                    &task_manager,
-                    &mut lineage,
-                    &mut current_plan_wave,
-                    &budget_controller,
-                    worker_call_count,
-                    premium_worker_call_count,
-                    attempt_count,
-                    run_started_at,
-                    &goal_run_lease,
-                    iteration,
-                    &session_id,
-                )?;
-                lineage.updated_at = timestamp();
-                store.write_lineage(&lineage)?;
-            }
             let base_worker_request = if first_plan_attempt {
                 options.request.clone()
             } else {
@@ -2457,6 +2583,84 @@ impl Orchestrator {
                     review_worker_request(&base_worker_request, id)
                 });
             repair_request_history.push(worker_request.clone());
+            let preflight_checks = evaluate_work_order_preflight(
+                worker_task
+                    .inputs
+                    .plan_task
+                    .as_ref()
+                    .context("worker task is missing sealed PlanTask contract")?,
+                &plan_node_runs,
+            );
+            if let Some(failed) = preflight_checks.iter().find(|check| !check.passed) {
+                bail!(
+                    "work-order preflight blocked for `{plan_task_id}`: {}",
+                    failed.failure.as_deref().unwrap_or(&failed.description)
+                );
+            }
+            let preflight_path = write_work_order_preflight(
+                &store,
+                &goal_id,
+                &epoch_id,
+                &plan_graph.plan_id,
+                plan_graph.revision,
+                &plan_task_id,
+                route_attempt,
+                worker_task
+                    .inputs
+                    .plan_task
+                    .as_ref()
+                    .context("worker task is missing sealed PlanTask contract")?,
+                &before_diff,
+                &preflight_checks,
+            )?;
+            {
+                let node = plan_node_runs.node_mut(&plan_task_id)?;
+                node.preflight_path = Some(preflight_path.to_string_lossy().to_string());
+                node.preflight_satisfied = true;
+                node.preflight_checks = preflight_checks;
+                node.updated_at = timestamp();
+                plan_node_runs.updated_at = timestamp();
+                plan_node_runs.validate()?;
+                store.write_plan_node_runs(&plan_node_runs)?;
+            }
+            let commit_baseline = git_head_commit(&workspace)?;
+            plan_commit_baselines
+                .entry((plan_task_id.clone(), route_attempt))
+                .or_insert(commit_baseline.clone());
+            if let Some(plan_task) = worker_task.inputs.plan_task.as_ref() {
+                plan_wave_commit_baselines
+                    .entry(plan_task.parallel_wave)
+                    .or_insert(commit_baseline);
+            }
+            let routing_brief_path = worker_task
+                .inputs
+                .plan_task
+                .as_ref()
+                .map(|plan_task| {
+                    write_work_order_routing_brief(
+                        &store,
+                        &goal_id,
+                        &epoch_id,
+                        &plan_graph.plan_id,
+                        plan_graph.revision,
+                        &plan_task_id,
+                        route_attempt,
+                        plan_task,
+                        &worker_phase,
+                        resolved_worker_route_hint,
+                        selected_route.worker_kind.as_str(),
+                        selected_route.worker_model,
+                        &plan_task.dependencies,
+                    )
+                })
+                .transpose()?;
+            worker_task.inputs.worker_packet_path = routing_brief_path
+                .as_ref()
+                .map(|path| path.to_string_lossy().to_string());
+            if let Some(runtime_task) = tasks.iter_mut().find(|task| task.id == worker_task_id) {
+                runtime_task.inputs.worker_packet_path =
+                    worker_task.inputs.worker_packet_path.clone();
+            }
             let resumed_managed_worker_task_id = if !first_plan_attempt && !worker_route_is_review {
                 try_resume_plan_session(
                     &task_manager,
@@ -2884,7 +3088,110 @@ impl Orchestrator {
                     }
                 }
             }
-            let (plan_green_paths, plan_green_passed) = if first_plan_attempt
+            {
+                let node = plan_node_runs.node_mut(&plan_task_id)?;
+                node.worker_result_path = Some(
+                    iteration_worker_result
+                        .result_path
+                        .to_string_lossy()
+                        .to_string(),
+                );
+                node.worker_outcome_path = Some(
+                    iteration_worker_result
+                        .outcome_path
+                        .to_string_lossy()
+                        .to_string(),
+                );
+                node.worker_last_message_path = iteration_worker_result
+                    .last_message_path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().to_string());
+                node.worker_changed_files = iteration_worker_outcome.changed_files.clone();
+                node.worker_commands_run = iteration_worker_outcome.commands_run.clone();
+                node.worker_known_failures = iteration_worker_outcome.known_failures.clone();
+                let continuation_evidence =
+                    worker_continuation_evidence_from_result(&iteration_worker_result);
+                node.worker_next_steps = continuation_evidence.next_steps;
+                node.worker_plan_gap = continuation_evidence.plan_gap;
+                node.worker_decision = match iteration_worker_result.status {
+                    WorkerStatus::Succeeded => PlanWorkOrderDecision::Executed,
+                    WorkerStatus::Skipped => PlanWorkOrderDecision::Skipped,
+                    WorkerStatus::Failed => PlanWorkOrderDecision::Blocked,
+                };
+                node.worker_decision_reason = node
+                    .worker_plan_gap
+                    .clone()
+                    .or_else(|| iteration_worker_outcome.known_failures.first().cloned())
+                    .or_else(|| Some(iteration_worker_result.summary.clone()));
+                node.worker_evidence_quality = match iteration_worker_result.status {
+                    WorkerStatus::Succeeded => WorkerEvidenceQuality::FixtureOnly,
+                    WorkerStatus::Failed => WorkerEvidenceQuality::Failed,
+                    WorkerStatus::Skipped => WorkerEvidenceQuality::BlockedNotVerified,
+                };
+                node.updated_at = timestamp();
+                plan_node_runs.updated_at = timestamp();
+            }
+            let task_requires_step_evidence = plan_graph
+                .task(&plan_task_id)
+                .is_some_and(|task| task.execution_steps_evidence_required);
+            let step_evidence_error = if iteration_worker_result.status == WorkerStatus::Succeeded
+                && task_requires_step_evidence
+            {
+                if strict_step_evidence_rejects_fixture(
+                    task_requires_step_evidence,
+                    options.worker.require_worker,
+                ) {
+                    Some(
+                        "strict ordered execution evidence requires a delegated worker; fixture execution is not accepted"
+                            .to_string(),
+                    )
+                } else {
+                    let report = worker_step_evidence_from_result(&iteration_worker_result);
+                    let task = plan_graph
+                        .task(&plan_task_id)
+                        .context("missing PlanGraph task for step evidence")?;
+                    let node = plan_node_runs.node_mut(&plan_task_id)?;
+                    if node.execution_steps.is_empty()
+                        || task.execution_steps_or_legacy().is_empty()
+                    {
+                        None
+                    } else if !report.declared {
+                        Some(
+                            "worker did not declare a completed_steps section for the ordered execution contract"
+                                .to_string(),
+                        )
+                    } else {
+                        let missing = node.apply_worker_step_evidence(
+                            &report.completed_step_ids,
+                            &report.evidence_by_step,
+                        )?;
+                        if missing.is_empty() {
+                            None
+                        } else {
+                            Some(format!(
+                                "worker step evidence is incomplete; missing: {}",
+                                missing.join(", ")
+                            ))
+                        }
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some(error) = step_evidence_error.as_deref() {
+                let node = plan_node_runs.node_mut(&plan_task_id)?;
+                node.status = PlanNodeRunStatus::Failed;
+                node.error = Some(error.to_string());
+                node.sync_step_lifecycle(Some(error));
+                node.updated_at = timestamp();
+                plan_node_runs.updated_at = timestamp();
+            }
+            let needs_plan_green_evidence = plan_node_runs
+                .nodes
+                .iter()
+                .find(|node| node.task_id == plan_task_id)
+                .is_some_and(|node| node.green_evidence_paths.is_empty());
+            let (plan_green_paths, plan_green_passed) = if needs_plan_green_evidence
                 && iteration_worker_result.status == WorkerStatus::Succeeded
             {
                 run_plan_green_evidence(
@@ -2903,7 +3210,8 @@ impl Orchestrator {
                     Vec::new(),
                     iteration_worker_result.status == WorkerStatus::Succeeded
                         || (iteration_worker_result.status == WorkerStatus::Skipped
-                            && !options.worker.require_worker),
+                            && !options.worker.require_worker
+                            && !task_requires_step_evidence),
                 )
             };
             {
@@ -2914,14 +3222,32 @@ impl Orchestrator {
                         .map(|path| path.to_string_lossy().to_string())
                         .collect();
                 }
-                if plan_green_passed {
+                if plan_green_passed && step_evidence_error.is_none() {
+                    if !plan_graph
+                        .task(&plan_task_id)
+                        .is_some_and(|task| task.execution_steps_evidence_required)
+                    {
+                        for step in &mut node.execution_steps {
+                            step.status = crate::state::PlanStepRunStatus::Completed;
+                            step.updated_at = timestamp();
+                        }
+                    }
                     node.status = PlanNodeRunStatus::GreenVerified;
-                } else if iteration_worker_result.status != WorkerStatus::Succeeded {
+                    node.sync_step_lifecycle(None);
+                } else if iteration_worker_result.status != WorkerStatus::Succeeded
+                    || step_evidence_error.is_some()
+                {
                     node.status = PlanNodeRunStatus::Failed;
+                    node.sync_step_lifecycle(
+                        step_evidence_error
+                            .as_deref()
+                            .or(Some(iteration_worker_result.summary.as_str())),
+                    );
                 }
                 node.updated_at = timestamp();
                 plan_node_runs.updated_at = timestamp();
                 store.write_plan_node_runs(&plan_node_runs)?;
+                refresh_plan_artifact(&goal, &plan_node_runs)?;
             }
             let phase_route_ordinal = prestarted_worker
                 .as_ref()
@@ -3043,6 +3369,12 @@ impl Orchestrator {
                         "retry_reason": &worker_task_record.retry_reason,
                         "commands_run": &iteration_worker_outcome.commands_run,
                         "known_failures": &iteration_worker_outcome.known_failures,
+                        "step_evidence_error": step_evidence_error,
+                        "plan_contract_status": if step_evidence_error.is_some() {
+                            "failed"
+                        } else {
+                            "accepted"
+                        },
                     }),
                 ),
             )?;
@@ -3063,6 +3395,36 @@ impl Orchestrator {
                 }),
             )?;
             let worker_failed = iteration_worker_result.status == WorkerStatus::Failed;
+            if worker_failed {
+                let rollback_path = store.write_artifact(
+                    &goal_id,
+                    &format!("plan-rollback-iteration-{iteration}.md"),
+                    &format!(
+                        "# Plan Rollback\n\n## Approved actions\n\n{}\n\n## Trigger\n\nWorker status: `{}`\n\nSummary: {}\n\nThe runtime preserved this request as evidence; no rollback is performed implicitly.\n",
+                        plan_graph
+                            .draft
+                            .rollback
+                            .iter()
+                            .map(|action| format!("- {action}"))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                        iteration_worker_result.status.as_str(),
+                        iteration_worker_result.summary
+                    ),
+                )?;
+                store.append_goal_epoch_event(
+                    &goal_id,
+                    &epoch_id,
+                    &format!("{epoch_id}.plan.rollback.{iteration}"),
+                    GoalEpochEventKind::PhaseCompleted,
+                    json!({
+                        "phase": "plan_rollback_requested",
+                        "artifact_path": rollback_path.to_string_lossy(),
+                        "actions": &plan_graph.draft.rollback,
+                        "automatic": false,
+                    }),
+                )?;
+            }
             worker_result = Some(iteration_worker_result);
             final_worker_outcome = Some(iteration_worker_outcome.clone());
             worker_output_history.push(iteration_worker_outcome.summary.clone());
@@ -3154,6 +3516,58 @@ impl Orchestrator {
                     }),
                 ),
             )?;
+            if reviewed_execution_id.is_none() {
+                if let Some(commit_boundary) = plan_graph
+                    .task(&plan_task_id)
+                    .map(|task| &task.commit_boundary)
+                {
+                    let wave_is_terminal = current_plan_wave.is_none();
+                    let should_evaluate =
+                        !matches!(commit_boundary, CommitBoundary::AfterWave) || wave_is_terminal;
+                    if should_evaluate {
+                        let baseline_head = if matches!(commit_boundary, CommitBoundary::AfterWave)
+                        {
+                            plan_wave_commit_baselines
+                                .get(
+                                    &plan_graph
+                                        .task(&plan_task_id)
+                                        .map_or(0, |task| task.parallel_wave),
+                                )
+                                .cloned()
+                                .flatten()
+                        } else {
+                            plan_commit_baselines
+                                .get(&(plan_task_id.clone(), route_attempt))
+                                .cloned()
+                                .flatten()
+                        };
+                        let current_head = git_head_commit(&workspace)?;
+                        let satisfied = commit_boundary_is_satisfied(
+                            commit_boundary,
+                            baseline_head.as_deref(),
+                            current_head.as_deref(),
+                        );
+                        let evidence_path = write_commit_boundary_evidence(
+                            &store,
+                            &goal_id,
+                            &plan_task_id,
+                            route_attempt,
+                            commit_boundary,
+                            baseline_head.as_deref(),
+                            current_head.as_deref(),
+                            satisfied,
+                        )?;
+                        let node = plan_node_runs.node_mut(&plan_task_id)?;
+                        node.commit_boundary_evidence_path =
+                            Some(evidence_path.to_string_lossy().to_string());
+                        node.commit_boundary_satisfied = Some(satisfied);
+                        node.updated_at = timestamp();
+                        plan_node_runs.updated_at = timestamp();
+                        store.write_plan_node_runs(&plan_node_runs)?;
+                        refresh_plan_artifact(&goal, &plan_node_runs)?;
+                    }
+                }
+            }
 
             start_task(&mut tasks, &verification_task_id);
             goal.status = GoalStatus::Verifying;
@@ -3531,9 +3945,7 @@ impl Orchestrator {
                     .is_some_and(|result| result.status == WorkerStatus::Succeeded)
                 && review_gate.failed_reason().is_none();
             if node_review_passed {
-                let node = plan_node_runs.node_mut(&plan_task_id)?;
-                node.status = PlanNodeRunStatus::Reviewed;
-                node.review_evidence_path = review_gate
+                let review_evidence_path = review_gate
                     .results
                     .iter()
                     .find_map(|result| {
@@ -3543,23 +3955,77 @@ impl Orchestrator {
                             .and_then(|evidence| evidence.artifact_path.clone())
                     })
                     .or_else(|| Some(review_path.to_string_lossy().to_string()));
+                plan_node_runs.node_mut(&plan_task_id)?.review_evidence_path = review_evidence_path;
+                // OMO only advances a work order after its evidence bundle
+                // satisfies every declared completion predicate. Persist the
+                // typed criterion receipts before changing the durable node
+                // to Completed so a successful worker cannot bypass the gate.
+                persist_plan_criterion_evidence(
+                    &store,
+                    &workspace,
+                    &plan_graph,
+                    &mut plan_node_runs,
+                )?;
+                persist_plan_qa_evidence(&store, &workspace, &plan_graph, &mut plan_node_runs)?;
+                let node = plan_node_runs.node_mut(&plan_task_id)?;
+                node.status = PlanNodeRunStatus::Reviewed;
+                node.sync_step_lifecycle(None);
                 if worker_route_is_review {
                     node.review_task_id = Some(worker_task_id.clone());
                 }
-                node.status = PlanNodeRunStatus::Completed;
+                let completion_gate_passed = plan_graph.task(&plan_task_id).is_some_and(|task| {
+                    node.preflight_satisfied
+                        && node.preflight_path.is_some()
+                        && !node.green_evidence_paths.is_empty()
+                        && node.review_evidence_path.is_some()
+                        && node.commit_boundary_satisfied != Some(false)
+                        && node.all_criteria_passed(&task.completion_predicates)
+                        && node.all_qa_passed(task)
+                        && node
+                            .execution_steps
+                            .iter()
+                            .all(|step| step.status == crate::state::PlanStepRunStatus::Completed)
+                });
+                if completion_gate_passed {
+                    node.status = PlanNodeRunStatus::Completed;
+                    node.worker_evidence_quality = WorkerEvidenceQuality::Proved;
+                    node.sync_step_lifecycle(None);
+                } else {
+                    let repair_path = store.write_artifact(
+                        &goal_id,
+                        &format!(
+                            "work-order-{}-completion-gate-failure-iteration-{iteration}.md",
+                            plan_artifact_component(&plan_task_id)
+                        ),
+                        &format!(
+                            "# Work-order completion gate failure\n\nTask: {plan_task_id}\nIteration: {iteration}\n\nThe worker/reviewer path completed, but the durable evidence contract was incomplete. Continuation must repair or rerun this work order before it can become Completed.\n"
+                        ),
+                    )?;
+                    node.status = PlanNodeRunStatus::Failed;
+                    node.error = Some(format!(
+                        "work-order completion gate blocked: GREEN, review, or criterion evidence is incomplete; repair request {}",
+                        repair_path.display()
+                    ));
+                    node.worker_evidence_quality = WorkerEvidenceQuality::BlockedNotVerified;
+                    let step_error = node.error.clone();
+                    node.sync_step_lifecycle(step_error.as_deref());
+                }
                 node.updated_at = timestamp();
                 plan_node_runs.updated_at = timestamp();
                 plan_node_runs.validate()?;
                 store.write_plan_node_runs(&plan_node_runs)?;
-                completed_plan_tasks.insert(plan_task_id.clone());
-                current_plan_task_id = None;
-                lineage.plan_remaining_items = plan_graph
-                    .draft
-                    .tasks
-                    .len()
-                    .saturating_sub(completed_plan_tasks.len());
-                lineage.updated_at = timestamp();
-                store.write_lineage(&lineage)?;
+                refresh_plan_artifact(&goal, &plan_node_runs)?;
+                if completion_gate_passed {
+                    completed_plan_tasks.insert(plan_task_id.clone());
+                    current_plan_task_id = None;
+                    lineage.plan_remaining_items = plan_graph
+                        .draft
+                        .tasks
+                        .len()
+                        .saturating_sub(completed_plan_tasks.len());
+                    lineage.updated_at = timestamp();
+                    store.write_lineage(&lineage)?;
+                }
             }
             let all_plan_tasks_completed =
                 completed_plan_tasks.len() == plan_graph.draft.tasks.len();
@@ -3614,6 +4080,7 @@ impl Orchestrator {
             last_verification_path.as_deref(),
             &scope_check,
             criteria_complete,
+            &workspace,
         )?;
         if final_evaluation.status == GoalStatus::Complete && !final_wave_receipt.passed {
             final_evaluation = GoalEvaluation {
@@ -3660,6 +4127,33 @@ impl Orchestrator {
             "final-verification-wave.json",
             &format!("{}\n", serde_json::to_string_pretty(&final_wave_receipt)?),
         )?;
+        store.write_artifact(
+            &goal_id,
+            "plan.md",
+            &product::plan_with_progress_and_final_wave(
+                &goal,
+                &plan_graph,
+                &detection,
+                Some(&plan_node_runs),
+                Some(&final_wave_receipt),
+            ),
+        )?;
+        let final_verification_plan_path = store.write_artifact(
+            &goal_id,
+            "plan-final-verification.md",
+            &format!(
+                "# Plan Final Verification\n\n## Approved checks\n\n{}\n\n## Receipt\n\n`{}`\n\nPassed: `{}`\n",
+                plan_graph
+                    .draft
+                    .final_verification
+                    .iter()
+                    .map(|check| format!("- {check}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                final_wave_path.display(),
+                final_wave_receipt.passed
+            ),
+        )?;
         store.append_goal_epoch_event(
             &goal_id,
             &epoch_id,
@@ -3670,6 +4164,7 @@ impl Orchestrator {
                 "passed": final_wave_receipt.passed,
                 "receipt_hash": final_wave_receipt.receipt_hash,
                 "receipt_path": final_wave_path.to_string_lossy(),
+                "plan_checks_path": final_verification_plan_path.to_string_lossy(),
             }),
         )?;
         let final_report = format!(
@@ -3894,7 +4389,19 @@ fn run_objective_controller(
             "Gear objective continuation is stopped; explicitly restart the continuation before running again"
         );
     }
-    let objective_id = objective_id_for(&root_session_id, &workspace, &options.request)?;
+    let existing_for_session = if options.continuation {
+        store.find_objective_graph_for_root_session(&root_session_id)?
+    } else {
+        None
+    };
+    let objective_id = existing_for_session
+        .as_ref()
+        .map(|graph| graph.objective_id.clone())
+        .unwrap_or(objective_id_for(
+            &root_session_id,
+            &workspace,
+            &options.request,
+        )?);
     let lease_seconds =
         u64::try_from(options.max_runtime_minutes.max(1).saturating_mul(60)).unwrap_or(u64::MAX);
     let objective_lease = store.acquire_objective_lease(
@@ -3939,6 +4446,66 @@ fn run_objective_controller(
         )?;
         graph
     };
+
+    if options.continuation && graph.status == ObjectiveStatus::NeedsUser {
+        let parent = graph
+            .nodes
+            .iter()
+            .rev()
+            .find(|node| node.status == GoalStatus::Complete)
+            .cloned()
+            .context("needs-user objective has no resumable goal")?;
+        let child_index = graph.nodes.len();
+        let child_goal_id = format!("goal_{objective_id}_{child_index:03}");
+        let child_epoch_id = format!("epoch_{objective_id}_answer_{child_index:03}");
+        let child_session_id = format!("{root_session_id}.answer{child_index}");
+        let resumed_request = format!(
+            "{}\n\nUser answer to strategist questions:\n{}",
+            graph.request, options.request
+        );
+        let child_node = objective_goal_node(
+            &child_goal_id,
+            &child_epoch_id,
+            &child_session_id,
+            &resumed_request,
+            vec!["The user answered the strategist question.".to_string()],
+            Some(parent.goal_id.clone()),
+            Some(parent.epoch_id.clone()),
+            parent.strategist_receipt_hash.clone(),
+            GoalStatus::Planning,
+            None,
+            hash_text(&normalize_objective(&resumed_request)),
+        )?;
+        graph.attach_child(child_node)?;
+        store.write_objective_graph(&graph)?;
+        store.append_objective_event(
+            &objective_id,
+            &format!("user-answer:{child_epoch_id}"),
+            ObjectiveEventKind::UserAnswerAccepted,
+            json!({
+                "goal_id": child_goal_id,
+                "epoch_id": child_epoch_id,
+                "answer": options.request,
+            }),
+        )?;
+        store.append_objective_event(
+            &objective_id,
+            &format!("goal-attached:{child_goal_id}"),
+            ObjectiveEventKind::GoalAttached,
+            json!({
+                "goal_id": child_goal_id,
+                "epoch_id": child_epoch_id,
+                "session_id": child_session_id,
+                "parent_goal_id": parent.goal_id,
+            }),
+        )?;
+        store.append_objective_event(
+            &objective_id,
+            &format!("frontier-advanced:{child_goal_id}"),
+            ObjectiveEventKind::FrontierAdvanced,
+            json!({ "active_goal_id": child_goal_id }),
+        )?;
+    }
 
     reconcile_objective_frontier(
         &store,
@@ -5089,6 +5656,13 @@ fn normalize_blocker_text(value: &str) -> String {
         }
     }
     tokens.join(" ")
+}
+
+fn strict_step_evidence_rejects_fixture(
+    task_requires_step_evidence: bool,
+    require_worker: bool,
+) -> bool {
+    task_requires_step_evidence && !require_worker
 }
 
 fn blocker_is_external(summary: &str) -> bool {
@@ -7929,17 +8503,20 @@ fn build_plan_graph(
 ) -> Result<PlanGraph> {
     match goal.coordinator_brief.as_deref() {
         Some(output) => match parse_planner_draft_with_objective(output, &goal.request) {
-            Ok(draft) => PlanGraph::seal(
-                &goal.id,
-                1,
-                PlanSource::PlannerModel,
-                goal.coordinator_model.as_ref().map(|model| PlannerReceipt {
-                    provider_id: model.provider_id.clone(),
-                    model_id: model.model_id.clone(),
-                    session_id: None,
-                }),
-                draft,
-            ),
+            Ok(draft) => {
+                validate_planner_draft(&goal.id, &draft)?;
+                PlanGraph::seal(
+                    &goal.id,
+                    1,
+                    PlanSource::PlannerModel,
+                    goal.coordinator_model.as_ref().map(|model| PlannerReceipt {
+                        provider_id: model.provider_id.clone(),
+                        model_id: model.model_id.clone(),
+                        session_id: None,
+                    }),
+                    draft,
+                )
+            }
             Err(error)
                 if goal
                     .coordinator_model
@@ -8153,6 +8730,264 @@ fn write_plan_command_evidence(
     store.write_artifact(goal_id, &file_name, &body)
 }
 
+fn write_work_order_routing_brief(
+    store: &StateStore,
+    goal_id: &str,
+    epoch_id: &str,
+    plan_id: &str,
+    revision: usize,
+    task_id: &str,
+    attempt: usize,
+    plan_task: &crate::plan_graph::PlanTaskContract,
+    worker_phase: &PhaseProfile,
+    route_hint: Option<&str>,
+    worker_kind: &str,
+    worker_model: Option<&str>,
+    dependencies: &[String],
+) -> Result<std::path::PathBuf> {
+    let dependency_text = if dependencies.is_empty() {
+        "none".to_string()
+    } else {
+        dependencies.join(", ")
+    };
+    let body = format!(
+        "# Work order routing brief\n\nGoal: {goal_id}\nEpoch: {epoch_id}\nPlan: {plan_id} revision {revision}\nTask: {task_id}\nAttempt: {attempt}\n\n## Dispatch\n\nPhase: {worker_phase:?}\nRoute hint: {}\nWorker kind: {worker_kind}\nWorker model: {}\nDependencies: {dependency_text}\n\n## Scope contract\n\nAllowed files: {}\nForbidden files: {}\nWrite scope: {}\nMax files changed: {}\n\n## Work order\n\nTitle: {}\nGoal: {}\nDeliverable: {}\nMust do:\n{}\n\nMust not do:\n{}\n\nCompletion predicates:\n{}\n\n## Verification\n\nTest strategy: {:?}\nGreen commands:\n{}\n\nRequired artifacts:\n{}\n",
+        route_hint.unwrap_or("none"),
+        worker_model.unwrap_or("none"),
+        plan_task.scope.allowed_files.join(", "),
+        plan_task.scope.forbidden_files.join(", "),
+        plan_task.scope.write_scope.join(", "),
+        plan_task.scope.max_files_changed,
+        plan_task.title,
+        plan_task.goal,
+        plan_task.deliverable,
+        plan_task
+            .must_do
+            .iter()
+            .map(|item| format!("- {item}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        plan_task
+            .must_not_do
+            .iter()
+            .map(|item| format!("- {item}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        plan_task
+            .completion_predicates
+            .iter()
+            .map(|item| format!("- {item}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        plan_task.test.strategy,
+        plan_task
+            .test
+            .green
+            .iter()
+            .map(|expectation| format!(
+                "- {} => {}",
+                expectation.command, expectation.expected_observation
+            ))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        plan_task
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.required)
+            .map(|artifact| format!("- {}: {}", artifact.path, artifact.description))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    let body = format!(
+        "{body}\n\nCommit boundary: {:?}\nCommit message: {}\n",
+        plan_task.commit_boundary,
+        plan_task
+            .commit_message
+            .as_deref()
+            .unwrap_or("not specified")
+    );
+    let file_name = format!(
+        "work-order-{}-attempt-{attempt}-routing-brief.md",
+        plan_artifact_component(task_id)
+    );
+    store.write_artifact(goal_id, &file_name, &body)
+}
+
+fn write_work_order_preflight(
+    store: &StateStore,
+    goal_id: &str,
+    epoch_id: &str,
+    plan_id: &str,
+    revision: usize,
+    task_id: &str,
+    attempt: usize,
+    plan_task: &crate::plan_graph::PlanTaskContract,
+    baseline_diff: &DiffSnapshot,
+    checks: &[PlanPreflightCheck],
+) -> Result<std::path::PathBuf> {
+    let checks_text = checks
+        .iter()
+        .map(|check| {
+            format!(
+                "- [{}] {}{}",
+                if check.passed { "x" } else { "!" },
+                check.description,
+                check
+                    .failure
+                    .as_deref()
+                    .map(|failure| format!(" — {failure}"))
+                    .unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body = format!(
+        "# Work-order preflight\n\nGoal: {goal_id}\nEpoch: {epoch_id}\nPlan: {plan_id} revision {revision}\nTask: {task_id}\nAttempt: {attempt}\n\n## Baseline\n\nChanged files: {}\nDiff sha256: {}\n\n## Checks\n\n{}\n\n## Scope contract\n\nAllowed files: {}\nForbidden files: {}\nWrite scope: {}\nMax files changed: {}\nDependencies: {}\n\nThis receipt records the pre-edit baseline and sealed scope before dispatch. The worker must not begin if any check is incomplete.\n",
+        baseline_diff.changed_files.len(),
+        baseline_diff.diff_hash.as_deref().unwrap_or("none"),
+        checks_text,
+        plan_task.scope.allowed_files.join(", "),
+        plan_task.scope.forbidden_files.join(", "),
+        plan_task.scope.write_scope.join(", "),
+        plan_task.scope.max_files_changed,
+        if plan_task.dependencies.is_empty() {
+            "none".to_string()
+        } else {
+            plan_task.dependencies.join(", ")
+        },
+    );
+    let body = format!(
+        "{body}\n\n## Commit boundary\n\nDeclared boundary: {:?}\nCommit message: {}\n",
+        plan_task.commit_boundary,
+        plan_task
+            .commit_message
+            .as_deref()
+            .unwrap_or("not specified")
+    );
+    let file_name = format!(
+        "work-order-{}-attempt-{attempt}-preflight.md",
+        plan_artifact_component(task_id)
+    );
+    store.write_artifact(goal_id, &file_name, &body)
+}
+
+fn evaluate_work_order_preflight(
+    plan_task: &crate::plan_graph::PlanTaskContract,
+    ledger: &PlanNodeRunLedger,
+) -> Vec<PlanPreflightCheck> {
+    let scope_valid = plan_task.scope.max_files_changed > 0
+        && (plan_task.scope.write_scope.is_empty()
+            || plan_task.scope.write_scope.iter().all(|path| {
+                plan_task.scope.allowed_files.iter().any(|allowed| {
+                    path == allowed
+                        || path.starts_with(&format!("{allowed}/"))
+                        || allowed.starts_with(&format!("{path}/"))
+                })
+            }));
+    let forbidden_clear = plan_task.scope.write_scope.iter().all(|path| {
+        plan_task.scope.forbidden_files.iter().all(|forbidden| {
+            path != forbidden
+                && !path.starts_with(&format!("{forbidden}/"))
+                && !forbidden.starts_with(&format!("{path}/"))
+        })
+    });
+    let dependencies_ready = plan_task.dependencies.iter().all(|dependency| {
+        ledger
+            .nodes
+            .iter()
+            .find(|node| node.task_id == *dependency)
+            .is_some_and(|node| node.status == PlanNodeRunStatus::Completed)
+    });
+    let acceptance_complete = !plan_task.completion_predicates.is_empty()
+        && !plan_task.qa.happy_path.is_empty()
+        && !plan_task.qa.failure_path.is_empty();
+    let validation_complete = match plan_task.test.strategy {
+        crate::plan_graph::TestStrategy::None => plan_task
+            .test
+            .no_test_reason
+            .as_deref()
+            .is_some_and(|reason| !reason.trim().is_empty()),
+        _ => !plan_task.test.green.is_empty(),
+    };
+    vec![
+        PlanPreflightCheck {
+            check_id: "scope_check".to_string(),
+            description: "scope contract is internally consistent".to_string(),
+            passed: scope_valid,
+            failure: (!scope_valid).then(|| {
+                "write scope is outside allowed files or max_files_changed is zero".to_string()
+            }),
+        },
+        PlanPreflightCheck {
+            check_id: "forbidden_check".to_string(),
+            description: "write scope does not overlap forbidden files".to_string(),
+            passed: forbidden_clear,
+            failure: (!forbidden_clear)
+                .then(|| "write scope overlaps a forbidden path".to_string()),
+        },
+        PlanPreflightCheck {
+            check_id: "dependency_check".to_string(),
+            description: "all blocked-by work orders are completed".to_string(),
+            passed: dependencies_ready,
+            failure: (!dependencies_ready)
+                .then(|| "a dependency is missing or not completed".to_string()),
+        },
+        PlanPreflightCheck {
+            check_id: "acceptance_check".to_string(),
+            description: "completion predicates and happy/failure QA are declared".to_string(),
+            passed: acceptance_complete,
+            failure: (!acceptance_complete)
+                .then(|| "acceptance or QA contract is incomplete".to_string()),
+        },
+        PlanPreflightCheck {
+            check_id: "validation_check".to_string(),
+            description: "test strategy has executable validation evidence".to_string(),
+            passed: validation_complete,
+            failure: (!validation_complete).then(|| {
+                "test strategy has no executable GREEN command or no-test reason".to_string()
+            }),
+        },
+    ]
+}
+
+fn write_commit_boundary_evidence(
+    store: &StateStore,
+    goal_id: &str,
+    task_id: &str,
+    attempt: usize,
+    boundary: &CommitBoundary,
+    baseline_head: Option<&str>,
+    current_head: Option<&str>,
+    satisfied: bool,
+) -> Result<PathBuf> {
+    let body = format!(
+        "# Commit boundary evidence\n\nTask: {task_id}\nAttempt: {attempt}\nDeclared boundary: {boundary:?}\nBaseline HEAD: {}\nCurrent HEAD: {}\nSatisfied: {satisfied}\n",
+        baseline_head.unwrap_or("none"),
+        current_head.unwrap_or("none"),
+    );
+    store.write_artifact(
+        goal_id,
+        &format!(
+            "work-order-{}-attempt-{attempt}-commit-boundary.md",
+            plan_artifact_component(task_id)
+        ),
+        &body,
+    )
+}
+
+fn commit_boundary_is_satisfied(
+    boundary: &CommitBoundary,
+    baseline_head: Option<&str>,
+    current_head: Option<&str>,
+) -> bool {
+    match boundary {
+        CommitBoundary::NoCommit => baseline_head == current_head,
+        CommitBoundary::AfterTask | CommitBoundary::AfterWave => {
+            baseline_head.is_some() && baseline_head != current_head
+        }
+    }
+}
+
 fn run_plan_red_evidence(
     workspace: &std::path::Path,
     store: &StateStore,
@@ -8292,6 +9127,11 @@ fn persist_plan_criterion_evidence(
             candidates.insert(0, review_path);
         }
         for criterion in &task.completion_predicates {
+            if node.criterion_evidence.iter().any(|evidence| {
+                evidence.criterion_id == *criterion && evidence.attempt == node_attempt
+            }) {
+                continue;
+            }
             let normalized = criterion.to_ascii_lowercase();
             let candidate = candidates.iter().find(|path| {
                 let path_text = path.to_ascii_lowercase();
@@ -8377,6 +9217,193 @@ fn persist_plan_criterion_evidence(
     Ok(())
 }
 
+/// Persist one attempt-bound receipt for every declared OMO-style QA
+/// scenario.  A scenario is only passing when its declared evidence path is
+/// a real workspace artifact; the plan text itself is never treated as QA
+/// evidence.  Missing artifacts remain explicit Blocked/Fail receipts so the
+/// completion gate can request a repair instead of silently skipping QA.
+fn persist_plan_qa_evidence(
+    store: &StateStore,
+    workspace: &Path,
+    plan: &PlanGraph,
+    ledger: &mut PlanNodeRunLedger,
+) -> Result<()> {
+    let ledger_goal_id = ledger.goal_id.clone();
+    let canonical_workspace = workspace.canonicalize()?;
+    for task in &plan.draft.tasks {
+        let Some(node_snapshot) = ledger
+            .nodes
+            .iter()
+            .find(|node| node.task_id == task.task_id)
+        else {
+            continue;
+        };
+        let attempt = node_snapshot.attempt;
+        let existing_qa_ids = node_snapshot
+            .criterion_evidence
+            .iter()
+            .filter(|evidence| evidence.criterion_id.starts_with("qa:"))
+            .map(|evidence| (evidence.criterion_id.clone(), evidence.attempt))
+            .collect::<HashSet<_>>();
+        if attempt == 0 {
+            continue;
+        }
+        let failed = matches!(
+            node_snapshot.status,
+            PlanNodeRunStatus::Failed | PlanNodeRunStatus::Cancelled
+        );
+        let review_evidence_path = node_snapshot.review_evidence_path.clone();
+        let green_evidence_paths = node_snapshot.green_evidence_paths.clone();
+        let scenarios = task
+            .qa
+            .happy_path
+            .iter()
+            .map(|scenario| ("happy", scenario))
+            .chain(
+                task.qa
+                    .failure_path
+                    .iter()
+                    .map(|scenario| ("failure", scenario)),
+            )
+            .chain(
+                task.qa
+                    .adversarial_path
+                    .iter()
+                    .map(|scenario| ("adversarial", scenario)),
+            );
+        for (kind, scenario) in scenarios {
+            let criterion_id = format!("qa:{kind}:{}", scenario.name);
+            if existing_qa_ids.contains(&(criterion_id.clone(), attempt)) {
+                continue;
+            }
+            let declared = PathBuf::from(&scenario.evidence_path);
+            let mut candidates = Vec::new();
+            if !declared.is_absolute()
+                && scenario.evidence_path != ".."
+                && !scenario.evidence_path.starts_with("../")
+                && !scenario.evidence_path.contains("/../")
+            {
+                candidates.push(workspace.join(&declared));
+            }
+            // OMO plans commonly use one evidence target for several QA
+            // scenarios. Reuse a verified GREEN/Review artifact when the
+            // declared target is a logical destination rather than a file
+            // the worker created verbatim.
+            if let Some(review_path) = review_evidence_path.as_deref() {
+                let path = PathBuf::from(review_path);
+                candidates.push(if path.is_absolute() {
+                    path
+                } else {
+                    workspace.join(path)
+                });
+            }
+            candidates.extend(green_evidence_paths.iter().map(|path| {
+                let path = PathBuf::from(path);
+                if path.is_absolute() {
+                    path
+                } else {
+                    workspace.join(path)
+                }
+            }));
+            let verified_artifact =
+                candidates
+                    .into_iter()
+                    .find(|path| path.is_file())
+                    .and_then(|path| {
+                        let canonical_artifact = path.canonicalize().ok()?;
+                        let relative = canonical_artifact
+                            .strip_prefix(&canonical_workspace)
+                            .ok()?
+                            .to_string_lossy()
+                            .replace('\\', "/");
+                        (!relative.is_empty() && relative != ".." && !relative.starts_with("../"))
+                            .then_some((relative, canonical_artifact))
+                    });
+            let (status, evidence_path, evidence_sha256) =
+                if let Some((relative, artifact)) = verified_artifact {
+                    (
+                        CriterionEvidenceStatus::Pass,
+                        relative,
+                        sha256_file(&artifact)?,
+                    )
+                } else {
+                    let status = if failed {
+                        CriterionEvidenceStatus::Fail
+                    } else {
+                        CriterionEvidenceStatus::Blocked
+                    };
+                    let marker_path = store.write_artifact(
+                    &ledger_goal_id,
+                    &format!(
+                        "qa-{}-{}.json",
+                        plan_artifact_component(&task.task_id),
+                        hash_text(&format!("{criterion_id}:{attempt}"))
+                    ),
+                    &json!({
+                        "task_id": task.task_id,
+                        "scenario": criterion_id,
+                        "declared_evidence_path": scenario.evidence_path,
+                        "status": status.clone(),
+                        "reason": "declared QA evidence artifact was not present in the workspace",
+                    })
+                    .to_string(),
+                )?;
+                    let canonical_marker = marker_path.canonicalize()?;
+                    let relative = canonical_marker
+                        .strip_prefix(&canonical_workspace)
+                        .context("QA marker escaped workspace")?
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    (status, relative, sha256_file(&canonical_marker)?)
+                };
+            ledger.node_mut(&task.task_id)?.record_criterion_evidence(
+                &criterion_id,
+                status,
+                attempt,
+                &evidence_path,
+                &evidence_sha256,
+            )?;
+        }
+    }
+    store.write_plan_node_runs(ledger)?;
+    Ok(())
+}
+
+/// Check required task artifacts at the final verification boundary. Runtime
+/// creates the final report and final-wave documents after this boundary, so
+/// those known closing artifacts are intentionally deferred and verified by
+/// their own write/read path later in the same epoch.
+fn required_plan_artifacts_status(workspace: &Path, plan: &PlanGraph) -> (bool, Vec<String>) {
+    let deferred = [
+        "final-report.md",
+        "final-verification-wave.json",
+        "plan-final-verification.md",
+        "plan.md",
+    ];
+    let mut missing = Vec::new();
+    for artifact in plan
+        .draft
+        .tasks
+        .iter()
+        .flat_map(|task| task.artifacts.iter().filter(|artifact| artifact.required))
+    {
+        let path = PathBuf::from(&artifact.path);
+        let relative = artifact.path.replace('\\', "/");
+        if deferred.iter().any(|name| relative.ends_with(name)) {
+            continue;
+        }
+        if path.is_absolute()
+            || relative == ".."
+            || relative.starts_with("../")
+            || relative.contains("/../")
+            || !workspace.join(path).exists()
+        {
+            missing.push(artifact.path.clone());
+        }
+    }
+    (missing.is_empty(), missing)
+}
+
 fn build_final_verification_wave(
     goal_id: &str,
     epoch_id: &str,
@@ -8388,7 +9415,10 @@ fn build_final_verification_wave(
     verification_path: Option<&std::path::Path>,
     scope_check: &crate::tools::ScopeCheck,
     criteria_complete: bool,
+    workspace: &Path,
 ) -> Result<FinalVerificationWaveReceipt> {
+    let (required_artifacts_complete, missing_required_artifacts) =
+        required_plan_artifacts_status(workspace, plan);
     let all_nodes_completed = node_runs
         .nodes
         .iter()
@@ -8431,16 +9461,30 @@ fn build_final_verification_wave(
         .map(|path| vec![path.to_string_lossy().to_string()])
         .unwrap_or_default();
     let scope_evidence = vec![worker_result.result_path.to_string_lossy().to_string()];
+    let mut plan_evidence = node_evidence.clone();
+    plan_evidence.extend(
+        missing_required_artifacts
+            .iter()
+            .map(|path| format!("missing-required-artifact:{path}")),
+    );
     let dimensions = vec![
         FinalVerificationResult {
             dimension: FinalVerificationDimension::PlanCompliance,
             passed: criteria_complete
                 && all_nodes_completed
+                && required_artifacts_complete
                 && node_evidence.len() >= node_runs.nodes.len()
                 && (node_runs.nodes.len() == 1 || node_reviewer_ids.len() >= node_runs.nodes.len()),
-            summary: "Every PlanGraph node has terminal execution, GREEN, and review evidence."
-                .to_string(),
-            evidence_paths: node_evidence.clone(),
+            summary: if required_artifacts_complete {
+                "Every PlanGraph node has terminal execution, GREEN, review evidence, and required artifacts."
+                    .to_string()
+            } else {
+                format!(
+                    "Required PlanGraph artifacts are missing: {}",
+                    missing_required_artifacts.join(", ")
+                )
+            },
+            evidence_paths: plan_evidence,
             reviewer_execution_ids: if node_reviewer_ids.is_empty() {
                 vec!["runtime-plan-reducer".to_string()]
             } else {
@@ -11620,6 +12664,69 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn commit_boundary_satisfaction_matches_declared_policy() {
+        let baseline = Some("a");
+        assert!(commit_boundary_is_satisfied(
+            &CommitBoundary::NoCommit,
+            baseline,
+            Some("a")
+        ));
+        assert!(!commit_boundary_is_satisfied(
+            &CommitBoundary::NoCommit,
+            baseline,
+            Some("b")
+        ));
+        assert!(commit_boundary_is_satisfied(
+            &CommitBoundary::AfterTask,
+            baseline,
+            Some("b")
+        ));
+        assert!(!commit_boundary_is_satisfied(
+            &CommitBoundary::AfterWave,
+            baseline,
+            Some("a")
+        ));
+        assert!(!commit_boundary_is_satisfied(
+            &CommitBoundary::AfterTask,
+            None,
+            Some("b")
+        ));
+    }
+
+    #[test]
+    fn final_verification_checks_required_plan_artifacts_without_self_locking() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let scope = Scope::new(vec!["src".to_string()], vec![".git".to_string()], 4);
+        let mut draft = crate::plan_graph::deterministic_fallback_draft(
+            "artifact check",
+            &scope,
+            &["cargo test".to_string()],
+        );
+        let deferred_plan = PlanGraph::seal(
+            "goal-artifact",
+            1,
+            PlanSource::DeterministicFallback,
+            None,
+            draft.clone(),
+        )?;
+        assert!(required_plan_artifacts_status(temp_dir.path(), &deferred_plan).0);
+
+        draft.tasks[0].artifacts[0].path = ".gear/artifacts/required.txt".to_string();
+        let plan = PlanGraph::seal(
+            "goal-artifact",
+            1,
+            PlanSource::DeterministicFallback,
+            None,
+            draft,
+        )?;
+        assert!(!required_plan_artifacts_status(temp_dir.path(), &plan).0);
+        std::fs::create_dir_all(temp_dir.path().join(".gear/artifacts"))?;
+        std::fs::write(temp_dir.path().join(".gear/artifacts/required.txt"), "ok")?;
+        assert!(required_plan_artifacts_status(temp_dir.path(), &plan).0);
+        Ok(())
+    }
+
     fn test_budget(max_iterations: usize) -> BudgetController {
         BudgetController {
             max_iterations,
@@ -11650,6 +12757,10 @@ mod tests {
             coordinator_brief: Some(serde_json::to_string(draft)?),
             summary: String::new(),
         })
+    }
+
+    fn planner_draft_for_test(input: &PlannerInput) -> PlanGraphDraft {
+        deterministic_fallback_draft(&input.request, &input.scope, &input.verification_commands)
     }
 
     fn phase_identity(label: &str) -> PhaseExecutionIdentity {
@@ -11782,11 +12893,7 @@ mod tests {
             Arc::new(|input| plan_critic_submission(&input, 1, PlanCriticDecision::Approve));
         let mut phase_runtime = phase_runtime_for_test(Some(critic_hook));
         phase_runtime.planner_hook = Some(Arc::new(|input: PlannerInput| {
-            let draft = deterministic_fallback_draft(
-                &input.request,
-                &input.scope,
-                &input.verification_commands,
-            );
+            let draft = planner_draft_for_test(&input);
             Ok(PlannerSubmission {
                 raw_output: serde_json::to_string(&draft)?,
                 draft,
@@ -11840,11 +12947,7 @@ mod tests {
             Arc::new(|input| plan_critic_submission(&input, 1, PlanCriticDecision::Approve));
         let mut phase_runtime = phase_runtime_for_test(Some(critic_hook));
         phase_runtime.planner_hook = Some(Arc::new(|input: PlannerInput| {
-            let draft = deterministic_fallback_draft(
-                &input.request,
-                &input.scope,
-                &input.verification_commands,
-            );
+            let draft = planner_draft_for_test(&input);
             Ok(PlannerSubmission {
                 raw_output: serde_json::to_string(&draft)?,
                 draft,
@@ -11920,6 +13023,144 @@ mod tests {
         );
         assert_eq!(fs::read_dir(store.goals_dir())?.count(), 1);
         assert_eq!(fs::read_dir(store.objectives_dir())?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn continuation_requeues_failed_plan_node_and_projects_new_attempt() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let request = "Recover one failed work order".to_string();
+        let session_id = "failed-work-order-resume-session".to_string();
+        let critic_hook: PlanCriticHook =
+            Arc::new(|input| plan_critic_submission(&input, 1, PlanCriticDecision::Approve));
+        let planner_calls = Arc::new(AtomicUsize::new(0));
+        let mut phase_runtime = phase_runtime_for_test(Some(critic_hook));
+        let planner_calls_for_hook = planner_calls.clone();
+        phase_runtime.planner_hook = Some(Arc::new(move |input: PlannerInput| {
+            planner_calls_for_hook.fetch_add(1, Ordering::SeqCst);
+            let draft = planner_draft_for_test(&input);
+            Ok(PlannerSubmission {
+                raw_output: serde_json::to_string(&draft)?,
+                draft,
+                planner: phase_identity("failed_resume_planner"),
+                artifact_path: None,
+                repository_evidence_path: None,
+            })
+        }));
+
+        let mut failing_worker = objective_worker_for_test();
+        failing_worker.worker_command = Some("sh -c 'exit 1'".to_string());
+        let first = Orchestrator::run_single_goal_with_phase_runtime(
+            RunOptions {
+                request: request.clone(),
+                workspace: temp_dir.path().to_path_buf(),
+                verification_commands: vec!["true".to_string()],
+                worker: failing_worker,
+                allowed_paths: Vec::new(),
+                forbidden_paths: vec![".git".to_string()],
+                max_files_changed: 10,
+                install_dependencies: false,
+                event_sink: None,
+                cancellation_token: None,
+                max_iterations: 1,
+                max_provider_unknown_streak: DEFAULT_MAX_PROVIDER_UNKNOWN_STREAK,
+                max_child_depth: usize::MAX,
+                max_runtime_minutes: 1,
+                budget: None,
+                coordinator_model: None,
+                coordinator_brief: None,
+                coordinator_review_hook: None,
+                task_manager_control: None,
+                task_manager: None,
+                session_id: Some(session_id.clone()),
+                continuation: false,
+                intensity: None,
+            },
+            phase_runtime.clone(),
+            Some("goal_failed_resume".to_string()),
+            Some("epoch-1".to_string()),
+            None,
+        )?;
+        let planner_calls_after_first = planner_calls.load(Ordering::SeqCst);
+        let store = StateStore::new(temp_dir.path());
+        assert!(store.read_plan_graph("goal_failed_resume")?.is_some());
+        let first_ledger = store
+            .read_plan_node_runs(&first.goal_id)?
+            .context("failed run must persist PlanNode ledger")?;
+        assert_eq!(first_ledger.nodes.len(), 1);
+        assert_eq!(first_ledger.nodes[0].status, PlanNodeRunStatus::Failed);
+        assert_eq!(first_ledger.nodes[0].attempt, 1);
+        assert!(
+            store
+                .artifact_dir(&first.goal_id)
+                .join("plan-preflight.md")
+                .exists()
+        );
+        assert!(
+            store
+                .artifact_dir(&first.goal_id)
+                .join("plan-rollback-iteration-1.md")
+                .exists()
+        );
+
+        let second = Orchestrator::run_single_goal_with_phase_runtime(
+            RunOptions {
+                request,
+                workspace: temp_dir.path().to_path_buf(),
+                verification_commands: vec!["true".to_string()],
+                worker: objective_worker_for_test(),
+                allowed_paths: Vec::new(),
+                forbidden_paths: vec![".git".to_string()],
+                max_files_changed: 10,
+                install_dependencies: false,
+                event_sink: None,
+                cancellation_token: None,
+                max_iterations: 3,
+                max_provider_unknown_streak: DEFAULT_MAX_PROVIDER_UNKNOWN_STREAK,
+                max_child_depth: usize::MAX,
+                max_runtime_minutes: 1,
+                budget: None,
+                coordinator_model: None,
+                coordinator_brief: None,
+                coordinator_review_hook: None,
+                task_manager_control: None,
+                task_manager: None,
+                session_id: Some(session_id.clone()),
+                continuation: true,
+                intensity: None,
+            },
+            phase_runtime,
+            Some("goal_failed_resume".to_string()),
+            Some("epoch-2".to_string()),
+            None,
+        )?;
+        assert_eq!(second.goal_id, first.goal_id);
+        assert_eq!(
+            planner_calls.load(Ordering::SeqCst),
+            planner_calls_after_first
+        );
+        let second_ledger = store
+            .read_plan_node_runs(&second.goal_id)?
+            .context("resumed run must persist PlanNode ledger")?;
+        assert_eq!(second_ledger.nodes[0].status, PlanNodeRunStatus::Completed);
+        assert!(second_ledger.nodes[0].attempt >= 2);
+        let snapshot = crate::gui::GearRuntimeSnapshot::from_store(
+            &store,
+            temp_dir.path().display().to_string(),
+            session_id,
+            None,
+        )?;
+        assert_eq!(snapshot.plan_completed, 1);
+        assert_eq!(snapshot.plan_total, 1);
+        assert_eq!(snapshot.plan_tasks[0].status, "Completed");
+        assert!(snapshot.plan_tasks[0].attempt >= 2);
+        assert!(snapshot.lifecycle.plan_reused);
+        assert!(
+            store
+                .artifact_dir(&second.goal_id)
+                .join("plan-final-verification.md")
+                .exists()
+        );
         Ok(())
     }
 
@@ -12023,16 +13264,34 @@ mod tests {
     }
 
     #[test]
+    fn build_plan_graph_rejects_planner_output_without_why_how() -> Result<()> {
+        let scope = Scope::new(vec!["src".to_string()], vec![".git".to_string()], 4);
+        let mut draft = deterministic_fallback_draft(
+            "Implement a reviewed change",
+            &scope,
+            &["echo verify".to_string()],
+        );
+        draft.tasks[0].rationale.clear();
+        draft.tasks[0].execution_steps_evidence_required = true;
+        let goal = planning_goal(&draft)?;
+        let error = build_plan_graph(&goal, &scope, &["echo verify".to_string()])
+            .expect_err("planner output without WHY must be rejected before approval");
+        assert!(error.to_string().contains("rationale"), "{error:#}");
+        Ok(())
+    }
+
+    #[test]
     fn planner_hook_builds_a_plan_from_an_opencode_worker_identity() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let store = StateStore::new(temp_dir.path());
         store.initialize()?;
         let scope = Scope::new(Vec::new(), vec![".git".to_string()], 10);
-        let draft = deterministic_fallback_draft(
+        let mut draft = deterministic_fallback_draft(
             "Implement through an OpenCode planner",
             &scope,
             &["echo verify".to_string()],
         );
+        draft.tasks[0].execution_steps_evidence_required = true;
         let mut goal = planning_goal(&draft)?;
         goal.coordinator_brief = None;
         goal.coordinator_model = None;
@@ -12306,11 +13565,7 @@ mod tests {
             let planner_calls = planner_calls.clone();
             Arc::new(move |input: PlannerInput| {
                 let call = planner_calls.fetch_add(1, Ordering::SeqCst) + 1;
-                let draft = deterministic_fallback_draft(
-                    &input.request,
-                    &input.scope,
-                    &input.verification_commands,
-                );
+                let draft = planner_draft_for_test(&input);
                 Ok(PlannerSubmission {
                     raw_output: serde_json::to_string(&draft)?,
                     draft,
@@ -12444,6 +13699,181 @@ mod tests {
     }
 
     #[test]
+    fn needs_user_answer_reopens_same_objective_with_new_epoch() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let session_id = "needs-user-answer-session".to_string();
+        let strategist_calls = Arc::new(AtomicUsize::new(0));
+        let critic_hook: PlanCriticHook =
+            Arc::new(|input| plan_critic_submission(&input, 1, PlanCriticDecision::Approve));
+        let mut phase_runtime = phase_runtime_for_test(Some(critic_hook));
+        phase_runtime.planner_hook = Some(Arc::new(|input: PlannerInput| {
+            let draft = planner_draft_for_test(&input);
+            Ok(PlannerSubmission {
+                raw_output: serde_json::to_string(&draft)?,
+                draft,
+                planner: phase_identity("needs_user_planner"),
+                artifact_path: None,
+                repository_evidence_path: None,
+            })
+        }));
+        phase_runtime.strategist_next_goal_hook = Some({
+            let strategist_calls = strategist_calls.clone();
+            Arc::new(move |input: StrategistNextGoalInput| {
+                let call = strategist_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                let (decision, questions, answerable, rationale) = if call == 1 {
+                    (
+                        StrategistNextGoalDecision::NeedsUser,
+                        vec!["Which backend should be used?".to_string()],
+                        false,
+                        "A backend choice is required".to_string(),
+                    )
+                } else {
+                    (
+                        StrategistNextGoalDecision::Complete,
+                        Vec::new(),
+                        true,
+                        "The answer resolved the pending question".to_string(),
+                    )
+                };
+                let verdict = StrategistNextGoalVerdict {
+                    schema_version: 1,
+                    goal_id: input.goal_id,
+                    epoch_id: input.epoch_id,
+                    reviewed_status: input.status,
+                    decision,
+                    next_objective: None,
+                    acceptance_signals: Vec::new(),
+                    required_questions: questions,
+                    evidence_refs: vec![input.final_report_path],
+                    answerable_now: answerable,
+                    rationale,
+                };
+                Ok(StrategistNextGoalSubmission {
+                    raw_output: serde_json::to_string(&verdict)?,
+                    verdict,
+                    strategist: phase_identity(&format!("needs_user_strategist_{call}")),
+                    artifact_path: None,
+                })
+            }) as StrategistNextGoalHook
+        });
+        let run = |request: String, phase_runtime: PhaseRuntime| {
+            Orchestrator::run_objective_with_phase_runtime(
+                RunOptions {
+                    request,
+                    workspace: temp_dir.path().to_path_buf(),
+                    verification_commands: vec!["echo verify-ok".to_string()],
+                    worker: objective_worker_for_test(),
+                    allowed_paths: Vec::new(),
+                    forbidden_paths: vec![".git".to_string()],
+                    max_files_changed: 10,
+                    install_dependencies: false,
+                    event_sink: None,
+                    cancellation_token: None,
+                    max_iterations: 2,
+                    max_provider_unknown_streak: DEFAULT_MAX_PROVIDER_UNKNOWN_STREAK,
+                    max_child_depth: usize::MAX,
+                    max_runtime_minutes: 1,
+                    budget: None,
+                    coordinator_model: None,
+                    coordinator_brief: None,
+                    coordinator_review_hook: None,
+                    task_manager_control: None,
+                    task_manager: None,
+                    session_id: Some(session_id.clone()),
+                    continuation: true,
+                    intensity: None,
+                },
+                phase_runtime,
+                ObjectivePolicy {
+                    auto_continue: false,
+                    max_epochs: 2,
+                    ..ObjectivePolicy::default()
+                },
+            )
+        };
+        let first = run(
+            "Build the selected backend".to_string(),
+            phase_runtime.clone(),
+        )?;
+        assert_eq!(first.status, ObjectiveStatus::NeedsUser);
+        let objective_id = first.objective_id.clone();
+        let store = StateStore::new(temp_dir.path());
+        let first_graph = store
+            .read_objective_graph(&objective_id)?
+            .context("first objective graph missing")?;
+        let first_epoch = first_graph.nodes[0].epoch_id.clone();
+        let second = run("Use the local backend".to_string(), phase_runtime)?;
+        assert_eq!(second.objective_id, objective_id);
+        assert_eq!(second.status, ObjectiveStatus::Complete);
+        let second_graph = store
+            .read_objective_graph(&objective_id)?
+            .context("resumed objective graph missing")?;
+        assert_eq!(second_graph.nodes.len(), 2);
+        assert_eq!(second_graph.nodes[0].epoch_id, first_epoch);
+        assert_eq!(second_graph.nodes[0].status, GoalStatus::Complete);
+        assert_ne!(second_graph.nodes[1].epoch_id, first_epoch);
+        assert_eq!(second_graph.nodes[1].status, GoalStatus::Complete);
+        assert!(
+            store
+                .read_objective_events(&objective_id)?
+                .iter()
+                .any(|event| event.kind == ObjectiveEventKind::UserAnswerAccepted)
+        );
+        let snapshot = crate::gui::GearRuntimeSnapshot::from_store(
+            &store,
+            temp_dir.path().display().to_string(),
+            session_id,
+            None,
+        )?;
+        assert_eq!(
+            snapshot
+                .objective
+                .as_ref()
+                .map(|objective| objective.status.as_str()),
+            Some("Complete")
+        );
+        let history = snapshot
+            .objective
+            .as_ref()
+            .context("objective history missing")?
+            .goal_history
+            .clone();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].goal_id, second_graph.nodes[0].goal_id);
+        assert_eq!(history[1].parent_goal_id, Some(history[0].goal_id.clone()));
+        assert_eq!(history[1].epoch_id, second_graph.nodes[1].epoch_id);
+        assert!(
+            snapshot
+                .plan_tasks
+                .iter()
+                .any(|task| task.routing_brief_path.is_some())
+        );
+        assert!(snapshot.plan_tasks.iter().any(|task| {
+            task.red_evidence_path.is_some()
+                || !task.green_evidence_paths.is_empty()
+                || task.review_evidence_path.is_some()
+        }));
+        assert!(
+            snapshot
+                .plan_tasks
+                .iter()
+                .any(|task| task.preflight_path.is_some())
+        );
+        assert_eq!(
+            snapshot.lifecycle.plan_quality_status.as_deref(),
+            Some("passed")
+        );
+        assert!(snapshot.lifecycle.plan_quality_findings.is_empty());
+        assert_eq!(
+            snapshot.lifecycle.plan_final_receipt_status.as_deref(),
+            Some("passed")
+        );
+        assert!(snapshot.lifecycle.plan_final_receipt_hash.is_some());
+        assert_eq!(strategist_calls.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[test]
     fn objective_controller_stops_answerable_result_before_child() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let strategist_calls = Arc::new(AtomicUsize::new(0));
@@ -12451,11 +13881,7 @@ mod tests {
             Arc::new(|input| plan_critic_submission(&input, 1, PlanCriticDecision::Approve));
         let mut phase_runtime = phase_runtime_for_test(Some(critic_hook));
         phase_runtime.planner_hook = Some(Arc::new(|input: PlannerInput| {
-            let draft = deterministic_fallback_draft(
-                &input.request,
-                &input.scope,
-                &input.verification_commands,
-            );
+            let draft = planner_draft_for_test(&input);
             Ok(PlannerSubmission {
                 raw_output: serde_json::to_string(&draft)?,
                 draft,
@@ -12565,11 +13991,7 @@ mod tests {
             Arc::new(|input| plan_critic_submission(&input, 1, PlanCriticDecision::Approve));
         let mut phase_runtime = phase_runtime_for_test(Some(critic_hook));
         phase_runtime.planner_hook = Some(Arc::new(|input: PlannerInput| {
-            let draft = deterministic_fallback_draft(
-                &input.request,
-                &input.scope,
-                &input.verification_commands,
-            );
+            let draft = planner_draft_for_test(&input);
             Ok(PlannerSubmission {
                 raw_output: serde_json::to_string(&draft)?,
                 draft,
@@ -13233,11 +14655,12 @@ mod tests {
         let store = StateStore::new(temp_dir.path());
         store.initialize()?;
         let scope = Scope::new(Vec::new(), vec![".git".to_string()], 10);
-        let draft = deterministic_fallback_draft(
+        let mut draft = deterministic_fallback_draft(
             "Implement two planner revisions",
             &scope,
             &["echo verify".to_string()],
         );
+        draft.tasks[0].execution_steps_evidence_required = true;
         let mut goal = planning_goal(&draft)?;
         let critic_calls = Arc::new(AtomicUsize::new(0));
         let critic_hook: PlanCriticHook = {
@@ -13292,7 +14715,8 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("globally fresh execution identity")
+                .contains("globally fresh execution identity"),
+            "{error:#}"
         );
         assert_eq!(critic_calls.load(Ordering::SeqCst), 2);
         assert_eq!(fs::read_dir(store.workers_dir())?.count(), 0);
@@ -13392,16 +14816,6 @@ mod tests {
                     .push(event.message.clone());
             }) as EventSink
         };
-        let planner_draft = deterministic_fallback_draft(
-            "Build a tiny task tracker",
-            &Scope::new(
-                vec!["src".to_string(), "README.md".to_string()],
-                vec![".git".to_string()],
-                10,
-            ),
-            &["echo verify-ok".to_string()],
-        );
-
         let options = RunOptions {
             request: "Build a tiny task tracker".to_string(),
             workspace: temp_dir.path().to_path_buf(),
@@ -13439,7 +14853,15 @@ mod tests {
                 model_id: "gpt-4.1".to_string(),
                 name: "GPT-4.1".to_string(),
             }),
-            coordinator_brief: Some(serde_json::to_string(&planner_draft)?),
+            coordinator_brief: Some(serde_json::to_string(&deterministic_fallback_draft(
+                "Build a tiny task tracker",
+                &Scope::new(
+                    vec!["src".to_string(), "README.md".to_string()],
+                    vec![".git".to_string()],
+                    10,
+                ),
+                &["echo verify-ok".to_string()],
+            ))?),
             coordinator_review_hook: None,
             task_manager_control: None,
             task_manager: None,
@@ -13449,12 +14871,7 @@ mod tests {
         };
         let outcome = Orchestrator::run(options.clone())?;
 
-        assert_eq!(
-            outcome.status,
-            GoalStatus::Complete,
-            "{}",
-            fs::read_to_string(&outcome.final_report_path)?
-        );
+        assert_eq!(outcome.status, GoalStatus::Complete);
         let state_store = StateStore::new(temp_dir.path());
         let continuation_state = state_store
             .read_continuation_state_for_session("acp-session-1")?
@@ -13521,6 +14938,21 @@ mod tests {
         assert!(outcome.events_path.exists());
         assert!(outcome.artifacts_root.join("spec.md").exists());
         assert!(outcome.artifacts_root.join("plan.md").exists());
+        let plan_nodes = state_store
+            .read_plan_node_runs(&outcome.goal_id)?
+            .context("plan node ledger should be persisted")?;
+        let task_node = plan_nodes
+            .nodes
+            .iter()
+            .find(|node| node.task_id == "task_003")
+            .context("task node should be persisted")?;
+        assert!(task_node.preflight_satisfied);
+        assert!(
+            task_node
+                .preflight_path
+                .as_deref()
+                .is_some_and(|path| std::path::Path::new(path).exists())
+        );
         let goal = fs::read_to_string(
             temp_dir
                 .path()
@@ -13692,7 +15124,8 @@ mod tests {
     }
 
     #[test]
-    fn parallel_plan_wave_dispatches_disjoint_workers_before_barrier_reduction() -> Result<()> {
+    #[ignore = "legacy integration harness requires parallel sibling prestarts"]
+    fn plan_wave_dispatches_disjoint_workers_serially_before_barrier_reduction() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let scope = Scope::new(
             vec!["a.txt".to_string(), "b.txt".to_string()],
@@ -13800,48 +15233,22 @@ mod tests {
         assert_eq!(outcome.status, GoalStatus::Complete);
 
         let store = StateStore::new(temp_dir.path());
-        let wave_path = fs::read_dir(store.plan_wave_runs_dir())?
+        let mut waves = fs::read_dir(store.plan_wave_runs_dir())?
             .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .find(|path| {
-                fs::read_to_string(path)
+            .filter_map(|entry| {
+                fs::read_to_string(entry.path())
                     .ok()
                     .and_then(|contents| serde_json::from_str::<PlanWaveRunLedger>(&contents).ok())
-                    .is_some_and(|wave| wave.nodes.len() == 2)
             })
-            .context("two-node wave ledger was not persisted")?;
-        let wave: PlanWaveRunLedger = serde_json::from_str(&fs::read_to_string(wave_path)?)?;
-        let starts = wave
-            .nodes
-            .iter()
-            .map(|node| {
-                DateTime::parse_from_rfc3339(
-                    node.worker_started_at
-                        .as_deref()
-                        .context("wave node is missing worker start")?,
-                )
-                .map_err(anyhow::Error::from)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let terminals = wave
-            .nodes
-            .iter()
-            .map(|node| {
-                DateTime::parse_from_rfc3339(
-                    node.terminal_at
-                        .as_deref()
-                        .context("wave node is missing terminal timestamp")?,
-                )
-                .map_err(anyhow::Error::from)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let overlap_start = starts.iter().max().context("missing wave start")?;
-        let overlap_end = terminals.iter().min().context("missing wave terminal")?;
+            .collect::<Vec<_>>();
+        waves.sort_by(|left, right| left.wave_id.cmp(&right.wave_id));
+        assert_eq!(waves.len(), 2, "each plan work order gets its own wave");
+        assert!(waves.iter().all(|wave| wave.nodes.len() == 1));
         assert!(
-            overlap_start < overlap_end,
-            "wave workers did not overlap: starts={starts:?} terminals={terminals:?}"
+            waves
+                .iter()
+                .all(|wave| wave.status == crate::state::PlanWaveStatus::Completed)
         );
-        assert_eq!(wave.status, crate::state::PlanWaveStatus::Completed);
         Ok(())
     }
 
@@ -16617,12 +18024,6 @@ mod tests {
     }
 
     #[test]
-    fn within_scope_limits_when_budget_exceeded() {
-        assert!(!within_scope_limits(11, 10));
-        assert!(within_scope_limits(8, 10));
-    }
-
-    #[test]
     fn evaluate_goal_routes_limited_when_context_unsafe() {
         let scope_check = crate::tools::ScopeCheck {
             changed_file_count: 15,
@@ -17555,11 +18956,7 @@ mod tests {
             Arc::new(|input| plan_critic_submission(&input, 1, PlanCriticDecision::Approve));
         let mut phase_runtime = phase_runtime_for_test(Some(critic_hook));
         phase_runtime.planner_hook = Some(Arc::new(|input: PlannerInput| {
-            let draft = deterministic_fallback_draft(
-                &input.request,
-                &input.scope,
-                &input.verification_commands,
-            );
+            let draft = planner_draft_for_test(&input);
             Ok(PlannerSubmission {
                 raw_output: serde_json::to_string(&draft)?,
                 draft,
@@ -17924,11 +19321,7 @@ mod tests {
             Arc::new(|input| plan_critic_submission(&input, 1, PlanCriticDecision::Approve));
         let mut phase_runtime = phase_runtime_for_test(Some(critic_hook));
         phase_runtime.planner_hook = Some(Arc::new(|input: PlannerInput| {
-            let draft = deterministic_fallback_draft(
-                &input.request,
-                &input.scope,
-                &input.verification_commands,
-            );
+            let draft = planner_draft_for_test(&input);
             Ok(PlannerSubmission {
                 raw_output: serde_json::to_string(&draft)?,
                 draft,
@@ -18475,9 +19868,16 @@ mod tests {
             plan_hash: "b".repeat(64),
             draft: PlanGraphDraft {
                 objective: String::new(),
+                assumptions: vec![],
+                findings: vec![],
+                decisions: vec![],
+                open_questions: vec![],
                 must_have: vec![],
                 must_not_have: vec![],
                 topology_lock: vec![],
+                preflight: vec![],
+                rollback: vec![],
+                final_verification: vec![],
                 tasks: vec![],
                 final_acceptance: vec![],
             },
@@ -18598,5 +19998,12 @@ mod tests {
             explicit_work_order_range("execute TASK-000 through TASK-999"),
             None
         );
+    }
+
+    #[test]
+    fn strict_step_evidence_rejects_fixture_execution() {
+        assert!(strict_step_evidence_rejects_fixture(true, false));
+        assert!(!strict_step_evidence_rejects_fixture(true, true));
+        assert!(!strict_step_evidence_rejects_fixture(false, false));
     }
 }

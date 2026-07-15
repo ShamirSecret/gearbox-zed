@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -19,9 +19,28 @@ pub fn id_timestamp() -> String {
     Local::now().format("%Y%m%d_%H%M%S_%3f").to_string()
 }
 
-const REPOSITORY_OBSERVATION_PATH_COMPONENT_LIMIT: usize = 64;
+// Leave room for the revision/role separators and the atomic temporary suffix
+// in the single filename. The old 64-byte components could make a repair
+// observation filename exceed NAME_MAX when both task and session identities
+// were long.
+const REPOSITORY_OBSERVATION_PATH_COMPONENT_LIMIT: usize = 32;
+const LEGACY_REPOSITORY_OBSERVATION_PATH_COMPONENT_LIMIT: usize = 64;
 
 fn repository_observation_path_component(value: &str) -> String {
+    repository_observation_path_component_with_limit(
+        value,
+        REPOSITORY_OBSERVATION_PATH_COMPONENT_LIMIT,
+    )
+}
+
+fn legacy_repository_observation_path_component(value: &str) -> String {
+    repository_observation_path_component_with_limit(
+        value,
+        LEGACY_REPOSITORY_OBSERVATION_PATH_COMPONENT_LIMIT,
+    )
+}
+
+fn repository_observation_path_component_with_limit(value: &str, limit: usize) -> String {
     let sanitized = value
         .chars()
         .map(|character| {
@@ -32,14 +51,14 @@ fn repository_observation_path_component(value: &str) -> String {
             }
         })
         .collect::<String>();
-    if sanitized.len() <= REPOSITORY_OBSERVATION_PATH_COMPONENT_LIMIT {
+    if sanitized.len() <= limit {
         return sanitized;
     }
 
     // Keep long task/session identities distinguishable without exceeding filesystem limits.
     let digest = format!("{:x}", Sha256::digest(value.as_bytes()));
     let suffix = &digest[..16];
-    let prefix_length = REPOSITORY_OBSERVATION_PATH_COMPONENT_LIMIT - suffix.len() - 1;
+    let prefix_length = limit - suffix.len() - 1;
     let prefix = sanitized.chars().take(prefix_length).collect::<String>();
     format!("{prefix}-{suffix}")
 }
@@ -582,6 +601,49 @@ pub enum PlanNodeRunStatus {
     Cancelled,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanStepRunStatus {
+    Pending,
+    Running,
+    Completed,
+    Blocked,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanStepRun {
+    pub step_id: String,
+    pub action: String,
+    pub expected_observation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_path: Option<String>,
+    pub status: PlanStepRunStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerEvidenceQuality {
+    #[default]
+    Unclassified,
+    Proved,
+    FixtureOnly,
+    BlockedNotVerified,
+    Failed,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanWorkOrderDecision {
+    #[default]
+    NotRecorded,
+    Executed,
+    Skipped,
+    Blocked,
+}
+
 impl PlanNodeRunStatus {
     pub fn is_terminal(&self) -> bool {
         matches!(
@@ -723,6 +785,40 @@ pub struct PlanNodeRun {
     pub attempt: usize,
     pub dependencies: Vec<String>,
     pub status: PlanNodeRunStatus,
+    /// Durable OMO-style per-work-order preflight receipt. A node cannot be
+    /// considered dispatched without this baseline artifact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preflight_path: Option<String>,
+    #[serde(default)]
+    pub preflight_satisfied: bool,
+    #[serde(default)]
+    pub preflight_checks: Vec<PlanPreflightCheck>,
+    /// Durable per-step lifecycle projected from the frozen plan contract.
+    /// This remains inside the node ledger so GUI and recovery share one source.
+    #[serde(default)]
+    pub execution_steps: Vec<PlanStepRun>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_result_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_outcome_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_last_message_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub worker_changed_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub worker_commands_run: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub worker_known_failures: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub worker_next_steps: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_plan_gap: Option<String>,
+    #[serde(default)]
+    pub worker_decision: PlanWorkOrderDecision,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_decision_reason: Option<String>,
+    #[serde(default)]
+    pub worker_evidence_quality: WorkerEvidenceQuality,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_task_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -736,10 +832,23 @@ pub struct PlanNodeRun {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_evidence_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_boundary_evidence_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_boundary_satisfied: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default)]
     pub criterion_evidence: Vec<PlanCriterionEvidence>,
     pub updated_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanPreflightCheck {
+    pub check_id: String,
+    pub description: String,
+    pub passed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2076,6 +2185,139 @@ impl PlanNodeRun {
             })
         })
     }
+
+    /// QA scenarios are sealed as criterion evidence with a stable `qa:` id.
+    /// Keeping the check on the node makes completion and recovery use the
+    /// same attempt-bound evidence rules as ordinary acceptance predicates.
+    pub fn all_qa_passed(&self, task: &crate::plan_graph::PlanTaskContract) -> bool {
+        if self.attempt == 0 {
+            return false;
+        }
+        task.qa
+            .happy_path
+            .iter()
+            .map(|scenario| ("happy", scenario))
+            .chain(
+                task.qa
+                    .failure_path
+                    .iter()
+                    .map(|scenario| ("failure", scenario)),
+            )
+            .chain(
+                task.qa
+                    .adversarial_path
+                    .iter()
+                    .map(|scenario| ("adversarial", scenario)),
+            )
+            .all(|(kind, scenario)| {
+                let criterion_id = format!("qa:{kind}:{}", scenario.name);
+                self.criterion_evidence.iter().any(|evidence| {
+                    evidence.criterion_id == criterion_id
+                        && evidence.attempt == self.attempt
+                        && evidence.status == CriterionEvidenceStatus::Pass
+                })
+            })
+    }
+
+    pub fn sync_step_lifecycle(&mut self, error: Option<&str>) {
+        match self.status {
+            PlanNodeRunStatus::Running => {
+                if let Some(step) = self
+                    .execution_steps
+                    .iter_mut()
+                    .find(|step| step.status == PlanStepRunStatus::Pending)
+                {
+                    step.status = PlanStepRunStatus::Running;
+                    step.updated_at = timestamp();
+                }
+            }
+            PlanNodeRunStatus::Completed => {
+                for step in &mut self.execution_steps {
+                    step.status = PlanStepRunStatus::Completed;
+                    step.updated_at = timestamp();
+                }
+            }
+            PlanNodeRunStatus::Failed
+            | PlanNodeRunStatus::NeedsUser
+            | PlanNodeRunStatus::Cancelled => {
+                if let Some(step) = self
+                    .execution_steps
+                    .iter_mut()
+                    .find(|step| !matches!(step.status, PlanStepRunStatus::Completed))
+                {
+                    step.status = PlanStepRunStatus::Blocked;
+                    step.error = error.map(ToString::to_string);
+                    step.updated_at = timestamp();
+                }
+            }
+            PlanNodeRunStatus::Pending
+            | PlanNodeRunStatus::Runnable
+            | PlanNodeRunStatus::RedVerified
+            | PlanNodeRunStatus::Implemented
+            | PlanNodeRunStatus::GreenVerified
+            | PlanNodeRunStatus::Reviewed => {}
+        }
+        self.updated_at = timestamp();
+    }
+
+    pub fn apply_worker_step_evidence(
+        &mut self,
+        completed_step_ids: &[String],
+        evidence_by_step: &HashMap<String, String>,
+    ) -> Result<Vec<String>> {
+        let declared = completed_step_ids.iter().collect::<HashSet<_>>();
+        for step_id in &declared {
+            if !self
+                .execution_steps
+                .iter()
+                .any(|step| &step.step_id == *step_id)
+            {
+                bail!("worker reported unknown execution step `{step_id}`");
+            }
+        }
+        let mut encountered_uncompleted = false;
+        for step in &self.execution_steps {
+            let is_completed = step.status == PlanStepRunStatus::Completed;
+            let is_declared = declared.contains(&step.step_id);
+            if !is_completed && !is_declared {
+                encountered_uncompleted = true;
+                continue;
+            }
+            if encountered_uncompleted && (is_completed || is_declared) {
+                bail!(
+                    "worker skipped ordered execution step `{}` before reporting `{}`",
+                    self.execution_steps
+                        .iter()
+                        .find(|candidate| {
+                            candidate.status != PlanStepRunStatus::Completed
+                                && !declared.contains(&candidate.step_id)
+                        })
+                        .map(|candidate| candidate.step_id.as_str())
+                        .unwrap_or("unknown"),
+                    step.step_id
+                );
+            }
+        }
+        for step in &mut self.execution_steps {
+            if declared.contains(&step.step_id) {
+                step.status = PlanStepRunStatus::Completed;
+                step.evidence_path = evidence_by_step
+                    .get(&step.step_id)
+                    .cloned()
+                    .or_else(|| step.evidence_path.clone());
+                step.error = None;
+                step.updated_at = timestamp();
+            }
+        }
+        let missing = self
+            .execution_steps
+            .iter()
+            .filter(|step| step.status != PlanStepRunStatus::Completed)
+            .map(|step| step.step_id.clone())
+            .collect::<Vec<_>>();
+        self.updated_at = timestamp();
+        Ok(missing)
+    }
 }
 
 impl PlanNodeRunLedger {
@@ -2106,12 +2348,41 @@ impl PlanNodeRunLedger {
                     attempt: 0,
                     dependencies: task.dependencies.clone(),
                     status: PlanNodeRunStatus::Pending,
+                    preflight_path: None,
+                    preflight_satisfied: false,
+                    preflight_checks: Vec::new(),
+                    execution_steps: task
+                        .execution_steps_or_legacy()
+                        .into_iter()
+                        .map(|step| PlanStepRun {
+                            step_id: step.step_id,
+                            action: step.action,
+                            expected_observation: step.expected_observation,
+                            evidence_path: step.evidence_path,
+                            status: PlanStepRunStatus::Pending,
+                            error: None,
+                            updated_at: timestamp(),
+                        })
+                        .collect(),
+                    worker_result_path: None,
+                    worker_outcome_path: None,
+                    worker_last_message_path: None,
+                    worker_changed_files: Vec::new(),
+                    worker_commands_run: Vec::new(),
+                    worker_known_failures: Vec::new(),
+                    worker_next_steps: Vec::new(),
+                    worker_plan_gap: None,
+                    worker_decision: PlanWorkOrderDecision::NotRecorded,
+                    worker_decision_reason: None,
+                    worker_evidence_quality: WorkerEvidenceQuality::Unclassified,
                     worker_task_id: None,
                     implementation_task_id: None,
                     review_task_id: None,
                     red_evidence_path: None,
                     green_evidence_paths: Vec::new(),
                     review_evidence_path: None,
+                    commit_boundary_evidence_path: None,
+                    commit_boundary_satisfied: None,
                     error: None,
                     criterion_evidence: Vec::new(),
                     updated_at: timestamp(),
@@ -2148,10 +2419,25 @@ impl PlanNodeRunLedger {
                 && (node.attempt == 0
                     || node.green_evidence_paths.is_empty()
                     || node.review_evidence_path.is_none()
-                    || (self.nodes.len() > 1 && node.review_task_id.is_none()))
+                    || (self.nodes.len() > 1 && node.review_task_id.is_none())
+                    || node
+                        .execution_steps
+                        .iter()
+                        .any(|step| step.status != PlanStepRunStatus::Completed))
             {
                 bail!(
                     "completed PlanNodeRun `{}` is missing attempt, GREEN, or review evidence",
+                    node.task_id
+                );
+            }
+            if matches!(node.worker_decision, PlanWorkOrderDecision::Skipped)
+                && node
+                    .worker_decision_reason
+                    .as_deref()
+                    .is_none_or(|reason| reason.trim().is_empty())
+            {
+                bail!(
+                    "skipped PlanNodeRun `{}` must record a decision reason",
                     node.task_id
                 );
             }
@@ -2159,6 +2445,16 @@ impl PlanNodeRunLedger {
                 evidence.validate()?;
                 if evidence.attempt > node.attempt && node.attempt > 0 {
                     bail!("PlanNodeRun criterion evidence belongs to a future attempt");
+                }
+            }
+            let mut step_ids = HashSet::new();
+            for step in &node.execution_steps {
+                if step.step_id.trim().is_empty()
+                    || !step_ids.insert(step.step_id.as_str())
+                    || step.action.trim().is_empty()
+                    || step.expected_observation.trim().is_empty()
+                {
+                    bail!("PlanNodeRun `{}` has invalid execution step", node.task_id);
                 }
             }
         }
@@ -2224,9 +2520,59 @@ impl PlanNodeRunLedger {
             );
         }
         node.status = status;
+        node.sync_step_lifecycle(None);
         node.updated_at = timestamp();
         self.updated_at = timestamp();
         Ok(())
+    }
+
+    /// Requeue failed plan nodes when a persisted continuation is resumed.
+    ///
+    /// `Failed` is terminal for an epoch's evidence, but it must not become a
+    /// dead end after a process restart: the next continuation epoch may
+    /// retry the same work order without pretending that the failed attempt
+    /// passed. The attempt number, previous worker identity and error remain
+    /// durable for audit purposes.
+    pub fn requeue_failed_for_resume(&mut self) -> Vec<String> {
+        let mut requeued = Vec::new();
+        for node in &mut self.nodes {
+            if node.status == PlanNodeRunStatus::Failed {
+                // Leave the node pending so the scheduler can select it on
+                // the resumed epoch and persist the normal Pending -> Runnable
+                // transition before dispatch.
+                node.status = PlanNodeRunStatus::Pending;
+                node.preflight_path = None;
+                node.preflight_satisfied = false;
+                node.preflight_checks.clear();
+                for step in &mut node.execution_steps {
+                    if step.status == PlanStepRunStatus::Blocked {
+                        step.status = PlanStepRunStatus::Pending;
+                        step.error = None;
+                        step.updated_at = timestamp();
+                    }
+                }
+                node.updated_at = timestamp();
+                requeued.push(node.task_id.clone());
+            }
+        }
+        if !requeued.is_empty() {
+            self.updated_at = timestamp();
+        }
+        requeued
+    }
+
+    /// Bind a recovered ledger to the new continuation epoch while retaining
+    /// every node's attempt and evidence history.
+    pub fn rebind_epoch_for_resume(&mut self, epoch_id: &str) {
+        if self.epoch_id == epoch_id {
+            return;
+        }
+        self.epoch_id = epoch_id.to_string();
+        for node in &mut self.nodes {
+            node.epoch_id = epoch_id.to_string();
+            node.updated_at = timestamp();
+        }
+        self.updated_at = timestamp();
     }
 }
 
@@ -2800,6 +3146,46 @@ impl ObjectiveGraph {
         self.reseal()
     }
 
+    /// Reopen a needs-user frontier for a new epoch after an explicit answer.
+    /// Prior terminal evidence remains in the event ledger; the node itself
+    /// becomes the active planning frontier with a fresh request binding.
+    pub fn reopen_for_user_answer(
+        &mut self,
+        goal_id: &str,
+        epoch_id: &str,
+        request: &str,
+    ) -> Result<()> {
+        if self.status != ObjectiveStatus::NeedsUser || self.active_goal_id.is_some() {
+            bail!("objective is not waiting for a user answer");
+        }
+        let node = self
+            .nodes
+            .iter_mut()
+            .find(|node| node.goal_id == goal_id)
+            .context("user answer references an unknown objective goal")?;
+        if !matches!(node.status, GoalStatus::NeedsUser | GoalStatus::Complete) {
+            bail!("objective goal is not waiting for a user answer");
+        }
+        if epoch_id.trim().is_empty() || request.trim().is_empty() {
+            bail!("reopened objective requires epoch and request");
+        }
+        node.epoch_id = epoch_id.to_string();
+        node.request = request.to_string();
+        node.request_hash = format!("{:x}", Sha256::digest(request.as_bytes()));
+        node.objective_hash = format!("{:x}", Sha256::digest(request.as_bytes()));
+        node.status = GoalStatus::Planning;
+        node.final_wave_receipt_hash = None;
+        node.final_report_path = None;
+        node.strategist_receipt_hash = None;
+        node.terminal_reason = None;
+        node.updated_at = timestamp();
+        self.active_goal_id = Some(goal_id.to_string());
+        self.status = ObjectiveStatus::Running;
+        self.stop_reason = None;
+        self.updated_at = timestamp();
+        self.reseal()
+    }
+
     pub fn record_progress(&mut self, consecutive_no_progress: usize) -> Result<()> {
         self.consecutive_no_progress = consecutive_no_progress;
         self.updated_at = timestamp();
@@ -3062,6 +3448,7 @@ pub enum ObjectiveEventKind {
     GoalAttached,
     GoalOutcomeRecorded,
     StrategistContinueAccepted,
+    UserAnswerAccepted,
     ChildDispatchReserved,
     FinalReviewBlockerPromoted,
     ObjectiveBudgetSettled,
@@ -3193,6 +3580,13 @@ fn validate_objective_event_transition(
             }
             *active = true;
         }
+        ObjectiveEventKind::UserAnswerAccepted => {
+            if !*terminated || *active {
+                bail!("objective user answer requires a terminal objective");
+            }
+            *active = true;
+            *terminated = false;
+        }
         ObjectiveEventKind::GoalAttached
         | ObjectiveEventKind::GoalOutcomeRecorded
         | ObjectiveEventKind::StrategistContinueAccepted
@@ -3252,6 +3646,11 @@ fn validate_objective_event_payload(event: &ObjectiveEvent) -> Result<()> {
             required_non_empty("parent_epoch_id")?;
             required_non_empty("receipt_hash")?;
             required_non_empty("next_objective")?;
+        }
+        ObjectiveEventKind::UserAnswerAccepted => {
+            required_non_empty("goal_id")?;
+            required_non_empty("epoch_id")?;
+            required_non_empty("answer")?;
         }
         ObjectiveEventKind::ChildDispatchReserved => {
             required_non_empty("reservation_id")?;
@@ -3614,6 +4013,7 @@ pub enum EventKind {
     PlanRevisionRequested,
     PlanReviewApproved,
     PlanApproved,
+    PlanReused,
     PlanRejected,
     PhaseRouteSelected,
     TaskStarted,
@@ -4082,6 +4482,30 @@ impl StateStore {
         let graph: ObjectiveGraph = read_json_file(&path)?;
         graph.validate()?;
         Ok(Some(graph))
+    }
+
+    pub fn find_objective_graph_for_root_session(
+        &self,
+        root_session_id: &str,
+    ) -> Result<Option<ObjectiveGraph>> {
+        let entries = fs::read_dir(self.objectives_dir())?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json")
+                || !path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".graph.json"))
+            {
+                continue;
+            }
+            let graph: ObjectiveGraph = read_json_file(&path)?;
+            graph.validate()?;
+            if graph.root_session_id == root_session_id {
+                return Ok(Some(graph));
+            }
+        }
+        Ok(None)
     }
 
     pub fn append_objective_event(
@@ -4575,6 +4999,18 @@ impl StateStore {
         Ok(path)
     }
 
+    pub fn read_session(&self, session_id: &str) -> Result<Option<Session>> {
+        let path = self.sessions_dir().join(format!("{session_id}.json"));
+        if !path.exists() {
+            return Ok(None);
+        }
+        let contents = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        Ok(Some(serde_json::from_str(&contents).with_context(
+            || format!("failed to parse {}", path.display()),
+        )?))
+    }
+
     pub fn write_goal(&self, goal: &Goal) -> Result<PathBuf> {
         let path = self.goals_dir().join(format!("{}.json", goal.id));
         write_json(&path, goal)?;
@@ -4757,11 +5193,20 @@ impl StateStore {
         worker_task_id: &str,
         session_id: &str,
     ) -> Result<Option<RepositoryObservationReceipt>> {
-        let path = self.plan_review_dir(goal_id).join(format!(
+        let current_path = self.plan_review_dir(goal_id).join(format!(
             "revision-{revision:03}-{role}-{}-{}-repository-observation.json",
             repository_observation_path_component(worker_task_id),
             repository_observation_path_component(session_id)
         ));
+        let path = if current_path.is_file() {
+            current_path
+        } else {
+            self.plan_review_dir(goal_id).join(format!(
+                "revision-{revision:03}-{role}-{}-{}-repository-observation.json",
+                legacy_repository_observation_path_component(worker_task_id),
+                legacy_repository_observation_path_component(session_id)
+            ))
+        };
         if !path.is_file() {
             return Ok(None);
         }
@@ -5010,6 +5455,45 @@ impl StateStore {
         ));
         write_json(&path, receipt)?;
         Ok(path)
+    }
+
+    pub fn read_plan_critic_receipt(
+        &self,
+        goal_id: &str,
+        plan_revision: usize,
+    ) -> Result<Option<crate::plan_review::PlanCriticReceipt>> {
+        let path = self
+            .plan_review_dir(goal_id)
+            .join(format!("revision-{plan_revision:03}-critic-receipt.json"));
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let receipt: crate::plan_review::PlanCriticReceipt = read_json_file(&path)?;
+        if receipt.goal_id != goal_id || receipt.plan_revision != plan_revision {
+            bail!("plan critic receipt path binding mismatch");
+        }
+        Ok(Some(receipt))
+    }
+
+    pub fn read_plan_oracle_receipt(
+        &self,
+        goal_id: &str,
+        plan_revision: usize,
+    ) -> Result<Option<crate::plan_review::PlanCriticReceipt>> {
+        let path = self
+            .plan_review_dir(goal_id)
+            .join(format!("revision-{plan_revision:03}-oracle-receipt.txt"));
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let contents = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let receipt: crate::plan_review::PlanCriticReceipt = serde_json::from_str(&contents)
+            .with_context(|| format!("failed to parse {}", path.display()))?;
+        if receipt.goal_id != goal_id || receipt.plan_revision != plan_revision {
+            bail!("plan oracle receipt path binding mismatch");
+        }
+        Ok(Some(receipt))
     }
 
     pub fn write_plan_review_text(
@@ -6510,6 +6994,51 @@ mod epoch_tests {
     }
 
     #[test]
+    fn needs_user_frontier_reopens_for_a_new_answer_epoch() -> Result<()> {
+        let mut graph = ObjectiveGraph::new(
+            "objective-answer",
+            "session-answer",
+            "/tmp/workspace",
+            "Answer a question",
+            "scope-hash",
+            ObjectivePolicy::rolling_default(),
+        )?;
+        graph.add_root_node(graph_node(
+            "goal-answer",
+            "epoch-1",
+            "session-answer",
+            "Answer a question",
+            GoalStatus::Planning,
+            None,
+            None,
+            None,
+        ))?;
+        graph.update_active_node(
+            "goal-answer",
+            GoalStatus::NeedsUser,
+            Some("final-wave".to_string()),
+            Some("/tmp/report.md".to_string()),
+            Some("strategist".to_string()),
+            Some("missing environment choice".to_string()),
+        )?;
+        graph.set_terminal(
+            ObjectiveStatus::NeedsUser,
+            "missing environment choice".to_string(),
+        )?;
+        graph.reopen_for_user_answer(
+            "goal-answer",
+            "epoch-2",
+            "Answer a question\n\nUser answer: use the local backend",
+        )?;
+        assert_eq!(graph.status, ObjectiveStatus::Running);
+        assert_eq!(graph.active_goal_id.as_deref(), Some("goal-answer"));
+        assert_eq!(graph.nodes[0].epoch_id, "epoch-2");
+        assert_eq!(graph.nodes[0].status, GoalStatus::Planning);
+        graph.validate()?;
+        Ok(())
+    }
+
+    #[test]
     fn final_review_blocker_child_promotion_is_idempotent() -> Result<()> {
         let policy = ObjectivePolicy::rolling_default();
         let mut graph = ObjectiveGraph::new(
@@ -6609,6 +7138,28 @@ mod epoch_tests {
         )?;
         assert_eq!(started.sequence, 0);
         assert_eq!(completed.previous_hash, attached.event_hash);
+        let reopened = store.append_objective_event(
+            "objective-1",
+            "user-answer:epoch-2",
+            ObjectiveEventKind::UserAnswerAccepted,
+            json!({
+                "goal_id": "goal-1",
+                "epoch_id": "epoch-2",
+                "answer": "use the local backend"
+            }),
+        )?;
+        assert_eq!(reopened.previous_hash, completed.event_hash);
+        let resumed_goal = store.append_objective_event(
+            "objective-1",
+            "goal-outcome:goal-1:epoch-2",
+            ObjectiveEventKind::GoalOutcomeRecorded,
+            json!({
+                "goal_id": "goal-1",
+                "epoch_id": "epoch-2",
+                "receipt_hash": "receipt-2"
+            }),
+        )?;
+        assert_eq!(resumed_goal.previous_hash, reopened.event_hash);
         assert!(
             store
                 .append_objective_event(
@@ -6889,6 +7440,7 @@ mod plan_wave_tests {
     use super::*;
     use crate::plan_graph::{PlanGraph, PlanSource};
     use crate::state::Scope;
+    use std::collections::HashMap;
 
     fn two_task_plan() -> Result<PlanGraph> {
         let scope = Scope::new(vec!["src".to_string()], vec![".git".to_string()], 4);
@@ -6912,6 +7464,53 @@ mod plan_wave_tests {
             None,
             draft,
         )
+    }
+
+    #[test]
+    fn worker_step_evidence_rejects_out_of_order_completion() -> Result<()> {
+        let plan = two_task_plan()?;
+        let mut ledger = PlanNodeRunLedger::from_plan("goal-wave", "epoch-1", &plan)?;
+        let node = ledger.node_mut("task_003")?;
+        node.execution_steps = vec![
+            PlanStepRun {
+                step_id: "step-1".to_string(),
+                action: "inspect".to_string(),
+                expected_observation: "source is understood".to_string(),
+                evidence_path: None,
+                status: PlanStepRunStatus::Pending,
+                error: None,
+                updated_at: timestamp(),
+            },
+            PlanStepRun {
+                step_id: "step-2".to_string(),
+                action: "edit".to_string(),
+                expected_observation: "bounded change is applied".to_string(),
+                evidence_path: None,
+                status: PlanStepRunStatus::Pending,
+                error: None,
+                updated_at: timestamp(),
+            },
+        ];
+
+        let error = node
+            .apply_worker_step_evidence(&["step-2".to_string()], &HashMap::new())
+            .expect_err("a worker must not skip the first ordered step");
+        assert!(error.to_string().contains("skipped ordered execution step"));
+        assert!(
+            node.execution_steps
+                .iter()
+                .all(|step| step.status == PlanStepRunStatus::Pending)
+        );
+
+        assert!(
+            node.apply_worker_step_evidence(&["step-1".to_string()], &HashMap::new())?
+                .contains(&"step-2".to_string())
+        );
+        assert!(
+            node.apply_worker_step_evidence(&["step-2".to_string()], &HashMap::new())?
+                .is_empty()
+        );
+        Ok(())
     }
 
     #[test]
@@ -7013,6 +7612,97 @@ mod plan_wave_tests {
     }
 
     #[test]
+    fn failed_plan_nodes_requeue_for_continuation_without_losing_evidence() -> Result<()> {
+        let plan = two_task_plan()?;
+        let mut ledger = PlanNodeRunLedger::from_plan("goal-wave", "epoch-1", &plan)?;
+        let node = ledger.node_mut("task_003")?;
+        node.attempt = 2;
+        node.status = PlanNodeRunStatus::Failed;
+        node.worker_task_id = Some("worker-failed".to_string());
+        node.error = Some("worker exited non-zero".to_string());
+        node.preflight_path = Some("artifacts/old-preflight.md".to_string());
+        node.preflight_satisfied = true;
+        node.preflight_checks = vec![PlanPreflightCheck {
+            check_id: "scope_check".to_string(),
+            description: "old attempt".to_string(),
+            passed: true,
+            failure: None,
+        }];
+
+        let requeued = ledger.requeue_failed_for_resume();
+        assert_eq!(requeued, vec!["task_003".to_string()]);
+        let node = ledger.node_mut("task_003")?;
+        assert_eq!(node.status, PlanNodeRunStatus::Pending);
+        assert_eq!(node.attempt, 2);
+        assert_eq!(node.worker_task_id.as_deref(), Some("worker-failed"));
+        assert_eq!(node.error.as_deref(), Some("worker exited non-zero"));
+        assert!(!node.preflight_satisfied);
+        assert!(node.preflight_path.is_none());
+        assert!(node.preflight_checks.is_empty());
+        ledger.validate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn failed_plan_nodes_rebind_to_new_resume_epoch_without_losing_attempts() -> Result<()> {
+        let plan = two_task_plan()?;
+        let mut ledger = PlanNodeRunLedger::from_plan("goal-wave", "epoch-1", &plan)?;
+        let node = ledger.node_mut("task_003")?;
+        node.attempt = 1;
+        node.status = PlanNodeRunStatus::Failed;
+        node.error = Some("first epoch failed".to_string());
+
+        ledger.rebind_epoch_for_resume("epoch-2");
+        let requeued = ledger.requeue_failed_for_resume();
+        assert_eq!(requeued, vec!["task_003".to_string()]);
+        assert_eq!(ledger.epoch_id, "epoch-2");
+        assert!(ledger.nodes.iter().all(|node| node.epoch_id == "epoch-2"));
+        assert_eq!(ledger.node_mut("task_003")?.attempt, 1);
+        ledger.validate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn qa_evidence_requires_every_declared_scenario_on_current_attempt() -> Result<()> {
+        let plan = two_task_plan()?;
+        let mut ledger = PlanNodeRunLedger::from_plan("goal-wave", "epoch-1", &plan)?;
+        let task = &plan.draft.tasks[0];
+        let node = ledger.node_mut(&task.task_id)?;
+        node.attempt = 1;
+        node.status = PlanNodeRunStatus::Reviewed;
+        assert!(!node.all_qa_passed(task));
+        for (kind, scenario) in task
+            .qa
+            .happy_path
+            .iter()
+            .map(|scenario| ("happy", scenario))
+            .chain(
+                task.qa
+                    .failure_path
+                    .iter()
+                    .map(|scenario| ("failure", scenario)),
+            )
+            .chain(
+                task.qa
+                    .adversarial_path
+                    .iter()
+                    .map(|scenario| ("adversarial", scenario)),
+            )
+        {
+            let criterion = format!("qa:{kind}:{}", scenario.name);
+            node.record_criterion_evidence(
+                &criterion,
+                CriterionEvidenceStatus::Pass,
+                1,
+                "artifacts/qa.md",
+                "sha-qa",
+            )?;
+        }
+        assert!(node.all_qa_passed(task));
+        Ok(())
+    }
+
+    #[test]
     fn criterion_evidence_rejects_rewrites_and_workspace_escape() -> Result<()> {
         let mut evidence = PlanCriterionEvidence::seal(
             "compile",
@@ -7045,12 +7735,29 @@ mod plan_wave_tests {
             attempt: 1,
             dependencies: Vec::new(),
             status: PlanNodeRunStatus::Implemented,
+            preflight_path: None,
+            preflight_satisfied: false,
+            preflight_checks: Vec::new(),
+            execution_steps: Vec::new(),
+            worker_result_path: None,
+            worker_outcome_path: None,
+            worker_last_message_path: None,
+            worker_changed_files: Vec::new(),
+            worker_commands_run: Vec::new(),
+            worker_known_failures: Vec::new(),
+            worker_next_steps: Vec::new(),
+            worker_plan_gap: None,
+            worker_decision: PlanWorkOrderDecision::NotRecorded,
+            worker_decision_reason: None,
+            worker_evidence_quality: WorkerEvidenceQuality::Unclassified,
             worker_task_id: None,
             implementation_task_id: None,
             review_task_id: None,
             red_evidence_path: None,
             green_evidence_paths: Vec::new(),
             review_evidence_path: None,
+            commit_boundary_evidence_path: None,
+            commit_boundary_satisfied: None,
             error: None,
             criterion_evidence: Vec::new(),
             updated_at: timestamp(),
@@ -7397,7 +8104,9 @@ mod plan_wave_tests {
             .file_name()
             .context("repository observation path has no filename")?
             .len();
-        assert!(filename_length < 255);
+        // Atomic writes replace `.json` with a timestamped `.tmp-*` suffix;
+        // leave enough room for that suffix on filesystems with NAME_MAX=255.
+        assert!(filename_length <= 220);
         assert!(
             store
                 .read_repository_observation_receipt_for_task(

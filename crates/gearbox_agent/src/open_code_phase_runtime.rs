@@ -196,24 +196,40 @@ struct OpenCodePhaseOutput {
 }
 
 fn read_phase_output(result: &WorkerResult) -> Result<(String, Option<String>)> {
-    let output_path = result
+    let mut output_paths = Vec::new();
+    if let Some(path) = result
         .last_message_path
         .as_ref()
         .filter(|path| path.is_file())
-        .or_else(|| result.stdout_path.as_ref().filter(|path| path.is_file()));
-    let raw_output = output_path
-        .map(std::fs::read_to_string)
-        .transpose()?
-        .unwrap_or_else(|| result.summary.clone())
-        .trim()
-        .to_string();
-    if raw_output.is_empty() {
+    {
+        output_paths.push(path.clone());
+    }
+    if let Some(path) = result.stdout_path.as_ref().filter(|path| path.is_file()) {
+        output_paths.push(path.clone());
+    }
+    if let Some(parent) = result.result_path.parent() {
+        for artifact in ["transcript.jsonl", "partial-output.md"] {
+            let path = parent.join(artifact);
+            if path.is_file() {
+                output_paths.push(path);
+            }
+        }
+    }
+    for path in output_paths {
+        let raw_output = std::fs::read_to_string(&path)?;
+        let extracted = extract_worker_text_events(&raw_output);
+        if !extracted.trim().is_empty() {
+            return Ok((
+                extracted.trim().to_string(),
+                Some(path.to_string_lossy().to_string()),
+            ));
+        }
+    }
+    let summary = result.summary.trim();
+    if summary.is_empty() {
         bail!("OpenCode phase returned an empty response");
     }
-    Ok((
-        extract_worker_text_events(&raw_output),
-        output_path.map(|path| path.to_string_lossy().to_string()),
-    ))
+    Ok((summary.to_string(), None))
 }
 
 /// OpenCode's JSON formatter emits one event per line and puts the model's
@@ -227,28 +243,43 @@ fn extract_worker_text_events(raw_output: &str) -> String {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
-        if let Some(part_text) = value
-            .get("part")
-            .and_then(|part| part.get("text"))
-            .and_then(serde_json::Value::as_str)
-        {
-            found_event = true;
-            text.push_str(part_text);
-            continue;
-        }
-        if let Some(output) = value
-            .get("worker_stdout")
-            .and_then(|event| event.get("output"))
-            .and_then(serde_json::Value::as_str)
-        {
-            found_event = true;
-            text.push_str(output);
-        }
+        append_worker_text_event(&value, &mut text, &mut found_event, 0);
     }
     if found_event {
         text.trim().to_string()
     } else {
         raw_output.to_string()
+    }
+}
+
+fn append_worker_text_event(
+    value: &serde_json::Value,
+    text: &mut String,
+    found_event: &mut bool,
+    depth: usize,
+) {
+    if depth > 4 {
+        return;
+    }
+    if let Some(part_text) = value
+        .get("part")
+        .and_then(|part| part.get("text"))
+        .and_then(serde_json::Value::as_str)
+    {
+        *found_event = true;
+        text.push_str(part_text);
+    }
+    for (container, key) in [("worker_stdout", "output"), ("assistant_text_delta", "delta")]
+    {
+        if let Some(nested) = value
+            .get(container)
+            .and_then(|event| event.get(key))
+            .and_then(serde_json::Value::as_str)
+        {
+            if let Ok(nested_value) = serde_json::from_str::<serde_json::Value>(nested) {
+                append_worker_text_event(&nested_value, text, found_event, depth + 1);
+            }
+        }
     }
 }
 
@@ -1283,7 +1314,7 @@ fn gear_opencode_review_repair_prompt(
     attempt: usize,
 ) -> Result<String> {
     Ok(format!(
-        "You are the same Gear {role} reviewer on bounded fresh repair turn {attempt}. Output ONLY one JSON object. Do not use `status`, `verdict` at the top level, `goal_id`, `plan_id`, `revision`, `plan_hash`, or an object/map for `checks`. `checks` MUST be an array of exactly seven objects. Convert the previous answer into this exact skeleton, preserving its meaning: {{\"schema_version\":1,\"reviewed_goal_id\":\"{goal}\",\"reviewed_plan_id\":\"{plan}\",\"reviewed_plan_revision\":{revision},\"reviewed_plan_hash\":\"{hash}\",\"reviewed_planner_execution_id\":\"{planner}\",\"decision\":\"approve|revise|reject\",\"checks\":[{{\"dimension\":\"references\",\"verdict\":\"pass|fail\",\"summary\":\"...\",\"evidence_refs\":[]}}],\"findings\":[],\"revision_instructions\":null,\"needs_user_reason\":null,\"summary\":\"...\"}}. Each finding severity is only `blocking` or `advisory`; each check verdict is only `pass` or `fail`.\n\nRust parse error:\n{error}\n\nPrevious invalid output:\n{raw_output}",
+        "You are the same Gear {role} reviewer on bounded fresh repair turn {attempt}. Output ONLY one JSON object. Do not use `status`, `verdict` at the top level, `goal_id`, `plan_id`, `revision`, `plan_hash`, or an object/map for `checks`. `checks` MUST be an array of exactly seven objects. `evidence_refs` is allowed only inside each check; never put it at the verdict or finding top level. Every finding MUST use the typed fields `dimension`, `severity`, `code`, `task_id`, `path`, `message`, and `required_change`; do not use OMO's alternate `summary`/`evidence_refs` finding shape. Convert the previous answer into this exact skeleton, preserving its meaning: {{\"schema_version\":1,\"reviewed_goal_id\":\"{goal}\",\"reviewed_plan_id\":\"{plan}\",\"reviewed_plan_revision\":{revision},\"reviewed_plan_hash\":\"{hash}\",\"reviewed_planner_execution_id\":\"{planner}\",\"decision\":\"approve|revise|reject\",\"checks\":[{{\"dimension\":\"references\",\"verdict\":\"pass|fail\",\"summary\":\"...\",\"evidence_refs\":[]}}],\"findings\":[{{\"dimension\":\"scope\",\"severity\":\"blocking|advisory\",\"code\":\"scope_contradiction\",\"task_id\":null,\"path\":null,\"message\":\"...\",\"required_change\":\"...\"}}],\"revision_instructions\":null,\"needs_user_reason\":null,\"summary\":\"...\"}}. Each finding severity is only `blocking` or `advisory`; each check verdict is only `pass` or `fail`.\n\nRust parse error:\n{error}\n\nPrevious invalid output:\n{raw_output}",
         goal = input.plan.goal_id,
         plan = input.plan.plan_id,
         revision = input.plan.revision,
@@ -1331,7 +1362,7 @@ fn gear_opencode_planner_prompt(input: &PlannerInput) -> Result<String> {
         })
         .unwrap_or_else(|| "none".to_string());
     Ok(format!(
-        "You are Gear's read-only planner. Return exactly one PlanGraphDraft JSON object with no markdown fence or prose. The top-level `objective` string is mandatory; never omit it. Do not rename fields, replace arrays with strings or objects, or use prose values for enums. The complete nested contract exemplar is below; copy its shapes and use only the enum values shown. Every task must define task_id, title, goal, deliverable, dependencies, parallel_wave, scope, required_capabilities, preferred_phase_profile, must_do, must_not_do, references, test, qa, artifacts, commit_boundary, and completion_predicates. Dependencies must point to earlier waves. TDD tasks must use the same RED and GREEN command. Include happy and failure QA evidence paths. Treat the sealed repository discovery findings and IntentFold receipt as binding context: preserve discovered constraints, cite relevant paths, mitigate risks, and turn acceptance signals into executable checks. Do not write code.\n\nSchema exemplar:\n{}\n\nGoal:\n{}\n\nRepository discovery (must precede planning):\n{}\n\nIntentFold receipt:\n{}\n\nScope:\n{}\n\nVerification commands:\n{}",
+        "You are Gear's read-only planner. Return exactly one PlanGraphDraft JSON object with no markdown fence or prose. The top-level `objective` string is mandatory; never omit it. Do not rename fields, replace arrays with strings or objects, or use prose values for enums. The complete nested contract exemplar is below; copy its shapes and use only the enum values shown. Every task must define task_id, title, goal, deliverable, rationale, approach, already_in_working_tree, still_needed, dependencies, parallel_wave, scope, required_capabilities, preferred_phase_profile, inputs, preconditions, must_do, execution_steps, must_not_do, references, test, qa, artifacts, evidence, rollback, budget, commit_boundary, commit_message, and completion_predicates. `rationale` is the concrete WHY from OMO; `approach` is an ordered bounded HOW, not a second list of generic must_do items. `already_in_working_tree` must state concrete facts already present before this work order; `still_needed` must contain only the independently verifiable remainder, matching OMO's work-order format. One task must represent one independently verifiable objective; split unrelated behavior, review, documentation, and cleanup into separate work orders even when they touch nearby files. `inputs` and `preconditions` are checked before editing; `execution_steps` must be ordered and each step must include step_id, action, expected_observation, and optional evidence_path; the executor must stop on an unmet step instead of skipping ahead or redesigning the plan. `evidence` records observable proof obligations separately from changed-file deliverables. `rollback` describes the bounded recovery action and `budget` gives optional task limits; neither may be omitted when the task has irreversible or expensive work. `commit_message` is optional for no-commit tasks, but when present it must be a concrete OMO-style commit intent; Gear never commits or pushes automatically. Dependencies must point to earlier waves. TDD tasks must use the same RED and GREEN command. Include concrete happy, failure, and adversarial QA scenarios; when adversarial behavior does not apply, record an explicit not-applicable trigger check and evidence path. Treat the sealed repository discovery findings and IntentFold receipt as binding context: preserve discovered constraints, cite relevant paths, mitigate risks, and turn acceptance signals into executable checks. Do not write code.\n\nSchema exemplar:\n{}\n\nGoal:\n{}\n\nRepository discovery (must precede planning):\n{}\n\nIntentFold receipt:\n{}\n\nScope:\n{}\n\nVerification commands:\n{}",
         PLAN_GRAPH_SCHEMA_EXEMPLAR,
         input.request,
         repository_discovery,
@@ -1481,7 +1512,7 @@ fn gear_opencode_plan_critic_prompt(input: &PlanCriticInput) -> Result<String> {
         "phase_route_decision": input.route_decision,
     }))?;
     Ok(format!(
-        "You are Gear's independent read-only PlanCritic. Return exactly one PlanCriticVerdict JSON object and no markdown fence. It must bind the exact goal, plan, revision, hash, and planner execution. Return exactly seven checks: references, executability, contradictions, scope, tdd, qa, acceptance. Approve only if all checks and deterministic verification pass. Revise must include blocking findings and concrete revision_instructions. Reject is only for a user decision and must set needs_user_reason.\n\nEvidence:\n{evidence}"
+        "You are Gear's independent read-only PlanCritic. Return exactly one PlanCriticVerdict JSON object and no markdown fence. Use this exact top-level shape: {{\"schema_version\":1,\"reviewed_goal_id\":\"...\",\"reviewed_plan_id\":\"...\",\"reviewed_plan_revision\":0,\"reviewed_plan_hash\":\"...\",\"reviewed_planner_execution_id\":\"...\",\"decision\":\"approve|revise|reject\",\"checks\":[{{\"dimension\":\"references\",\"verdict\":\"pass|fail\",\"summary\":\"...\",\"evidence_refs\":[]}}],\"findings\":[{{\"dimension\":\"scope\",\"severity\":\"blocking|advisory\",\"code\":\"...\",\"task_id\":null,\"path\":null,\"message\":\"...\",\"required_change\":null}}],\"revision_instructions\":null,\"needs_user_reason\":null,\"summary\":\"...\"}}. `checks` must be an array of exactly seven dimensions: references, executability, contradictions, scope, tdd, qa, acceptance. `evidence_refs` belongs only inside checks. Findings must use the typed fields shown; never use a top-level `evidence_refs` or OMO's alternate finding shape. In executability and scope, verify every task is one independently verifiable work order, that `rationale` explains the concrete WHY, `approach` is a bounded HOW, `already_in_working_tree` contains facts rather than planned work, and that `still_needed` is the complete bounded remainder represented by must_do, execution_steps, artifacts, and completion_predicates. Flag tasks that mix implementation, review, documentation, or unrelated cleanup, but treat file boundaries as evidence and risk rather than an artificial exact-file rule. Approve only if all checks and deterministic verification pass. Revise must include blocking findings and concrete revision_instructions. Reject is only for a user decision and must set needs_user_reason.\n\nEvidence:\n{evidence}"
     ))
 }
 
@@ -1494,7 +1525,7 @@ fn gear_opencode_oracle_prompt(input: &PlanCriticInput) -> Result<String> {
         "phase_route_decision": input.route_decision,
     }))?;
     Ok(format!(
-        "You are Gear's independent Oracle, in a fresh read-only session separate from Momus. Re-read the exact plan and inspect every referenced repository path with available read/search tools before deciding. Do not write or edit files and do not trust claims that are not supported by the repository. Return exactly one PlanCriticVerdict JSON object with no markdown fence. Check references, executability, contradictions, scope, tdd, qa, and acceptance. Return at most three actionable blocking findings; approve only when the plan is executable and evidence-backed.\n\nEvidence:\n{evidence}"
+        "You are Gear's independent Oracle, in a fresh read-only session separate from Momus. Re-read the exact plan and inspect every referenced repository path with available read/search tools before deciding. Do not write or edit files and do not trust claims that are not supported by the repository. Return exactly one PlanCriticVerdict JSON object with no markdown fence and use the typed shape from the PlanCritic contract: checks is an array of seven objects with dimension, verdict, summary, evidence_refs; findings use dimension, severity, code, task_id, path, message, required_change. Never put evidence_refs at the verdict or finding top level and never use OMO's alternate status/findings shape. Check references, executability, contradictions, scope, tdd, qa, and acceptance. In executability, verify each task states WHY in `rationale`, HOW in a bounded ordered `approach`, compare `already_in_working_tree` and `still_needed` against repository evidence, and ensure the work order is independently verifiable without silently adding skipped work. Return at most three actionable blocking findings; approve only when the plan is executable and evidence-backed.\n\nEvidence:\n{evidence}"
     ))
 }
 
@@ -1507,7 +1538,7 @@ fn gear_opencode_plan_revision_prompt(input: &PlanRevisionInput) -> Result<Strin
         "phase_route_decision": input.route_decision,
     }))?;
     Ok(format!(
-        "You are Gear's read-only planner revising a rejected plan. Apply every blocking required_change and revision_instructions without expanding scope. Return exactly one complete PlanGraphDraft JSON object and no markdown fence or prose.\n\nEvidence:\n{evidence}"
+        "You are Gear's read-only planner revising a rejected plan. Apply every blocking required_change and revision_instructions without expanding scope. Preserve the plan's OMO work-order semantics: retain accurate `rationale` WHY and bounded `approach` HOW, retain accurate `already_in_working_tree`, rewrite `still_needed` to cover the entire bounded remainder, and keep each task independently verifiable. Do not hide work by moving it into generic must_do prose or by widening file scope. Return exactly one complete PlanGraphDraft JSON object and no markdown fence or prose.\n\nEvidence:\n{evidence}"
     ))
 }
 
@@ -1570,6 +1601,21 @@ mod tests {
     use crate::plan_graph::PLAN_GRAPH_SCHEMA_EXEMPLAR;
     use crate::state::Scope;
     use crate::workers::WorkerRegistry;
+
+    #[test]
+    fn extracts_nested_opencode_text_events_from_transcript_delta() {
+        let model_json = r#"{"objective":"live","tasks":[]}"#;
+        let nested = serde_json::json!({
+            "assistant_text_delta": {
+                "delta": serde_json::json!({
+                    "type": "text",
+                    "part": {"type": "text", "text": model_json}
+                })
+                .to_string()
+            }
+        });
+        assert_eq!(extract_worker_text_events(&nested.to_string()), model_json);
+    }
 
     fn test_worker_config() -> WorkerConfig {
         WorkerConfig {

@@ -3812,6 +3812,15 @@ pub fn worker_prompt(packet: &WorkerPacket) -> Result<String> {
         .map(|append| format!("\n## Route instructions\n\n{}\n", append))
         .unwrap_or_default();
     let model_metadata = worker_model_metadata(packet);
+    let step_report = if packet
+        .required_outputs
+        .iter()
+        .any(|output| output == "completed_steps")
+    {
+        "- completed_steps (one exact step_id per completed ordered step; report only a contiguous prefix and never skip an earlier step)\n- step_evidence (one `step_id: evidence_path` line per completed step)\n"
+    } else {
+        ""
+    };
 
     if packet.inputs.phase_route_locked && packet.inputs.plan_task.is_none() {
         return Ok(format!(
@@ -3865,19 +3874,24 @@ You are a `{}` worker controlled by Gearbox Gear. Treat this packet as the contr
 {}
 
 {}
+{}
 Return a concise report with:
 
 - summary
 - changed_files
 - commands_run
 - known_failures
+- completed_steps
+- step_evidence
 - next_steps
+- plan_gap
 "#,
         packet.worker,
         packet_json,
         model_metadata,
         packet.tools.to_markdown(),
-        prompt_append
+        prompt_append,
+        step_report
     ))
 }
 
@@ -4034,6 +4048,15 @@ struct ParsedWorkerReport {
     changed_files: Vec<String>,
     commands_run: Vec<String>,
     known_failures: Vec<String>,
+    completed_step_ids: Vec<String>,
+    step_evidence: HashMap<String, String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorkerStepEvidenceReport {
+    pub declared: bool,
+    pub completed_step_ids: Vec<String>,
+    pub evidence_by_step: HashMap<String, String>,
 }
 
 fn parsed_worker_report(result: &WorkerResult) -> ParsedWorkerReport {
@@ -4075,6 +4098,73 @@ fn parsed_worker_report(result: &WorkerResult) -> ParsedWorkerReport {
         changed_files: section_list(sections.get("changed_files")),
         commands_run: section_list(sections.get("commands_run")),
         known_failures: section_list(sections.get("known_failures")),
+        completed_step_ids: section_list(sections.get("completed_steps")),
+        step_evidence: section_map(sections.get("step_evidence")),
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerContinuationEvidence {
+    #[serde(default)]
+    pub next_steps: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_gap: Option<String>,
+}
+
+pub fn worker_continuation_evidence_from_result(
+    result: &WorkerResult,
+) -> WorkerContinuationEvidence {
+    WorkerContinuationEvidence {
+        next_steps: section_list_from_result(result, "next_steps"),
+        plan_gap: section_paragraph_from_result(result, "plan_gap"),
+    }
+}
+
+fn section_list_from_result(result: &WorkerResult, name: &str) -> Vec<String> {
+    let text = result
+        .last_message_path
+        .as_ref()
+        .or(result.stdout_path.as_ref())
+        .and_then(|path| fs::read_to_string(path).ok())
+        .unwrap_or_default();
+    let mut in_section = false;
+    let mut values = Vec::new();
+    for line in text.lines() {
+        if let Some(section) = worker_report_section_name(line) {
+            in_section = section == name;
+            continue;
+        }
+        if in_section {
+            let value = line.trim().trim_start_matches(['-', '*', ' ']).trim();
+            if !value.is_empty() {
+                values.push(value.to_string());
+            }
+        }
+    }
+    values
+}
+
+fn section_paragraph_from_result(result: &WorkerResult, name: &str) -> Option<String> {
+    section_list_from_result(result, name).into_iter().next()
+}
+
+/// Parse the worker's explicit ordered-step receipt without making the
+/// free-form worker summary part of the durable runtime state.
+pub fn worker_step_evidence_from_result(result: &WorkerResult) -> WorkerStepEvidenceReport {
+    let parsed = parsed_worker_report(result);
+    let declared = result
+        .last_message_path
+        .as_ref()
+        .or(result.stdout_path.as_ref())
+        .and_then(|path| fs::read_to_string(path).ok())
+        .is_some_and(|text| {
+            text.lines()
+                .any(|line| worker_report_section_name(line) == Some("completed_steps"))
+        });
+    WorkerStepEvidenceReport {
+        declared,
+        completed_step_ids: parsed.completed_step_ids,
+        evidence_by_step: parsed.step_evidence,
     }
 }
 
@@ -4093,8 +4183,30 @@ fn worker_report_section_name(line: &str) -> Option<&'static str> {
         "changed_files" => Some("changed_files"),
         "commands_run" => Some("commands_run"),
         "known_failures" => Some("known_failures"),
+        "next_steps" => Some("next_steps"),
+        "plan_gap" => Some("plan_gap"),
+        "completed_steps" => Some("completed_steps"),
+        "step_evidence" => Some("step_evidence"),
         _ => None,
     }
+}
+
+fn section_map(lines: Option<&Vec<String>>) -> HashMap<String, String> {
+    lines
+        .into_iter()
+        .flat_map(|lines| lines.iter())
+        .filter_map(|line| {
+            let (step_id, evidence) = line.split_once(':')?;
+            let step_id = step_id
+                .trim()
+                .trim_start_matches('-')
+                .trim()
+                .trim_matches('`')
+                .to_string();
+            let evidence = evidence.trim().trim_matches('`').to_string();
+            (!step_id.is_empty() && !evidence.is_empty()).then_some((step_id, evidence))
+        })
+        .collect()
 }
 
 fn section_paragraph(lines: Option<&Vec<String>>) -> Option<String> {
@@ -4368,6 +4480,44 @@ mod tests {
                 .map_err(anyhow::Error::msg)?;
 
         assert_eq!(validated, receipt.canonicalize()?);
+        Ok(())
+    }
+
+    #[test]
+    fn worker_step_evidence_parser_reads_ordered_ids_and_paths() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let message = workspace.path().join("last-message.md");
+        fs::write(
+            &message,
+            "# completed_steps\n- step-001\n- step-002\n\n# step_evidence\nstep-001: .gear/steps/001.md\nstep-002: .gear/steps/002.md\n",
+        )?;
+        let report = worker_step_evidence_from_result(&evidence_test_result(message));
+        assert!(report.declared);
+        assert_eq!(report.completed_step_ids, ["step-001", "step-002"]);
+        assert_eq!(
+            report.evidence_by_step.get("step-002").map(String::as_str),
+            Some(".gear/steps/002.md")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn worker_continuation_evidence_parser_reads_next_steps_and_plan_gap() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let message = workspace.path().join("last-message.md");
+        fs::write(
+            &message,
+            "# next_steps\n- rerun the focused test\n- inspect the remaining diff\n\n# plan_gap\nThe requested artifact path is not available yet.\n",
+        )?;
+        let evidence = worker_continuation_evidence_from_result(&evidence_test_result(message));
+        assert_eq!(
+            evidence.next_steps,
+            ["rerun the focused test", "inspect the remaining diff"]
+        );
+        assert_eq!(
+            evidence.plan_gap.as_deref(),
+            Some("The requested artifact path is not available yet.")
+        );
         Ok(())
     }
 

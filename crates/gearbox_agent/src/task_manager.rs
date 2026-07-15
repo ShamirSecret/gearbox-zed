@@ -385,7 +385,11 @@ pub struct TaskSnapshot {
     pub messageability: Option<Messageability>,
     pub run_epoch: u64,
     pub notified_epoch: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notification_failed_epoch: Option<u64>,
     pub parent_task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
     pub worker_kind: String,
     pub worker_model: Option<String>,
     pub worker_category: String,
@@ -399,6 +403,18 @@ pub struct TaskSnapshot {
     pub summary_head: String,
     #[serde(default)]
     pub continuation_hint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_command: Option<TaskCommandSnapshot>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskCommandSnapshot {
+    pub action: String,
+    pub accepted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub run_epoch: u64,
+    pub timestamp: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -974,6 +990,33 @@ fn summary_head_for_record(record: &TaskRecord) -> String {
         Some(model_chain) => format!("{summary_head}；模型回退链：{model_chain}"),
         None => summary_head.to_string(),
     }
+}
+
+fn last_task_command_snapshot(record: &TaskRecord) -> Option<TaskCommandSnapshot> {
+    const COMMAND_EVENT_TAIL_BYTES: usize = 16 * 1024;
+    let artifact_dir = record
+        .result_path
+        .as_ref()
+        .or(record.outcome_path.as_ref())
+        .and_then(|path| path.parent())?;
+    let path = artifact_dir.join("task-command-events.jsonl");
+    let bytes = fs::read(path).ok()?;
+    let tail = if bytes.len() > COMMAND_EVENT_TAIL_BYTES {
+        &bytes[bytes.len() - COMMAND_EVENT_TAIL_BYTES..]
+    } else {
+        bytes.as_slice()
+    };
+    String::from_utf8_lossy(tail)
+        .lines()
+        .rev()
+        .find_map(|line| serde_json::from_str::<TaskCommandEvent>(line).ok())
+        .map(|event| TaskCommandSnapshot {
+            action: event.action,
+            accepted: event.accepted,
+            reason: event.reason,
+            run_epoch: event.run_epoch,
+            timestamp: event.timestamp,
+        })
 }
 
 fn fallback_model_chain_for_record(record: &TaskRecord) -> Option<String> {
@@ -4198,6 +4241,7 @@ impl TaskManager {
                 let has_retry_reason = record.retry_reason.is_some();
                 let summary_head = summary_head_for_record(&record);
                 let continuation_hint = continuation_hint_for_record(&record);
+                let last_command = last_task_command_snapshot(&record);
                 TaskSnapshot {
                     task_id: record.task_id,
                     status: record.status,
@@ -4205,7 +4249,9 @@ impl TaskManager {
                     messageability,
                     run_epoch: record.run_epoch,
                     notified_epoch: record.notified_epoch,
+                    notification_failed_epoch: record.notification_failed_epoch,
                     parent_task_id: record.parent_task_id,
+                    parent_session_id: record.parent_session_id,
                     worker_kind: record.worker_kind,
                     worker_model: record.worker_model,
                     worker_category: record.worker_category,
@@ -4248,6 +4294,7 @@ impl TaskManager {
                     retry_reason: record.retry_reason,
                     summary_head,
                     continuation_hint,
+                    last_command,
                 }
             })
             .collect();
@@ -4322,6 +4369,7 @@ impl TaskManager {
                 let has_retry_reason = record.retry_reason.is_some();
                 let summary_head = summary_head_for_record(&record);
                 let continuation_hint = continuation_hint_for_record(&record);
+                let last_command = last_task_command_snapshot(&record);
                 TaskSnapshot {
                     task_id: record.task_id,
                     status: record.status,
@@ -4329,7 +4377,9 @@ impl TaskManager {
                     messageability: None,
                     run_epoch: record.run_epoch,
                     notified_epoch: record.notified_epoch,
+                    notification_failed_epoch: record.notification_failed_epoch,
                     parent_task_id: record.parent_task_id,
+                    parent_session_id: record.parent_session_id,
                     worker_kind: record.worker_kind,
                     worker_model: record.worker_model,
                     worker_category: record.worker_category,
@@ -4371,6 +4421,7 @@ impl TaskManager {
                     continuation_hint,
                     summary: record.summary,
                     retry_reason: record.retry_reason,
+                    last_command,
                 }
             })
             .collect();
@@ -6968,6 +7019,44 @@ mod tests {
                 error: None,
             }],
         }
+    }
+
+    #[test]
+    fn task_snapshot_projects_latest_command_outcome() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let command_path = temp_dir.path().join("task-command-events.jsonl");
+        let first = serde_json::json!({
+            "task_id": "task-command",
+            "action": "follow_up",
+            "accepted": false,
+            "all_scope": false,
+            "caller_session_id": null,
+            "reason": "task is not continuable",
+            "run_epoch": 1,
+            "timestamp": "2026-07-15T00:00:00Z"
+        });
+        let second = serde_json::json!({
+            "task_id": "task-command",
+            "action": "steer",
+            "accepted": true,
+            "all_scope": false,
+            "caller_session_id": null,
+            "reason": null,
+            "run_epoch": 2,
+            "timestamp": "2026-07-15T00:01:00Z"
+        });
+        fs::write(&command_path, format!("{}\n{}\n", first, second))?;
+        let mut record = test_task_record(
+            "task-command",
+            ManagedTaskStatus::Running,
+            TaskAttemptStatus::Running,
+        );
+        record.result_path = Some(temp_dir.path().join("result.json"));
+        let snapshot = last_task_command_snapshot(&record).expect("latest command");
+        assert_eq!(snapshot.action, "steer");
+        assert!(snapshot.accepted);
+        assert_eq!(snapshot.run_epoch, 2);
+        Ok(())
     }
 
     struct StartFailingNativeBackend;
@@ -10480,10 +10569,10 @@ mod tests {
                 residency_state: ResidencyState::Resident,
                 run_epoch: 0,
                 notified_epoch: default_notified_epoch(),
-                notification_failed_epoch: None,
+                notification_failed_epoch: Some(3),
                 killed: false,
                 session_id: Some("session_fake".to_string()),
-                parent_session_id: None,
+                parent_session_id: Some("parent-session".to_string()),
                 root_session_id: None,
                 parent_task_id: None,
                 result_path: Some(PathBuf::from("/tmp/task-result.json")),
@@ -10525,6 +10614,11 @@ mod tests {
         assert_eq!(snapshot.current_output.as_deref(), Some("control-output"));
         assert_eq!(snapshot.tasks.len(), 1);
         assert_eq!(snapshot.tasks[0].task_id, "task_snapshot");
+        assert_eq!(
+            snapshot.tasks[0].parent_session_id.as_deref(),
+            Some("parent-session")
+        );
+        assert_eq!(snapshot.tasks[0].notification_failed_epoch, Some(3));
         assert_eq!(snapshot.tasks[0].attempts.len(), 1);
         assert_eq!(
             snapshot.tasks[0].messageability,

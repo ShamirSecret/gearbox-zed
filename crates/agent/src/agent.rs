@@ -842,14 +842,15 @@ impl NativeAgent {
         telemetry_id: SharedString,
         cx: &mut Context<Self>,
     ) -> Entity<AcpThread> {
+        let is_gear_session = agent_id == *GEAR_AGENT_ID;
         let connection = Rc::new(NativeAgentConnection::with_identity(
             cx.entity(),
             agent_id,
             telemetry_id,
         ));
 
+        let session_id = thread_handle.read(cx).id().clone();
         let thread = thread_handle.read(cx);
-        let session_id = thread.id().clone();
         let parent_session_id = thread.parent_thread_id();
         let title = thread.title();
         let draft_prompt = thread.draft_prompt().map(Vec::from);
@@ -911,7 +912,7 @@ impl NativeAgent {
         ];
 
         self.sessions.insert(
-            session_id,
+            session_id.clone(),
             Session {
                 thread: thread_handle,
                 acp_thread: acp_thread.clone(),
@@ -932,9 +933,83 @@ impl NativeAgent {
             },
         );
 
+        if is_gear_session
+            && let Some(session) = self.sessions.get(&session_id)
+            && let Ok(workspace) = gear_workspace_for_session(session, self, cx)
+        {
+            self.ensure_gear_runtime_snapshot_task(session_id, workspace, None, cx);
+        }
+
         self.update_available_commands_for_project(project_id, cx);
 
         acp_thread
+    }
+
+    fn ensure_gear_runtime_snapshot_task(
+        &mut self,
+        session_id: acp::SessionId,
+        workspace: PathBuf,
+        task_manager: Option<SharedTaskManager>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            return;
+        };
+        if session.gear_runtime_snapshot_task.is_some() {
+            return;
+        }
+
+        let snapshot_agent = cx.entity().downgrade();
+        let snapshot_workspace = workspace;
+        let snapshot_session_id = session_id.clone();
+        let runtime_snapshot_task = cx.spawn(async move |_this, cx| {
+            loop {
+                let workspace = snapshot_workspace.clone();
+                let session_id = snapshot_session_id.clone();
+                let task_manager = task_manager.clone();
+                let snapshot = cx
+                    .background_spawn(async move {
+                        let task_snapshot = task_manager
+                            .as_ref()
+                            .map(|task_manager| {
+                                task_manager
+                                    .lock()
+                                    .map_err(|_| anyhow!("gear task manager mutex poisoned"))?
+                                    .snapshot()
+                            })
+                            .transpose()?;
+                        gearbox_agent::gui::GearRuntimeSnapshot::from_store(
+                            &StateStore::new(&workspace),
+                            workspace.display().to_string(),
+                            session_id.to_string(),
+                            task_snapshot,
+                        )
+                    })
+                    .await;
+                let update_result = snapshot_agent.update(cx, |agent, cx| {
+                    if let Some(session) = agent.sessions.get_mut(&snapshot_session_id) {
+                        match snapshot {
+                            Ok(snapshot) => {
+                                session.gear_runtime_snapshot = Some(snapshot);
+                                session.gear_runtime_snapshot_error = None;
+                            }
+                            Err(error) => {
+                                session.gear_runtime_snapshot_error =
+                                    Some(gear_truncate_text(&format!("{error:#}"), 1200));
+                            }
+                        }
+                        cx.notify();
+                    }
+                });
+                if update_result.is_err() {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(200))
+                    .await;
+            }
+        });
+        session.gear_runtime_snapshot_task = Some(runtime_snapshot_task);
     }
 
     pub fn models(&self) -> &LanguageModels {
@@ -2554,6 +2629,67 @@ impl NativeAgentConnection {
         Ok(true)
     }
 
+    /// Confirm a durable rollback request without performing an implicit
+    /// workspace mutation. The confirmation is an auditable hand-off to a
+    /// future rollback executor and keeps the current safety boundary explicit.
+    pub fn confirm_gear_rollback(&self, session_id: &acp::SessionId, cx: &App) -> Result<bool> {
+        let workspace = self
+            .agent
+            .read_with(cx, |agent, cx| -> Result<Option<std::path::PathBuf>> {
+                let Some(session) = agent.sessions.get(session_id) else {
+                    return Ok(None);
+                };
+                Ok(Some(gear_workspace_for_session(session, agent, cx)?))
+            })?
+            .context("Gear session not found")?;
+        let store = StateStore::new(&workspace);
+        store.initialize()?;
+        let continuation = store
+            .read_continuation_state_for_session(&session_id.to_string())?
+            .context("Gear session has no continuation goal")?;
+        let epoch_id = store
+            .read_goal_epoch_events(&continuation.goal_id)?
+            .last()
+            .map(|event| event.epoch_id.clone())
+            .context("Gear goal has no durable epoch")?;
+        let artifacts_dir = store.artifact_dir(&continuation.goal_id);
+        let mut rollback_paths = std_fs::read_dir(&artifacts_dir)?
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("plan-rollback-iteration-"))
+            })
+            .collect::<Vec<_>>();
+        rollback_paths.sort();
+        let rollback_path = rollback_paths
+            .pop()
+            .context("Gear has no pending rollback request")?;
+        let confirmation_path = store.write_artifact(
+            &continuation.goal_id,
+            "plan-rollback-confirmed.md",
+            &format!(
+                "# Plan Rollback Confirmation\n\nConfirmed by session `{}`.\n\nRequested artifact: `{}`\n\nNo workspace mutation was performed by this confirmation.\n",
+                session_id,
+                rollback_path.display()
+            ),
+        )?;
+        store.append_goal_epoch_event(
+            &continuation.goal_id,
+            &epoch_id,
+            &format!("{}.plan.rollback.confirmed", epoch_id),
+            gearbox_agent::state::GoalEpochEventKind::PhaseCompleted,
+            serde_json::json!({
+                "phase": "plan_rollback_confirmed",
+                "requested_artifact": rollback_path.to_string_lossy(),
+                "confirmation_artifact": confirmation_path.to_string_lossy(),
+                "automatic": false,
+            }),
+        )?;
+        Ok(true)
+    }
+
     pub fn send_follow_up_gear_task(
         &self,
         session_id: &acp::SessionId,
@@ -3082,55 +3218,13 @@ impl NativeAgentConnection {
             }
         });
 
-        let snapshot_agent = self.agent.downgrade();
-        let snapshot_workspace = workspace.clone();
-        let snapshot_session_id = session_id.clone();
-        let snapshot_task_manager = task_manager.clone();
-        let runtime_snapshot_task = cx.spawn(async move |cx| {
-            loop {
-                let workspace = snapshot_workspace.clone();
-                let session_id = snapshot_session_id.clone();
-                let task_manager = snapshot_task_manager.clone();
-                let snapshot = cx
-                    .background_spawn(async move {
-                        let task_snapshot = task_manager
-                            .lock()
-                            .map_err(|_| anyhow!("gear task manager mutex poisoned"))?
-                            .snapshot()?;
-                        gearbox_agent::gui::GearRuntimeSnapshot::from_store(
-                            &StateStore::new(&workspace),
-                            workspace.display().to_string(),
-                            session_id.to_string(),
-                            Some(task_snapshot),
-                        )
-                    })
-                    .await;
-                let update_result = snapshot_agent.update(cx, |agent, _cx| {
-                    if let Some(session) = agent.sessions.get_mut(&snapshot_session_id) {
-                        match snapshot {
-                            Ok(snapshot) => {
-                                session.gear_runtime_snapshot = Some(snapshot);
-                                session.gear_runtime_snapshot_error = None;
-                            }
-                            Err(error) => {
-                                session.gear_runtime_snapshot_error =
-                                    Some(gear_truncate_text(&format!("{error:#}"), 1200));
-                            }
-                        }
-                    }
-                });
-                if update_result.is_err() {
-                    break;
-                }
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(200))
-                    .await;
-            }
-        });
-        self.agent.update(cx, |agent, _cx| {
-            if let Some(session) = agent.sessions.get_mut(&session_id) {
-                session.gear_runtime_snapshot_task = Some(runtime_snapshot_task);
-            }
+        self.agent.update(cx, |agent, cx| {
+            agent.ensure_gear_runtime_snapshot_task(
+                session_id.clone(),
+                workspace.clone(),
+                Some(task_manager.clone()),
+                cx,
+            );
         });
 
         let (event_tx, event_rx) = async_channel::bounded::<String>(GEAR_GUI_EVENT_BUFFER_CAPACITY);
@@ -3912,12 +4006,19 @@ async fn generate_gear_coordinator_brief(
             LanguageModelRequestMessage {
                 role: Role::System,
                 content: vec![
-                    r#"You are Gear's high-reasoning planner. Do not write code. Return exactly one JSON object and no prose or markdown fences. The object must match this PlanGraphDraft contract:
+                    r#"You are Gear's high-reasoning planner. Do not write code. Return exactly one JSON object and no prose or markdown fences. The object must match this PlanGraphDraft contract. Include evidence-backed findings, adopted assumptions, decisions with rationale, and unresolved open questions in the top-level context fields. For QA, enumerate applicable adversarial trigger classes or record a concrete not-applicable reason with evidence:
 {
   "objective": "string",
+  "assumptions": ["adopted reversible default with rationale"],
+  "findings": ["path:line — verified repository fact"],
+  "decisions": ["decision — rationale"],
+  "open_questions": [],
   "must_have": ["string"],
   "must_not_have": ["string"],
   "topology_lock": ["string"],
+  "preflight": ["baseline and scope check"],
+  "rollback": ["bounded recovery action if verification fails"],
+  "final_verification": ["final verification wave and evidence"],
   "tasks": [{
     "task_id": "ascii_identifier",
     "title": "string",
@@ -3928,7 +4029,11 @@ async fn generate_gear_coordinator_brief(
     "scope": {"allowed_files": ["path"], "forbidden_files": ["path"], "write_scope": ["path"], "max_files_changed": 8},
     "required_capabilities": ["read", "edit", "test"],
     "preferred_phase_profile": "executor_quick|executor_deep|reviewer_task",
+    "inputs": ["path or repository fact to read before editing"],
+    "preconditions": ["observable condition required before starting"],
     "must_do": ["string"],
+    "execution_steps": [{"step_id": "step-001", "action": "string", "expected_observation": "string", "evidence_path": null}],
+    "execution_steps_evidence_required": true,
     "must_not_do": ["string"],
     "references": [{"path": "path", "reason": "string", "symbol": null}],
     "test": {
@@ -3939,15 +4044,19 @@ async fn generate_gear_coordinator_brief(
     },
     "qa": {
       "happy_path": [{"name": "string", "steps": ["string"], "expected_result": "string", "evidence_path": "path"}],
-      "failure_path": [{"name": "string", "steps": ["string"], "expected_result": "string", "evidence_path": "path"}]
+      "failure_path": [{"name": "string", "steps": ["string"], "expected_result": "string", "evidence_path": "path"}],
+      "adversarial_path": [{"name": "trigger class or not-applicable", "steps": ["string"], "expected_result": "observable or explicit not-applicable reason", "evidence_path": "path"}]
     },
     "artifacts": [{"path": "path", "description": "string", "required": true}],
+    "evidence": ["observable proof obligation"],
+    "rollback": ["bounded recovery action for this work order"],
+    "budget": {"max_attempts": 2, "max_commands": 3, "max_duration_seconds": null},
     "commit_boundary": "no_commit|after_task|after_wave",
     "completion_predicates": ["agent-executable predicate"]
   }],
   "final_acceptance": ["agent-executable predicate"]
 }
-Every dependency must reference an earlier wave. Same-wave write scopes must not overlap. TDD requires RED and GREEN to use the same test command. tests_after requires GREEN. none requires no_test_reason. Include both happy and failure QA with evidence paths. Keep cheap executors inside a closed-world contract: do not leave architecture, scope, tests, or acceptance for them to redesign. If a repository fact is unknown, keep the scope conservative and encode the missing fact as a must_do inspection step; never invent a path or symbol."#.into(),
+Before emitting JSON, decompose in this order: (1) derive one observable objective and its must-have/must-not-have boundaries, (2) split the objective into the smallest independently verifiable work orders, (3) connect dependencies and execution waves, and (4) assign each work order its own inputs, preconditions, scope, test, QA, evidence, rollback, budget, artifact, completion predicates, and commit intent. Each work order must have one primary deliverable and be executable by a weaker worker without redesigning the architecture. Do not combine unrelated discovery, implementation, review, or cleanup into one work order. Treat more than 8 explicitly scoped files or more than 12 must_do steps as a signal to split the work order. Every dependency must reference an earlier wave. Same-wave write scopes must not overlap. TDD requires RED and GREEN to use the same test command. tests_after requires GREEN. Include happy, failure, and adversarial QA with evidence paths; when adversarial behavior is not applicable, record a not-applicable trigger check. When a commit is requested, provide a concrete `commit_message`; Gear never commits or pushes automatically. The plan-level preflight, rollback, and final_verification lists are mandatory and must contain concrete, agent-executable evidence steps. Keep cheap executors inside a closed-world contract: do not leave architecture, scope, tests, acceptance, or commit intent for them to redesign. If a repository fact is unknown, keep the scope conservative and encode the missing fact as a must_do inspection step; never invent a path or symbol."#.into(),
                 ],
                 cache: false,
                 reasoning_details: None,
@@ -4079,7 +4188,7 @@ async fn generate_gear_plan_revision(
             LanguageModelRequestMessage {
                 role: Role::System,
                 content: vec![
-                    r#"You are Gear's high-reasoning planner revising a rejected PlanGraphDraft. Do not write code. Apply every blocking PlanCritic required_change and revision_instructions without expanding the original objective. Return exactly one complete PlanGraphDraft JSON object, with the same field contract as current_plan.draft, and no prose or markdown fences. Preserve decision-complete task scope, dependency waves, TDD RED/GREEN commands, happy/failure QA, required artifacts, and decidable acceptance. Do not return a patch."#.into(),
+                    r#"You are Gear's high-reasoning planner revising a rejected PlanGraphDraft. Do not write code. Preserve and repair the top-level findings, assumptions, decisions, and open_questions context while applying every blocking PlanCritic required_change and revision_instructions without expanding the original objective. Re-run the decomposition order: preserve one observable objective, split oversized or multi-deliverable work orders into independently verifiable nodes, then repair dependencies, inputs, preconditions, scopes, ordered execution_steps, tests, QA, evidence, rollback, budget, artifacts, and completion predicates. Each execution step must retain stable identity, one action, one expected observation, and optional evidence; workers must not skip or reorder it. Treat more than 8 explicitly scoped files or more than 12 execution_steps as a split request unless critic evidence proves the node is atomic. Return exactly one complete PlanGraphDraft JSON object, with the same field contract as current_plan.draft, and no prose or markdown fences. Preserve decision-complete task scope, dependency waves, TDD RED/GREEN commands, happy/failure QA, required artifacts, and decidable acceptance. Do not return a patch."#.into(),
                 ],
                 cache: false,
                 reasoning_details: None,
@@ -9357,6 +9466,11 @@ mod internal_tests {
                     .collect::<Vec<_>>()
                     .join("\n");
                 let response = if request_text.contains("Gear's high-reasoning planner") {
+                    assert!(
+                        request_text.contains("decompose in this order")
+                            || request_text.contains("Re-run the decomposition order")
+                    );
+                    assert!(request_text.contains("independently verifiable"));
                     let objective = request
                         .messages
                         .last()
@@ -9620,7 +9734,7 @@ mod internal_tests {
         );
         cx.run_until_parked();
 
-        let gearbox_root = workspace.path().join(".gearbox-agent");
+        let gearbox_root = workspace.path().join(".gear");
         assert!(gearbox_root.join("sessions").is_dir());
         assert!(gearbox_root.join("goals").is_dir());
 
@@ -9740,14 +9854,14 @@ mod internal_tests {
         gear_finished.store(true, Ordering::SeqCst);
         assert_eq!(
             worker_responder.join().unwrap(),
-            3,
-            "Gear should approve the plan, execute one native implementation worker, and run one independent final reviewer"
+            4,
+            "Gear should run planner/PlanCritic/independent Oracle, execute one native implementation worker, and run one final reviewer"
         );
         cx.run_until_parked();
 
         let event_log = events.lock().expect("event log lock");
 
-        let gearbox_root = workspace.path().join(".gearbox-agent");
+        let gearbox_root = workspace.path().join(".gear");
         let _final_report = std::fs::read_dir(gearbox_root.join("artifacts"))
             .unwrap()
             .filter_map(|entry| entry.ok())

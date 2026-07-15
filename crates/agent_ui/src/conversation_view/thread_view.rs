@@ -2199,6 +2199,20 @@ impl ThreadView {
         true
     }
 
+    fn fill_gear_next_question(
+        &mut self,
+        question: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let prompt = format!("Answer to Gear's next-goal question:\n{question}\n\n");
+        self.message_editor.update(cx, |editor, cx| {
+            editor.insert_text(&prompt, window, cx);
+        });
+        self.set_editor_is_expanded(true, cx);
+        cx.notify();
+    }
+
     pub fn cancel_generation(&mut self, cx: &mut Context<Self>) {
         self.thread_retry_status.take();
         self.thread_error.take();
@@ -3686,18 +3700,183 @@ impl ThreadView {
                             .size(LabelSize::XSmall)
                             .color(Color::Muted),
                         )
+                        .when_some(runtime_snapshot.objective.as_ref(), |this, objective| {
+                            this.when(!objective.goal_history.is_empty(), |this| {
+                                this.child(
+                                    v_flex()
+                                        .gap_0p5()
+                                        .p_1()
+                                        .border_b_1()
+                                        .border_color(cx.theme().colors().border)
+                                        .child(
+                                            Label::new(format!(
+                                                "Goal frontier/history · {} entries · active {}",
+                                                objective.goal_history.len(),
+                                                objective.active_goal_id.as_deref().unwrap_or("none")
+                                            ))
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                        )
+                                        .children(objective.goal_history.iter().map(|entry| {
+                                            let parent = entry
+                                                .parent_goal_id
+                                                .as_deref()
+                                                .map(|goal| format!(" · parent {goal}"))
+                                                .unwrap_or_default();
+                                            let terminal_reason = entry
+                                                .terminal_reason
+                                                .as_deref()
+                                                .map(|reason| format!(" · {reason}"))
+                                                .unwrap_or_default();
+                                            Label::new(format!(
+                                                "{} [{}] epoch {}{} · {}{}",
+                                                entry.goal_id,
+                                                entry.status,
+                                                entry.epoch_id,
+                                                parent,
+                                                entry.request,
+                                                terminal_reason,
+                                            ))
+                                            .size(LabelSize::XSmall)
+                                            .color(if objective.active_goal_id.as_deref()
+                                                == Some(entry.goal_id.as_str())
+                                            {
+                                                Color::Accent
+                                            } else {
+                                                Color::Muted
+                                            })
+                                        })),
+                                )
+                            })
+                        })
+                        .when(!runtime_snapshot.lifecycle.phase_routes.is_empty(), |this| {
+                            this.child(
+                                v_flex()
+                                    .gap_0p5()
+                                    .p_1()
+                                    .border_b_1()
+                                    .border_color(cx.theme().colors().border)
+                                    .child(
+                                        Label::new("Phase routes (durable receipts)")
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                                    .children(
+                                        runtime_snapshot
+                                            .lifecycle
+                                            .phase_routes
+                                            .iter()
+                                            .map(|route| {
+                                                h_flex()
+                                                    .gap_1()
+                                                    .child(
+                                                        Label::new(format!(
+                                                            "{} · {} · model {} · candidate {} · fallback {} · {}",
+                                                            route.phase,
+                                                            route.backend,
+                                                            route.model.as_deref().unwrap_or("none"),
+                                                            route.selected_candidate,
+                                                            route.fallback_count,
+                                                            route.source,
+                                                        ))
+                                                        .size(LabelSize::XSmall)
+                                                        .color(Color::Muted),
+                                                    )
+                                                    .child(self.render_gear_artifact_buttons(
+                                                        &format!("gear-route-{}", route.ordinal),
+                                                        None,
+                                                        None,
+                                                        None,
+                                                        route.receipt_path.as_deref(),
+                                                        cx,
+                                                    ))
+                                            }),
+                                    ),
+                            )
+                        })
+                        .when(runtime_snapshot.lifecycle.phase_route_errors > 0, |this| {
+                            this.child(
+                                Label::new(format!(
+                                    "Phase route receipt errors: {}",
+                                    runtime_snapshot.lifecycle.phase_route_errors
+                                ))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Error),
+                            )
+                        })
+                        .when(!runtime_snapshot.lifecycle.broker_sessions.is_empty(), |this| {
+                            this.child(
+                                v_flex()
+                                    .gap_0p5()
+                                    .p_1()
+                                    .border_b_1()
+                                    .border_color(cx.theme().colors().border)
+                                    .child(
+                                        Label::new("Broker sessions (durable lifecycle)")
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                                    .children(runtime_snapshot.lifecycle.broker_sessions.iter().map(
+                                        |session| {
+                                            Label::new(session.clone())
+                                                .size(LabelSize::XSmall)
+                                                .color(if session.ends_with("active") {
+                                                    Color::Accent
+                                                } else {
+                                                    Color::Muted
+                                                })
+                                        },
+                                    )),
+                            )
+                        })
                         .when_some(runtime_snapshot.review.as_ref(), |this, review| {
                             this.child(
                                 Label::new(format!(
-                                    "Review detail: latest {} · epoch events {} · plan revision {:?} · bundle complete {:?}",
+                                    "Review detail: latest {} · epoch events {} · plan revision {:?} · bundle complete {:?} · critic {:?} · oracle {:?}",
                                     review.latest_event.as_deref().unwrap_or("none"),
                                     review.epoch_events,
                                     review.plan_revision,
                                     review.bundle_complete,
+                                    review.critic_decision,
+                                    review.oracle_decision,
                                 ))
                                 .size(LabelSize::XSmall)
                                 .color(Color::Muted),
                             )
+                            .children(review.roles.iter().map(|role| {
+                                Label::new(format!("REVIEW ROLE: {role}"))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted)
+                            }))
+                            .children(review.critic_findings.iter().map(|finding| {
+                                Label::new(format!("Plan critic finding: {finding}"))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Error)
+                            }))
+                            .children(review.blockers.iter().map(|blocker| {
+                                Label::new(format!("Review blocker: {blocker}"))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Warning)
+                            }))
+                            .when_some(review.revision_instructions.as_ref(), |this, instructions| {
+                                this.child(
+                                    Label::new(format!("Plan revision instructions: {instructions}"))
+                                        .size(LabelSize::XSmall)
+                                    .color(Color::Warning),
+                                )
+                            })
+                            .children(review.oracle_findings.iter().map(|finding| {
+                                Label::new(format!("Oracle finding: {finding}"))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Error)
+                            }))
+                            .when_some(review.oracle_revision_instructions.as_ref(), |this, instructions| {
+                                this.child(
+                                    Label::new(format!("Oracle revision instructions: {instructions}"))
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Warning),
+                                )
+                            })
                         })
                         .when(
                             runtime_snapshot.recovery.stuck_reason.is_some()
@@ -3730,6 +3909,75 @@ impl ThreadView {
                                     .color(Color::Muted),
                             )
                         })
+                        .when(
+                            runtime_snapshot.lifecycle.plan_approval_status.is_some()
+                                || runtime_snapshot.lifecycle.plan_final_receipt_status.is_some(),
+                            |this| {
+                                this.child(
+                                    Label::new(format!(
+                                        "Plan approval: {} · revisions {} · critic {} · final {}",
+                                        runtime_snapshot
+                                            .lifecycle
+                                            .plan_approval_status
+                                            .as_deref()
+                                            .unwrap_or("not_recorded"),
+                                        runtime_snapshot.lifecycle.plan_revisions_used,
+                                        runtime_snapshot
+                                            .lifecycle
+                                            .plan_critic_receipt_hash
+                                            .as_deref()
+                                            .map(|hash| hash.get(..12).unwrap_or(hash))
+                                            .unwrap_or("none"),
+                                        runtime_snapshot
+                                            .lifecycle
+                                            .plan_final_receipt_status
+                                            .as_deref()
+                                            .unwrap_or("not_recorded"),
+                                    ))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Accent),
+                                )
+                            },
+                        )
+                        .when(
+                            runtime_snapshot.lifecycle.ownership_delegated.is_some(),
+                            |this| {
+                                this.child(
+                                    Label::new(format!(
+                                        "Execution ownership: delegated={} · worker={} · task={} · reason={}",
+                                        runtime_snapshot
+                                            .lifecycle
+                                            .ownership_delegated
+                                            .unwrap_or(false),
+                                        runtime_snapshot
+                                            .lifecycle
+                                            .ownership_worker_kind
+                                            .as_deref()
+                                            .unwrap_or("none"),
+                                        runtime_snapshot
+                                            .lifecycle
+                                            .ownership_worker_task_id
+                                            .as_deref()
+                                            .unwrap_or("none"),
+                                        runtime_snapshot
+                                            .lifecycle
+                                            .ownership_route_reason
+                                            .as_deref()
+                                            .unwrap_or("none"),
+                                    ))
+                                    .size(LabelSize::XSmall)
+                                    .color(if runtime_snapshot
+                                        .lifecycle
+                                        .ownership_delegated
+                                        == Some(true)
+                                    {
+                                        Color::Success
+                                    } else {
+                                        Color::Error
+                                    }),
+                                )
+                            },
+                        )
                         .when(!runtime_snapshot.plan_tasks.is_empty(), |this| {
                             this.child(
                                 v_flex()
@@ -3739,39 +3987,1018 @@ impl ThreadView {
                                     .border_color(cx.theme().colors().border)
                                     .child(
                                         Label::new(format!(
-                                            "Work Orders · {} · runtime dependency order",
-                                            runtime_snapshot.plan_tasks.len()
+                                            "Work Orders · {}/{} completed · {} · next {}",
+                                            runtime_snapshot.plan_completed,
+                                            runtime_snapshot.plan_total,
+                                            runtime_snapshot.plan_execution_mode,
+                                            runtime_snapshot
+                                                .next_plan_task_id
+                                                .as_deref()
+                                                .unwrap_or("none")
                                         ))
                                         .size(LabelSize::XSmall)
                                         .color(Color::Muted),
                                     )
+                                    .when_some(
+                                        runtime_snapshot.lifecycle.plan_coverage.as_ref(),
+                                        |this, coverage| {
+                                            this.child(
+                                                Label::new(format!(
+                                                    "Plan coverage · work orders {}/{} · acceptance {}/{} · QA {}/{}",
+                                                    coverage.work_orders_completed,
+                                                    coverage.work_orders_total,
+                                                    coverage.acceptance_satisfied,
+                                                    coverage.acceptance_total,
+                                                    coverage.qa_satisfied,
+                                                    coverage.qa_total,
+                                                ))
+                                                .size(LabelSize::XSmall)
+                                                .color(if coverage.acceptance_total > 0
+                                                    && coverage.acceptance_satisfied
+                                                        == coverage.acceptance_total
+                                                {
+                                                    Color::Success
+                                                } else {
+                                                    Color::Muted
+                                                }),
+                                            )
+                                        },
+                                    )
+                                    .when_some(
+                                        runtime_snapshot.lifecycle.plan_revision_diff.as_ref(),
+                                        |this, diff| {
+                                            this.child(
+                                                Label::new(format!(
+                                                    "Plan revision diff · r{} → r{} · +{} / -{} / ~{}{}",
+                                                    diff.from_revision,
+                                                    diff.to_revision,
+                                                    diff.added_tasks.len(),
+                                                    diff.removed_tasks.len(),
+                                                    diff.changed_tasks.len(),
+                                                    if diff.objective_changed {
+                                                        " · objective changed"
+                                                    } else {
+                                                        ""
+                                                    },
+                                                ))
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Warning),
+                                            )
+                                        },
+                                    )
+                                    .when(!runtime_snapshot.lifecycle.plan_must_have.is_empty(), |this| {
+                                        this.child(
+                                            Label::new(format!(
+                                                "Must have: {}",
+                                                runtime_snapshot.lifecycle.plan_must_have.join(" · ")
+                                            ))
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Accent),
+                                        )
+                                    })
+                                    .when(!runtime_snapshot.lifecycle.plan_assumptions.is_empty(), |this| {
+                                        this.child(
+                                            Label::new(format!(
+                                                "Assumptions: {}",
+                                                runtime_snapshot.lifecycle.plan_assumptions.join(" · ")
+                                            ))
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                        )
+                                    })
+                                    .when(!runtime_snapshot.lifecycle.plan_findings.is_empty(), |this| {
+                                        this.child(
+                                            Label::new(format!(
+                                                "Findings: {}",
+                                                runtime_snapshot.lifecycle.plan_findings.join(" · ")
+                                            ))
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                        )
+                                    })
+                                    .when(!runtime_snapshot.lifecycle.plan_decisions.is_empty(), |this| {
+                                        this.child(
+                                            Label::new(format!(
+                                                "Decisions: {}",
+                                                runtime_snapshot.lifecycle.plan_decisions.join(" · ")
+                                            ))
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Accent),
+                                        )
+                                    })
+                                    .when(!runtime_snapshot.lifecycle.plan_open_questions.is_empty(), |this| {
+                                        this.child(
+                                            Label::new(format!(
+                                                "Open questions (approval blocked): {}",
+                                                runtime_snapshot.lifecycle.plan_open_questions.join(" · ")
+                                            ))
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Error),
+                                        )
+                                    })
+                                    .when(!runtime_snapshot.lifecycle.plan_milestones.is_empty(), |this| {
+                                        this.child(
+                                            Label::new(format!(
+                                                "Milestones: {}",
+                                                runtime_snapshot.lifecycle.plan_milestones.join(" · ")
+                                            ))
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Accent),
+                                        )
+                                    })
+                                    .when(!runtime_snapshot.lifecycle.plan_acceptance_checklist.is_empty(), |this| {
+                                        this.child(
+                                            Label::new(format!(
+                                                "Acceptance checklist: {}",
+                                                runtime_snapshot.lifecycle.plan_acceptance_checklist.join(" · ")
+                                            ))
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Accent),
+                                        )
+                                    })
+                                    .when(!runtime_snapshot.lifecycle.plan_must_not_have.is_empty(), |this| {
+                                        this.child(
+                                            Label::new(format!(
+                                                "Must not have: {}",
+                                                runtime_snapshot.lifecycle.plan_must_not_have.join(" · ")
+                                            ))
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Error),
+                                        )
+                                    })
+                                    .when(!runtime_snapshot.lifecycle.plan_topology_lock.is_empty(), |this| {
+                                        this.child(
+                                            Label::new(format!(
+                                                "Topology lock: {}",
+                                                runtime_snapshot.lifecycle.plan_topology_lock.join(" · ")
+                                            ))
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                        )
+                                    })
+                                    .when(!runtime_snapshot.lifecycle.plan_final_acceptance.is_empty(), |this| {
+                                        this.child(
+                                            Label::new(format!(
+                                                "Final acceptance: {}",
+                                                runtime_snapshot.lifecycle.plan_final_acceptance.join(" · ")
+                                            ))
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Accent),
+                                        )
+                                    })
+                                    .when_some(
+                                        runtime_snapshot.next_plan_task_title.as_ref(),
+                                        |this, title| {
+                                            this.child(
+                                                Label::new(format!("Next work order: {title}"))
+                                                    .size(LabelSize::XSmall)
+                                                    .color(Color::Accent),
+                                            )
+                                        },
+                                    )
+                                    .when(
+                                        !runtime_snapshot.lifecycle.plan_preflight.is_empty(),
+                                        |this| {
+                                            this.child(
+                                                Label::new(format!(
+                                                    "Preflight: {}",
+                                                    runtime_snapshot.lifecycle.plan_preflight.join(" · ")
+                                                ))
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted),
+                                            )
+                                        },
+                                    )
+                                    .when(
+                                        !runtime_snapshot.lifecycle.plan_rollback.is_empty(),
+                                        |this| {
+                                            this.child(
+                                                Label::new(format!(
+                                                    "Rollback: {}",
+                                                    runtime_snapshot.lifecycle.plan_rollback.join(" · ")
+                                                ))
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted),
+                                            )
+                                        },
+                                    )
+                                    .when(
+                                        !runtime_snapshot.lifecycle.plan_final_verification.is_empty(),
+                                        |this| {
+                                            this.child(
+                                                Label::new(format!(
+                                                    "Final verification: {}",
+                                                    runtime_snapshot
+                                                        .lifecycle
+                                                        .plan_final_verification
+                                                        .join(" · ")
+                                                ))
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted),
+                                            )
+                                        },
+                                    )
+                                    .when_some(
+                                        runtime_snapshot.lifecycle.plan_artifact_path.as_ref(),
+                                        |this, path| {
+                                            this.child(
+                                                Label::new(format!(
+                                                    "Canonical plan artifact: {path}"
+                                                ))
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted),
+                                            )
+                                        },
+                                    )
+                                    .when(runtime_snapshot.lifecycle.plan_reused, |this| {
+                                        this.child(
+                                            Label::new(
+                                                "Plan resume: reused sealed PlanGraph (no replanning)",
+                                            )
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Success),
+                                        )
+                                    })
+                                    .when_some(
+                                        runtime_snapshot.lifecycle.plan_artifact_status.as_ref(),
+                                        |this, status| {
+                                            this.child(
+                                                Label::new(format!("Plan artifact: {status}"))
+                                                    .size(LabelSize::XSmall)
+                                                    .color(if status == "current" {
+                                                        Color::Success
+                                                    } else {
+                                                        Color::Error
+                                                    }),
+                                            )
+                                        },
+                                    )
+                                    .when(
+                                        runtime_snapshot.lifecycle.visible_plan_revision.is_some(),
+                                        |this| {
+                                            this.child(
+                                                Label::new(format!(
+                                                    "Visible plan: revision {:?} · source {} · candidate {}",
+                                                    runtime_snapshot.lifecycle.visible_plan_revision,
+                                                    runtime_snapshot.lifecycle.visible_plan_source.as_deref().unwrap_or("none"),
+                                                    runtime_snapshot.lifecycle.visible_plan_is_candidate,
+                                                ))
+                                                .size(LabelSize::XSmall)
+                                                .color(if runtime_snapshot.lifecycle.visible_plan_is_candidate {
+                                                    Color::Warning
+                                                } else {
+                                                    Color::Muted
+                                                }),
+                                            )
+                                        },
+                                    )
+                                    .when_some(
+                                        runtime_snapshot.lifecycle.plan_quality_status.as_ref(),
+                                        |this, status| {
+                                            this.child(
+                                                Label::new(format!(
+                                                    "Plan quality gate: {status} · verifier {}",
+                                                    runtime_snapshot
+                                                        .lifecycle
+                                                        .plan_quality_artifact
+                                                        .as_deref()
+                                                        .unwrap_or("none")
+                                                ))
+                                                .size(LabelSize::XSmall)
+                                                .color(if status == "passed" {
+                                                    Color::Success
+                                                } else {
+                                                    Color::Error
+                                                })
+                                            )
+                                            .children(runtime_snapshot.lifecycle.plan_quality_findings.iter().map(
+                                                |finding| {
+                                                    Label::new(format!("Plan quality finding: {finding}"))
+                                                        .size(LabelSize::XSmall)
+                                                        .color(Color::Error)
+                                                },
+                                            ))
+                                        },
+                                    )
+                                    .when_some(
+                                        runtime_snapshot.lifecycle.plan_approval_status.as_ref(),
+                                        |this, status| {
+                                            this.child(
+                                                Label::new(format!(
+                                                    "Plan approval: {status} · revisions {} · critic {} · artifact {}",
+                                                    runtime_snapshot.lifecycle.plan_revisions_used,
+                                                    runtime_snapshot
+                                                        .lifecycle
+                                                        .plan_critic_receipt_hash
+                                                        .as_deref()
+                                                        .unwrap_or("none"),
+                                                    runtime_snapshot
+                                                        .lifecycle
+                                                        .plan_approval_artifact
+                                                        .as_deref()
+                                                        .unwrap_or("none")
+                                                ))
+                                                .size(LabelSize::XSmall)
+                                                .color(if status == "Approved" {
+                                                    Color::Success
+                                                } else {
+                                                    Color::Error
+                                                }),
+                                            )
+                                        },
+                                    )
+                                    .when_some(
+                                        runtime_snapshot.lifecycle.plan_final_receipt_status.as_ref(),
+                                        |this, status| {
+                                            this.child(
+                                                Label::new(format!(
+                                                    "Final verification receipt: {status} · hash {} · artifact {}",
+                                                    runtime_snapshot
+                                                        .lifecycle
+                                                        .plan_final_receipt_hash
+                                                        .as_deref()
+                                                        .unwrap_or("none"),
+                                                    runtime_snapshot
+                                                        .lifecycle
+                                                        .plan_final_receipt_artifact
+                                                        .as_deref()
+                                                        .unwrap_or("none")
+                                                ))
+                                                .size(LabelSize::XSmall)
+                                                .color(if status == "passed" {
+                                                    Color::Success
+                                                } else {
+                                                    Color::Error
+                                                }),
+                                            )
+                                            .children(
+                                                runtime_snapshot
+                                                    .lifecycle
+                                                    .plan_final_checks
+                                                    .iter()
+                                                    .map(|check| {
+                                                        Label::new(format!("FINAL CHECK: {check}"))
+                                                            .size(LabelSize::XSmall)
+                                                            .color(if check.contains(": pass") {
+                                                                Color::Success
+                                                            } else {
+                                                                Color::Error
+                                                            })
+                                                    }),
+                                            )
+                                        },
+                                    )
+                                    .when_some(
+                                        runtime_snapshot.lifecycle.next_goal.as_ref(),
+                                        |this, next_goal| {
+                                            this.child(
+                                                Label::new(format!(
+                                                    "Next goal: {}{}{}",
+                                                    next_goal.decision,
+                                                    next_goal
+                                                        .next_objective
+                                                        .as_deref()
+                                                        .map(|objective| format!(" · {objective}"))
+                                                        .unwrap_or_default(),
+                                                    if next_goal.answerable_now {
+                                                        " · answerable now"
+                                                    } else {
+                                                        ""
+                                                    }
+                                                ))
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Accent),
+                                            )
+                                            .children(next_goal.required_questions.iter().map(
+                                                |question| {
+                                                    Label::new(format!("Question: {question}"))
+                                                        .size(LabelSize::XSmall)
+                                                        .color(Color::Muted)
+                                                },
+                                            ))
+                                            .children(next_goal.acceptance_signals.iter().map(
+                                                |signal| {
+                                                    Label::new(format!("Acceptance: {signal}"))
+                                                        .size(LabelSize::XSmall)
+                                                        .color(Color::Success)
+                                                },
+                                            ))
+                                            .children(next_goal.evidence_refs.iter().map(
+                                                |evidence| {
+                                                    Label::new(format!("Evidence: {evidence}"))
+                                                        .size(LabelSize::XSmall)
+                                                        .color(Color::Muted)
+                                                },
+                                            ))
+                                            .when_some(
+                                                next_goal.required_questions.first(),
+                                                |this, question| {
+                                                    let question = question.clone();
+                                                    this.child(
+                                                        Button::new(
+                                                            "gear-answer-next-question",
+                                                            "Answer next question",
+                                                        )
+                                                        .label_size(LabelSize::XSmall)
+                                                        .on_click(cx.listener(
+                                                            move |this, _, window, cx| {
+                                                                this.fill_gear_next_question(
+                                                                    &question, window, cx,
+                                                                );
+                                                            },
+                                                        )),
+                                                    )
+                                                },
+                                            )
+                                        },
+                                    )
                                     .children(runtime_snapshot.plan_tasks.iter().map(|task| {
-                                        let marker = if task.current { "▶" } else { "·" };
+                                        let selected_task_id = task
+                                            .worker_task_id
+                                            .as_deref()
+                                            .unwrap_or(task.task_id.as_str());
+                                        let selected = self.gear_selected_task_id.as_deref()
+                                            == Some(selected_task_id);
+                                        let marker = if selected {
+                                            "◆"
+                                        } else if task.current {
+                                            "▶"
+                                        } else {
+                                            "·"
+                                        };
                                         let dependencies = if task.dependencies.is_empty() {
                                             "none".to_string()
                                         } else {
                                             task.dependencies.join(", ")
                                         };
-                                        Label::new(format!(
-                                            "{marker} [{}] {} · wave {} · deps {} · {}",
+                                        let blocked_by = if task.dependencies.is_empty() {
+                                            "none".to_string()
+                                        } else {
+                                            task.dependencies
+                                                .iter()
+                                                .map(|dependency| {
+                                                    let status = runtime_snapshot
+                                                        .plan_tasks
+                                                        .iter()
+                                                        .find(|candidate| {
+                                                            candidate.task_id == *dependency
+                                                        })
+                                                        .map(|candidate| candidate.status.as_str())
+                                                        .unwrap_or("not_recorded");
+                                                    format!("{dependency} ({status})")
+                                                })
+                                                .collect::<Vec<_>>()
+                                                .join(", ")
+                                        };
+                                        let current_step = task
+                                            .execution_steps
+                                            .iter()
+                                            .find(|step| {
+                                                !step.status.eq_ignore_ascii_case("Completed")
+                                            })
+                                            .map(|step| {
+                                                format!(
+                                                    " · current-step {} [{}]",
+                                                    step.step_id, step.status
+                                                )
+                                            })
+                                            .unwrap_or_else(|| {
+                                                if task.execution_steps.is_empty() {
+                                                    String::new()
+                                                } else {
+                                                    " · current-step complete".to_string()
+                                                }
+                                            });
+                                        let session = task
+                                            .worker_session_id
+                                            .as_deref()
+                                            .unwrap_or("none");
+                                        let session_lifecycle = task
+                                            .worker_session_status
+                                            .as_deref()
+                                            .map(|status| {
+                                                format!(
+                                                    " · session-status {} · started {} · updated {} · ended {} · elapsed-ms {}",
+                                                    status,
+                                                    task.worker_session_started_at
+                                                        .as_deref()
+                                                        .unwrap_or("none"),
+                                                    task.worker_session_updated_at
+                                                        .as_deref()
+                                                        .unwrap_or("none"),
+                                                    task.worker_session_ended_at
+                                                        .as_deref()
+                                                        .unwrap_or("none"),
+                                                    task.worker_session_elapsed_ms
+                                                        .map(|elapsed| elapsed.to_string())
+                                                        .as_deref()
+                                                        .unwrap_or("none")
+                                                )
+                                            })
+                                            .unwrap_or_default();
+                                        let actual_route = task
+                                            .actual_worker_kind
+                                            .as_deref()
+                                            .map(|kind| {
+                                                format!(
+                                                    " · actual-route {}:{}{}",
+                                                    kind,
+                                                    task.actual_worker_model.as_deref().unwrap_or("default"),
+                                                    task.route_hint
+                                                        .as_deref()
+                                                        .map(|hint| format!(" ({hint})"))
+                                                        .unwrap_or_default()
+                                                )
+                                            })
+                                            .unwrap_or_default();
+                                        let decision = format!(
+                                            " · decision {}{}",
+                                            task.worker_decision,
+                                            task.worker_decision_reason
+                                                .as_deref()
+                                                .map(|reason| format!(" ({reason})"))
+                                                .unwrap_or_default()
+                                        );
+                                        let error = task
+                                            .error
+                                            .as_deref()
+                                            .map(|error| format!(" · blocked: {error}"))
+                                            .unwrap_or_default();
+                                        let routing_brief = task
+                                            .routing_brief_path
+                                            .as_deref()
+                                            .map(|path| format!(" · brief {path}"))
+                                            .unwrap_or_default();
+                                        let preflight = task
+                                            .preflight_path
+                                            .as_deref()
+                                            .map(|path| {
+                                                format!(
+                                                    " · preflight [{}] {path}",
+                                                    if task.preflight_satisfied { "x" } else { "!" }
+                                                )
+                                            })
+                                            .unwrap_or_default();
+                                        let preflight_checks = if task.preflight_checks.is_empty() {
+                                            String::new()
+                                        } else {
+                                            format!(" · checks {}", task.preflight_checks.join(" | "))
+                                        };
+                                        let worker_evidence = if task.worker_evidence_quality
+                                            != "Unclassified"
+                                        {
+                                            format!(
+                                                " · worker-evidence {} result={} outcome={}",
+                                                task.worker_evidence_quality,
+                                                task.worker_result_path.as_deref().unwrap_or("none"),
+                                                task.worker_outcome_path.as_deref().unwrap_or("none")
+                                            )
+                                        } else {
+                                            String::new()
+                                        };
+                                        let evidence = if task.red_evidence_path.is_some()
+                                            || !task.green_evidence_paths.is_empty()
+                                            || task.review_evidence_path.is_some()
+                                            || task.commit_boundary_evidence_path.is_some()
+                                        {
+                                            format!(
+                                                " · evidence red={} green={} review={} commit={} ({:?})",
+                                                task.red_evidence_path.as_deref().unwrap_or("none"),
+                                                task.green_evidence_paths.len(),
+                                                task.review_evidence_path.as_deref().unwrap_or("none"),
+                                                task.commit_boundary_evidence_path.as_deref().unwrap_or("none"),
+                                                task.commit_boundary_satisfied
+                                            )
+                                        } else {
+                                            String::new()
+                                        };
+                                        let recovery_hint = if task.status.eq_ignore_ascii_case("Failed") {
+                                            " · Resume Gear requeues"
+                                        } else {
+                                            ""
+                                        };
+                                        let commit_message = task
+                                            .commit_message
+                                            .as_deref()
+                                            .map(|message| format!(" · commit-msg {message}"))
+                                            .unwrap_or_default();
+                                        let label = Label::new(format!(
+                                            "{marker} [{}] {} · contract {} · role {} · attempt {} · session {}{}{} · wave {} · deps {} · blocked by {} · size {} · risk {} · step-evidence {} · commit {}{}{} · {}{}{}{}{}{}{}{}{}",
                                             task.status,
                                             task.task_id,
+                                            task.contract_status,
+                                            task.role,
+                                            task.attempt,
+                                            session,
+                                            session_lifecycle,
+                                            current_step,
                                             task.parallel_wave,
                                             dependencies,
-                                            task.title
+                                            blocked_by,
+                                            task.size_tier,
+                                            task.risk_tier,
+                                            task.execution_steps_evidence_required,
+                                            task.commit_boundary,
+                                            commit_message,
+                                            worker_evidence,
+                                            task.title,
+                                            error,
+                                            routing_brief,
+                                            preflight,
+                                            evidence,
+                                            preflight_checks,
+                                            actual_route,
+                                            decision,
+                                            recovery_hint
                                         ))
                                         .size(LabelSize::XSmall)
-                                        .color(if task.current {
+                                        .color(if selected || task.current {
                                             Color::Accent
                                         } else {
                                             Color::Muted
-                                        })
-                                    })),
-                            )
-                        })
+                                        });
+                                        let control_task_id = task
+                                            .worker_task_id
+                                            .clone()
+                                            .unwrap_or_else(|| task.task_id.clone());
+                                        h_flex()
+                                            .id(format!("gear-plan-task-{}", task.task_id))
+                                            .w_full()
+                                            .child(label)
+                                            .when(selected, |this| {
+                                                this.child(
+                                                    v_flex()
+                                                        .ml_2()
+                                                        .gap_0p5()
+                                                        .children(
+                                                            (!task.dependencies.is_empty()).then(|| {
+                                                                Label::new(format!(
+                                                                    "BLOCKED BY: {}",
+                                                                    blocked_by
+                                                                ))
+                                                                .size(LabelSize::XSmall)
+                                                                .color(Color::Muted)
+                                                            }),
+                                                        )
+                                                        .children(task.inputs.iter().map(|input| {
+                                                            Label::new(format!("INPUT: {input}"))
+                                                                .size(LabelSize::XSmall)
+                                                                .color(Color::Muted)
+                                                        }))
+                                                        .children(task.preflight_checks.iter().map(|check| {
+                                                            Label::new(format!("PREFLIGHT: {check}"))
+                                                                .size(LabelSize::XSmall)
+                                                                .color(Color::Muted)
+                                                        }))
+                                                        .children(task.preconditions.iter().map(|condition| {
+                                                            Label::new(format!("PRECONDITION: {condition}"))
+                                                                .size(LabelSize::XSmall)
+                                                                .color(Color::Muted)
+                                                        }))
+                                                        .children(task.worker_session_history.iter().map(|session| {
+                                                            Label::new(format!(
+                                                                "SESSION HISTORY: attempt {} · {} · category {} · {} · {}{} · started {} · ended {} · elapsed {}ms · route-fallbacks {}{}",
+                                                                session.attempt,
+                                                                session.worker_kind,
+                                                                session.worker_category.as_deref().unwrap_or("unknown"),
+                                                                session.model_id.as_deref().unwrap_or("default"),
+                                                                session.status,
+                                                                if session.session_id.is_empty() {
+                                                                    String::new()
+                                                                } else {
+                                                                    format!(" · {}", session.session_id)
+                                                                },
+                                                                session.started_at,
+                                                                session.ended_at.as_deref().unwrap_or("active"),
+                                                                session.elapsed_ms
+                                                                    .map(|elapsed| elapsed.to_string())
+                                                                    .as_deref()
+                                                                    .unwrap_or("unknown"),
+                                                                session.route_fallback_count,
+                                                                session
+                                                                    .route_reason
+                                                                    .as_deref()
+                                                                    .map(|reason| format!(" · {reason}"))
+                                                                    .unwrap_or_default(),
+                                                            ))
+                                                            .size(LabelSize::XSmall)
+                                                            .color(Color::Muted)
+                                                        }))
+                                                        .when(task.worker_session_attempt_count > 0, |this| {
+                                                            this.child(
+                                                                Label::new(format!(
+                                                                    "SESSION AGGREGATE: attempts {} · fallbacks {} · elapsed {}ms",
+                                                                    task.worker_session_attempt_count,
+                                                                    task.worker_session_fallback_count,
+                                                                    task.worker_session_elapsed_total_ms
+                                                                        .map(|elapsed| elapsed.to_string())
+                                                                        .as_deref()
+                                                                        .unwrap_or("unknown"),
+                                                                ))
+                                                                .size(LabelSize::XSmall)
+                                                                .color(Color::Accent),
+                                                            )
+                                                        })
+                                                        .when(!task.rationale.is_empty(), |this| {
+                                                            this.child(
+                                                                Label::new(format!("WHY: {}", task.rationale))
+                                                                    .size(LabelSize::XSmall)
+                                                                .color(Color::Accent),
+                                                            )
+                                                        })
+                                                        .when(!task.goal.is_empty(), |this| {
+                                                            this.child(
+                                                                Label::new(format!("GOAL: {}", task.goal))
+                                                                    .size(LabelSize::XSmall)
+                                                                    .color(Color::Accent),
+                                                            )
+                                                        })
+                                                        .when(!task.deliverable.is_empty(), |this| {
+                                                            this.child(
+                                                                Label::new(format!("DELIVERABLE: {}", task.deliverable))
+                                                                    .size(LabelSize::XSmall)
+                                                                    .color(Color::Accent),
+                                                            )
+                                                        })
+                                                        .children(task.approach.iter().map(|step| {
+                                                            Label::new(format!("HOW: {step}"))
+                                                                .size(LabelSize::XSmall)
+                                                                .color(Color::Muted)
+                                                        }))
+                                                        .children(task.already_in_working_tree.iter().map(|fact| {
+                                                            Label::new(format!("ALREADY PRESENT: {fact}"))
+                                                                .size(LabelSize::XSmall)
+                                                                .color(Color::Muted)
+                                                        }))
+                                                        .children(task.still_needed.iter().map(|item| {
+                                                            Label::new(format!("STILL NEEDED: {item}"))
+                                                                .size(LabelSize::XSmall)
+                                                                .color(Color::Muted)
+                                                        }))
+                                                        .child(Label::new(format!(
+                                                            "STEP EVIDENCE REQUIRED: {}",
+                                                            task.execution_steps_evidence_required
+                                                        ))
+                                                        .size(LabelSize::XSmall)
+                                                        .color(Color::Muted))
+                                                        .children(task.execution_steps.iter().map(
+                                                            |step| {
+                                                                Label::new(format!(
+                                                                    "STEP [{}] {}: {} -> {}{}{}",
+                                                                    step.status,
+                                                                    step.step_id,
+                                                                    step.action,
+                                                                    step.expected_observation,
+                                                                    step.evidence_path
+                                                                        .as_deref()
+                                                                        .map(|path| format!(" (evidence: {path})"))
+                                                                        .unwrap_or_default(),
+                                                                    step.error
+                                                                        .as_deref()
+                                                                        .map(|error| format!(" (blocked: {error})"))
+                                                                        .unwrap_or_default()
+                                                                ))
+                                                                .size(LabelSize::XSmall)
+                                                                .color(Color::Accent)
+                                                            },
+                                                        ))
+                                                        .children(
+                                                            task.worker_result_path.iter().map(|path| {
+                                                                Label::new(format!(
+                                                                    "WORKER RESULT [{}]: {path}",
+                                                                    task.worker_evidence_quality
+                                                                ))
+                                                                .size(LabelSize::XSmall)
+                                                                .color(Color::Muted)
+                                                            }),
+                                                        )
+                                                        .children(
+                                                            task.worker_outcome_path.iter().map(|path| {
+                                                                Label::new(format!(
+                                                                    "WORKER OUTCOME: {path}"
+                                                                ))
+                                                                .size(LabelSize::XSmall)
+                                                                .color(Color::Muted)
+                                                            }),
+                                                        )
+                                                        .when_some(
+                                                            task.worker_last_message_excerpt.as_ref(),
+                                                            |this, excerpt| {
+                                                                this.child(
+                                                                    Label::new(format!(
+                                                                        "WORKER FEEDBACK: {excerpt}"
+                                                                    ))
+                                                                    .size(LabelSize::XSmall)
+                                                                    .color(Color::Accent),
+                                                                )
+                                                            },
+                                                        )
+                                                        .children(
+                                                            (!task.worker_changed_files.is_empty()).then(|| {
+                                                                Label::new(format!(
+                                                                    "CHANGED FILES: {}",
+                                                                    task.worker_changed_files.join(", ")
+                                                                ))
+                                                                .size(LabelSize::XSmall)
+                                                                .color(Color::Muted)
+                                                            }),
+                                                        )
+                                                        .children(
+                                                            (!task.worker_commands_run.is_empty()).then(|| {
+                                                                Label::new(format!(
+                                                                    "COMMANDS RUN: {}",
+                                                                    task.worker_commands_run.join(" · ")
+                                                                ))
+                                                                .size(LabelSize::XSmall)
+                                                                .color(Color::Muted)
+                                                            }),
+                                                        )
+                                                        .children(task.worker_next_steps.iter().map(|step| {
+                                                            Label::new(format!("NEXT STEP: {step}"))
+                                                                .size(LabelSize::XSmall)
+                                                                .color(Color::Accent)
+                                                        }))
+                                                        .children(
+                                                            task.worker_plan_gap.iter().map(|gap| {
+                                                                Label::new(format!("PLAN GAP: {gap}"))
+                                                                    .size(LabelSize::XSmall)
+                                                                    .color(Color::Error)
+                                                            }),
+                                                        )
+                                                        .children(
+                                                            task.worker_decision_reason.iter().map(|reason| {
+                                                                Label::new(format!(
+                                                                    "WORK ORDER DECISION: {} — {reason}",
+                                                                    task.worker_decision
+                                                                ))
+                                                                .size(LabelSize::XSmall)
+                                                                .color(if task.worker_decision == "Skipped" {
+                                                                    Color::Warning
+                                                                } else {
+                                                                    Color::Muted
+                                                                })
+                                                            }),
+                                                        )
+                                                        .children(
+                                                            task.worker_known_failures.iter().map(|failure| {
+                                                                Label::new(format!(
+                                                                    "KNOWN FAILURE: {failure}"
+                                                                ))
+                                                                .size(LabelSize::XSmall)
+                                                                .color(Color::Error)
+                                                            }),
+                                                        )
+                                                        .children(task.must_do.iter().map(|item| {
+                                                            Label::new(format!(
+                                                                "MUST [{}]: {item}",
+                                                                task.status
+                                                            ))
+                                                                .size(LabelSize::XSmall)
+                                                                .color(Color::Muted)
+                                                        }))
+                                                        .children(task.evidence.iter().map(|item| {
+                                                            Label::new(format!("EVIDENCE: {item}"))
+                                                                .size(LabelSize::XSmall)
+                                                                .color(Color::Accent)
+                                                        }))
+                                                        .children(task.rollback.iter().map(|item| {
+                                                            Label::new(format!("ROLLBACK: {item}"))
+                                                                .size(LabelSize::XSmall)
+                                                                .color(Color::Muted)
+                                                        }))
+                                                        .when(
+                                                            task.budget.max_attempts.is_some()
+                                                                || task.budget.max_commands.is_some()
+                                                                || task.budget.max_duration_seconds.is_some(),
+                                                            |this| {
+                                                                this.child(
+                                                                    Label::new(format!(
+                                                                        "BUDGET: attempts={} commands={} duration_seconds={}",
+                                                                        task.budget.max_attempts.map_or_else(|| "unbounded".to_string(), |value| value.to_string()),
+                                                                        task.budget.max_commands.map_or_else(|| "unbounded".to_string(), |value| value.to_string()),
+                                                                        task.budget.max_duration_seconds.map_or_else(|| "unbounded".to_string(), |value| value.to_string()),
+                                                                    ))
+                                                                    .size(LabelSize::XSmall)
+                                                                    .color(Color::Muted),
+                                                                )
+                                                            },
+                                                        )
+                                                        .children(task.must_not_do.iter().map(|item| {
+                                                            Label::new(format!("MUST NOT: {item}"))
+                                                                .size(LabelSize::XSmall)
+                                                                .color(Color::Error)
+                                                        }))
+                                                        .children(
+                                                            task.completion_predicates.iter().map(
+                                                                |predicate| {
+                                                                    Label::new(format!(
+                                                                        "DONE WHEN: {predicate}"
+                                                                    ))
+                                                                    .size(LabelSize::XSmall)
+                                                                    .color(Color::Accent)
+                                                                },
+                                                            ),
+                                                        )
+                                                        .children(task.required_capabilities.iter().map(
+                                                            |capability| {
+                                                                Label::new(format!(
+                                                                    "CAPABILITY: {capability}"
+                                                                ))
+                                                                .size(LabelSize::XSmall)
+                                                                .color(Color::Accent)
+                                                            },
+                                                        ))
+                                                        .children(task.references.iter().map(|reference| {
+                                                            Label::new(format!("REFERENCE: {reference}"))
+                                                                .size(LabelSize::XSmall)
+                                                                .color(Color::Muted)
+                                                        }))
+                                                        .children(task.required_artifacts.iter().map(
+                                                            |artifact| {
+                                                                Label::new(format!(
+                                                                    "REQUIRED ARTIFACT: {artifact}"
+                                                                ))
+                                                                .size(LabelSize::XSmall)
+                                                                .color(Color::Accent)
+                                                            },
+                                                        ))
+                                                        .children(task.allowed_files.iter().map(|path| {
+                                                            Label::new(format!("ALLOW: {path}"))
+                                                                .size(LabelSize::XSmall)
+                                                                .color(Color::Muted)
+                                                        }))
+                                                        .children(task.forbidden_files.iter().map(|path| {
+                                                            Label::new(format!("FORBID: {path}"))
+                                                                .size(LabelSize::XSmall)
+                                                                .color(Color::Error)
+                                                        }))
+                                                        .children(task.write_scope.iter().map(|path| {
+                                                            Label::new(format!("WRITE: {path}"))
+                                                                .size(LabelSize::XSmall)
+                                                                .color(Color::Accent)
+                                                        }))
+                                                        .child(Label::new(format!(
+                                                            "MAX FILES CHANGED: {}",
+                                                            task.max_files_changed
+                                                        )))
+                                                )
+                                                .children(
+                                                    std::iter::once(Label::new(format!(
+                                                        "TEST STRATEGY: {}",
+                                                        task.test_strategy
+                                                    )))
+                                                    .chain(task.verification_commands.iter().map(
+                                                        |command| {
+                                                            Label::new(format!("VERIFY: {command}"))
+                                                                .size(LabelSize::XSmall)
+                                                                .color(Color::Muted)
+                                                        },
+                                                    ))
+                                                    .chain(task.qa_scenarios.iter().map(|scenario| {
+                                                        Label::new(format!("QA: {scenario}"))
+                                                            .size(LabelSize::XSmall)
+                                                            .color(Color::Muted)
+                                                    })),
+                                                )
+                                            })
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.gear_selected_task_id =
+                                                    Some(control_task_id.clone());
+                                                cx.notify();
+                                            }))
+                                            })),
+                                    )
+                                    .when(runtime_snapshot.lifecycle.rollback_pending, |this| {
+                                        this.child(
+                                            Button::new("gear-runtime-rollback", "Confirm rollback")
+                                                .label_size(LabelSize::XSmall)
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    if let Some(connection) =
+                                                        this.as_native_connection(cx)
+                                                    {
+                                                        match connection.confirm_gear_rollback(
+                                                            &this.session_id,
+                                                            cx,
+                                                        ) {
+                                                            Ok(result) => {
+                                                                this.gear_last_action_receipt =
+                                                                    Some(format!(
+                                                                        "rollback_confirmed={result}"
+                                                                    ));
+                                                                cx.notify();
+                                                            }
+                                                            Err(error) => {
+                                                                this.handle_thread_error(error, cx)
+                                                            }
+                                                        }
+                                                    }
+                                                })),
+                                        )
+                                    })
+                                })
                         .child(
                             Label::new(format!(
-                                "Health activity {} · children {} · rust {} · telemetry dropped/coalesced {}/{}{}",
+                                "Health activity {} · children {} · rust {} · processes cargo/rustc/analyzer {}/{}/{} · workers opencode/codex {}/{}{}",
                                 runtime_snapshot
                                     .health
                                     .last_activity_at
@@ -3783,9 +5010,14 @@ impl ThreadView {
                                     .rust_work_state
                                     .as_deref()
                                     .unwrap_or("unknown"),
-                                runtime_snapshot.health.dropped_telemetry,
-                                runtime_snapshot.health.coalesced_telemetry,
-                                if runtime_snapshot.health.refresh_required {
+                                runtime_snapshot.health.processes.cargo,
+                                runtime_snapshot.health.processes.rustc,
+                                runtime_snapshot.health.processes.rust_analyzer,
+                                runtime_snapshot.health.processes.opencode,
+                                runtime_snapshot.health.processes.codex,
+                                if runtime_snapshot.health.processes.rust_process_over_limit {
+                                    " · rust process limit exceeded"
+                                } else if runtime_snapshot.health.refresh_required {
                                     " · refresh required"
                                 } else {
                                     ""
@@ -4837,6 +6069,18 @@ impl ThreadView {
                                             )
                                         },
                                     )
+                                    .when_some(
+                                        task.parent_session_id.as_deref(),
+                                        |this, parent_session_id| {
+                                            this.child(dot_divider()).child(
+                                                Label::new(format!(
+                                                    "parent session {parent_session_id}"
+                                                ))
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted),
+                                            )
+                                        },
+                                    )
                                     .child(dot_divider())
                                     .child(
                                         Label::new(format!(
@@ -4863,6 +6107,45 @@ impl ThreadView {
                                         ))
                                         .size(LabelSize::Small)
                                         .color(Color::Muted),
+                                    )
+                                    .when_some(task.notification_failed_epoch, |this, epoch| {
+                                        this.child(dot_divider()).child(
+                                            Label::new(format!(
+                                                "completion notify failed epoch {epoch}"
+                                            ))
+                                            .size(LabelSize::Small)
+                                            .color(Color::Error),
+                                        )
+                                    })
+                                    .when(
+                                        task.notification_failed_epoch.is_none()
+                                            && task.notified_epoch >= 0
+                                            && task.notified_epoch as u64 >= task.run_epoch,
+                                        |this| {
+                                            this.child(dot_divider()).child(
+                                                Label::new(format!(
+                                                    "completion notified epoch {}",
+                                                    task.notified_epoch
+                                                ))
+                                                .size(LabelSize::Small)
+                                                .color(Color::Success),
+                                            )
+                                        },
+                                    )
+                                    .when(
+                                        task.notification_failed_epoch.is_none()
+                                            && (task.notified_epoch < 0
+                                                || (task.notified_epoch as u64) < task.run_epoch),
+                                        |this| {
+                                            this.child(dot_divider()).child(
+                                                Label::new(format!(
+                                                    "completion notify pending epoch {}",
+                                                    task.run_epoch
+                                                ))
+                                                .size(LabelSize::Small)
+                                                .color(Color::Warning),
+                                            )
+                                        },
                                     ),
                             )
                             .child(
@@ -4873,6 +6156,7 @@ impl ThreadView {
                                     task.attempts
                                         .last()
                                         .and_then(|attempt| attempt.route_transform_path.as_ref()),
+                                    None,
                                     cx,
                                 ),
                             )
@@ -4931,6 +6215,30 @@ impl ThreadView {
                                 .color(Color::Muted),
                         )
                     })
+                    .when_some(task.last_command.as_ref(), |this, command| {
+                        this.child(
+                            Label::new(format!(
+                                "Last command: {} · {}{}",
+                                command.action,
+                                if command.accepted {
+                                    "accepted"
+                                } else {
+                                    "rejected"
+                                },
+                                command
+                                    .reason
+                                    .as_deref()
+                                    .map(|reason| format!(" · {reason}"))
+                                    .unwrap_or_default(),
+                            ))
+                            .size(LabelSize::XSmall)
+                            .color(if command.accepted {
+                                Color::Success
+                            } else {
+                                Color::Error
+                            }),
+                        )
+                    })
                     .children(task.attempts.iter().rev().take(2).rev().map(|attempt| {
                         v_flex()
                             .pl_3()
@@ -4973,6 +6281,7 @@ impl ThreadView {
                                         attempt.result_path.as_ref(),
                                         attempt.outcome_path.as_ref(),
                                         attempt.route_transform_path.as_ref(),
+                                        None,
                                         cx,
                                     )),
                             )
@@ -5068,6 +6377,7 @@ impl ThreadView {
         result_path: Option<&std::path::PathBuf>,
         outcome_path: Option<&std::path::PathBuf>,
         route_transform_path: Option<&std::path::PathBuf>,
+        route_receipt_path: Option<&str>,
         _cx: &Context<Self>,
     ) -> impl IntoElement {
         let workspace = self.workspace.clone();
@@ -5177,6 +6487,29 @@ impl ThreadView {
                 let path = path.clone();
                 this.child(
                     Button::new(format!("{id_prefix}-fallback"), "Fallback")
+                        .label_size(LabelSize::XSmall)
+                        .on_click(move |_, window, cx| {
+                            let _ = workspace.update(cx, |workspace, cx| {
+                                workspace
+                                    .open_abs_path(
+                                        path.clone(),
+                                        OpenOptions {
+                                            focus: Some(true),
+                                            ..Default::default()
+                                        },
+                                        window,
+                                        cx,
+                                    )
+                                    .detach_and_log_err(cx);
+                            });
+                        }),
+                )
+            })
+            .when_some(route_receipt_path, |this, path| {
+                let workspace = workspace.clone();
+                let path = std::path::PathBuf::from(path);
+                this.child(
+                    Button::new(format!("{id_prefix}-route"), "Route")
                         .label_size(LabelSize::XSmall)
                         .on_click(move |_, window, cx| {
                             let _ = workspace.update(cx, |workspace, cx| {
