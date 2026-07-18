@@ -70,3 +70,4 @@ openspec/
 .dogfood/
 .gear/
 graphify-out/cache/ast/v0.9.18/
+graphify-out/
