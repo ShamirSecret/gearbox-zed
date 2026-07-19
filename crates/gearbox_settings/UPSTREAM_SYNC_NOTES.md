@@ -360,6 +360,7 @@ The shared changes above are an adapter boundary for `GEARBOX_GUI` native Gear s
 - `crates/agent/src/agent.rs` `[MOD]` (2026-07-12 OpenCode-only phase vertical slice): Gear sessions can opt into qualified Planner/Executor/Reviewer OpenCode model profiles through `GEARBOX_GEAR_OPENCODE_PHASES` and `GEARBOX_GEAR_OPENCODE_*_MODEL`. Planner, PlanCritic, and plan revision then execute as broker-owned `opencode_session` workers with typed session identities and terminal artifacts; ordinary Agent sessions and the legacy direct-model Gear route are unchanged.
 - `crates/agent/src/agent.rs` `[MOD]` (2026-07-12 IntentFold stage): OpenCode phase mode now runs a fresh read-only Metis-style IntentFold session before Planner, persists a hash-bound typed receipt, stops at `NeedsUser` before planning, and binds the accepted fold into the Planner prompt. Legacy direct-model Gear sessions and ordinary Agent sessions are unchanged.
 - `crates/agent/src/agent.rs` `[MOD]` (2026-07-17 WorkerPacket rules parity): Gear's native Zed worker path now reuses `gearbox_agent::workers::discover_workspace_rules`, writes the same scoped rules receipt as command-backed workers, and populates `WorkerPacket`'s `injected_rules`/`rules_injection_path` fields. This remains confined to Gear worker construction; ordinary Agent behavior is unchanged.
+- `crates/agent/src/agent.rs` `[MOD]` (2026-07-18 WorkerPacket step anchor): Gear native worker packet construction now carries the first runnable `current_step_id` into the shared hard prompt contract, matching the command-worker packet and preventing compaction/recovery from silently restarting a work order. Ordinary Agent behavior is unchanged.
 - `crates/agent/src/agent.rs` `[MOD]` (2026-07-12 executable budget ledger): the Gear-only orchestrator call now supplies the optional `RunOptions::budget` field, allowing the Gear runtime to enforce persisted call/token/cost reservations before worker dispatch. Ordinary Agent prompt execution is unchanged.
 - `crates/agent/src/agent.rs` `[MOD]` (2026-07-12 unified phase budget): Gear budget environment parsing now exposes `GEARBOX_GEAR_MAX_CALLS_PER_EPOCH` and aligns token/unknown defaults with the unified IntentFold, Planner, PlanCritic, revision, and worker call ledger. Ordinary Agent sessions remain unchanged.
 - `crates/agent/src/agent.rs` `[MOD]` (2026-07-12 StrategistNextGoal gate): OpenCode phase mode now runs a fresh planner-model strategist session after final review, returning a strict typed next-goal verdict bound to the current goal, epoch, final report, plan, and budget ledger. Direct-model and ordinary Agent sessions remain unchanged.
@@ -897,6 +898,13 @@ The shared changes above are an adapter boundary for `GEARBOX_GUI` native Gear s
 - `crates/gearbox_agent/src/workers.rs` 将付费判定绑定到实际 route model：`opencode-go/*` 即使使用 `WorkerKind::OpencodeSession` 也计入 premium worker budget；免费 OpenCode 模型不计入。`phase_routing` 在 premium budget 为零时拒绝显式付费 route，避免预算门禁在 dispatch 后才失效。
 - skills freshness cache 按 workspace 与 target set 分片，保留跨 task 的 freshness 观察并避免并行 worker 使用不同 scope 时互相覆盖；命令 worker 与 Gear 原生 worker 仍共用同一 receipt 语义。
 - 变更只影响 Gear runtime 的路由、预算和上下文 receipt，不改变上游 Agent 默认行为或 `.omo/**`。
+
+### 2026-07-19 GBX-256 — Epoch identity, scope hard boundary and symlink containment
+
+- `crates/gearbox_agent/src/runtime.rs`：目标 continuation 的 task namespace 绑定 `goal_id::epoch_id`，并在终端 `GoalOutcomeRecorded` 遗留时补齐 objective terminal event；context-pressure 同义摘要统一进入有界恢复。scope drift 不再允许 Review 的 `goal_satisfied=true` 豁免，越界路径或超文件预算只能停在 bounded `Limited`。
+- `crates/gearbox_agent/src/task_manager.rs`：provider session/unavailable/recovery cache 的失效边界加入 `epoch_id`，同一 goal 的新 epoch 不复用旧 broker/provider session。
+- `crates/gearbox_agent/src/tools.rs`：外部 effect admission 通过“最近存在祖先 + 缺失尾部”做 canonical containment，拒绝工作区外 symlink 指向的不存在目标；workspace 无法 canonicalize 时 fail closed。
+- 这些改动属于 Gear runtime 的恢复、安全和证据边界，不改变上游普通 Agent 行为或 `.omo/**`；共享文件列表和策略变化记录于本节，供后续 upstream 冲突解决复核。
 
 ### 2026-07-17 — Upstream sync review through `1d2a4b3f7f`
 

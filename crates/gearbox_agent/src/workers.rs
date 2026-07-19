@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::fmt::{Display, Formatter};
@@ -10,6 +10,7 @@ use std::sync::{
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, bail};
+use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -18,7 +19,116 @@ use crate::state::{
     CoordinatorModel, GlobalProviderCooldown, Scope, StateStore, Task, TaskInputs,
     is_destructive_command, timestamp, write_json,
 };
-use crate::tools::{CancellationToken, run_shell_command_with_env_and_cancellation_and_timeout};
+use crate::tools::{
+    CancellationToken, git_snapshot, run_shell_command_with_env_and_cancellation_and_timeout,
+};
+
+const WORKER_RUNTIME_DEADLINE_SCHEMA_VERSION: u32 = 1;
+const WORKER_RUNTIME_DEADLINE_FILE: &str = "runtime-deadline.json";
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct WorkerRuntimeDeadlineReceipt {
+    schema_version: u32,
+    task_id: String,
+    goal_id: String,
+    epoch_id: String,
+    deadline_at_ms: u64,
+    source: String,
+    recorded_at: String,
+}
+
+fn goal_runtime_deadline(store: &StateStore, goal_id: &str) -> Result<Option<(u64, String)>> {
+    let lease_path = store.goal_run_lease_path(goal_id);
+    let contents = match fs::read_to_string(&lease_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to read goal runtime lease {}", lease_path.display())
+            });
+        }
+    };
+    let lease: crate::state::GoalRunLease = serde_json::from_str(&contents)
+        .with_context(|| format!("failed to parse goal runtime lease {}", lease_path.display()))?;
+    if lease.goal_id != goal_id {
+        bail!(
+            "goal runtime lease {} is bound to {}, expected {}",
+            lease_path.display(),
+            lease.goal_id,
+            goal_id
+        );
+    }
+    let deadline_at_ms = DateTime::parse_from_rfc3339(&lease.expires_at)
+        .with_context(|| format!("goal runtime lease has invalid expires_at: {}", lease.expires_at))?
+        .timestamp_millis();
+    let deadline_at_ms = u64::try_from(deadline_at_ms)
+        .context("goal runtime lease expires_at precedes the Unix epoch")?;
+    Ok(Some((deadline_at_ms, lease.epoch_id)))
+}
+
+fn persist_worker_runtime_deadline(store: &StateStore, task: &Task) -> Result<()> {
+    let Some((deadline_at_ms, epoch_id)) = goal_runtime_deadline(store, &task.goal_id)? else {
+        return Ok(());
+    };
+    let receipt = WorkerRuntimeDeadlineReceipt {
+        schema_version: WORKER_RUNTIME_DEADLINE_SCHEMA_VERSION,
+        task_id: task.id.clone(),
+        goal_id: task.goal_id.clone(),
+        epoch_id,
+        deadline_at_ms,
+        source: store
+            .goal_run_lease_path(&task.goal_id)
+            .to_string_lossy()
+            .to_string(),
+        recorded_at: timestamp(),
+    };
+    store.write_worker_json_atomic(&task.id, WORKER_RUNTIME_DEADLINE_FILE, &receipt)?;
+    Ok(())
+}
+
+fn read_worker_runtime_deadline(store: &StateStore, task_id: &str) -> Result<Option<u64>> {
+    let path = store.worker_dir(task_id).join(WORKER_RUNTIME_DEADLINE_FILE);
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to read worker runtime deadline {}", path.display())
+            });
+        }
+    };
+    let receipt: WorkerRuntimeDeadlineReceipt = serde_json::from_str(&contents)
+        .with_context(|| format!("failed to parse worker runtime deadline {}", path.display()))?;
+    if receipt.schema_version != WORKER_RUNTIME_DEADLINE_SCHEMA_VERSION
+        || receipt.task_id != task_id
+        || receipt.goal_id.trim().is_empty()
+        || receipt.epoch_id.trim().is_empty()
+        || receipt.deadline_at_ms == 0
+    {
+        bail!("worker runtime deadline {} is invalid", path.display());
+    }
+    Ok(Some(receipt.deadline_at_ms))
+}
+
+fn worker_external_timeout(
+    store: &StateStore,
+    task_id: &str,
+    configured_timeout: Option<Duration>,
+) -> Result<Option<Duration>> {
+    let runtime_timeout = read_worker_runtime_deadline(store, task_id)?.map(|deadline_at_ms| {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0);
+        Duration::from_millis(deadline_at_ms.saturating_sub(now_ms).max(1))
+    });
+    Ok(match (configured_timeout, runtime_timeout) {
+        (Some(configured), Some(runtime)) => Some(configured.min(runtime)),
+        (Some(configured), None) => Some(configured),
+        (None, Some(runtime)) => Some(runtime),
+        (None, None) => None,
+    })
+}
 
 /// Create a temporary directory containing `opencode/oh-my-openagent.json`
 /// with OMO plugin settings that must not appear in the native OpenCode config.
@@ -31,19 +141,113 @@ use crate::tools::{CancellationToken, run_shell_command_with_env_and_cancellatio
 /// ## Contents
 ///
 /// ```json
+/// opencode.json:
 /// {
-///   "disabled_mcps": [],
+///   "plugin": ["oh-my-openagent"],
+///   "lsp": false
+/// }
+///
+/// oh-my-openagent.json:
+/// {
+///   "disabled_mcps": ["lsp"],
+///   "model_fallback": false,
+///   "runtime_fallback": false,
 ///   "background_task": { "defaultConcurrency": 2 },
 ///   "team_mode": { "enabled": false, "max_parallel_members": 2 }
 /// }
 /// ```
-pub(crate) fn setup_omo_plugin_config_dir() -> Result<tempfile::TempDir> {
+/// Build the isolated OpenCode config used by command-backed sessions.
+///
+/// Planning, discovery, and review phases are read-only Gear roles. Their
+/// policy must reach OpenCode's actual permission resolver instead of staying
+/// only in the Gear prompt metadata. Read-only phases may use bash for
+/// repository observation (`git`, `xxd`, `wc`, and similar commands), but
+/// common file and git mutation forms are denied. The phase runner also takes
+/// a before/after fingerprint and fails closed if an unlisted mutation gets
+/// through this command-pattern guard.
+pub(crate) fn setup_omo_plugin_config_dir_with_read_only(
+    read_only: bool,
+) -> Result<tempfile::TempDir> {
     let temp_dir = tempfile::tempdir().context("failed to create OMO plugin config temp dir")?;
     let opencode_dir = temp_dir.path().join("opencode");
     fs::create_dir_all(&opencode_dir)
         .with_context(|| format!("failed to create {}/opencode", temp_dir.path().display()))?;
+    let mut opencode_config = json!({
+        "$schema": "https://opencode.ai/config.json",
+        "plugin": ["oh-my-openagent"],
+        "lsp": false,
+    });
+    if read_only {
+        let bash_permissions = [
+            ("*", "allow"),
+            ("* > *", "deny"),
+            ("* >> *", "deny"),
+            ("*tee *", "deny"),
+            ("*touch *", "deny"),
+            ("*mkdir *", "deny"),
+            ("*mktemp *", "deny"),
+            ("*rm *", "deny"),
+            ("*cp *", "deny"),
+            ("*mv *", "deny"),
+            ("*ln *", "deny"),
+            ("*install *", "deny"),
+            ("*truncate *", "deny"),
+            ("*dd *", "deny"),
+            ("*sed -i*", "deny"),
+            ("*perl -i*", "deny"),
+            ("*git add*", "deny"),
+            ("*git commit*", "deny"),
+            ("*git reset*", "deny"),
+            ("*git clean*", "deny"),
+            ("*git checkout --*", "deny"),
+            ("*git restore*", "deny"),
+            ("*git apply*", "deny"),
+            ("*git cherry-pick*", "deny"),
+            ("*git rebase*", "deny"),
+            ("*git merge*", "deny"),
+            ("*chmod *", "deny"),
+            ("*chown *", "deny"),
+            ("*writeFile*", "deny"),
+            ("*appendFile*", "deny"),
+            ("*createWriteStream*", "deny"),
+            ("*copyFile*", "deny"),
+            ("*mkdirSync*", "deny"),
+            ("*rmSync*", "deny"),
+            ("*rmdirSync*", "deny"),
+            ("*unlink*", "deny"),
+            ("*Bun.write*", "deny"),
+        ]
+        .into_iter()
+        .map(|(pattern, action)| (pattern.to_string(), json!(action)))
+        .collect::<serde_json::Map<_, _>>();
+        opencode_config["permission"] = json!({
+            "read": "allow",
+            "list": "allow",
+            "glob": "allow",
+            "grep": "allow",
+            "edit": "deny",
+            "bash": bash_permissions,
+            "task": "deny",
+            "question": "deny",
+            "webfetch": "deny",
+        });
+    }
+    let opencode_config_path = opencode_dir.join("opencode.json");
+    fs::write(
+        &opencode_config_path,
+        serde_json::to_string_pretty(&opencode_config)
+            .context("failed to serialize OpenCode plugin registration")?,
+    )
+    .with_context(|| {
+        format!(
+            "failed to write OpenCode plugin registration to {}",
+            opencode_config_path.display()
+        )
+    })?;
     let config = json!({
-        "disabled_mcps": [],
+        "disabled_mcps": ["lsp"],
+        "model_fallback": false,
+        "runtime_fallback": false,
         "background_task": {
             "defaultConcurrency": 2,
         },
@@ -272,6 +476,82 @@ pub struct WorkerToolPolicy {
     pub can_write: bool,
     pub can_review: bool,
     pub can_explore: bool,
+}
+
+const WORKER_PARAMETER_RESOLUTION_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WorkerParameterState {
+    Configured,
+    Defaulted,
+    Unknown,
+    Invalid,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct WorkerParameterResolution {
+    name: String,
+    state: WorkerParameterState,
+    value_type: String,
+    source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    value_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct WorkerParameterResolutionReceipt {
+    schema_version: u32,
+    task_id: String,
+    worker: String,
+    requested_category: Option<String>,
+    resolved_category: Option<String>,
+    precedence: Vec<String>,
+    parameters: Vec<WorkerParameterResolution>,
+    status: String,
+    errors: Vec<String>,
+    receipt_hash: String,
+    created_at: String,
+}
+
+impl WorkerParameterResolutionReceipt {
+    fn expected_hash(&self) -> Result<String> {
+        let mut payload = self.clone();
+        payload.receipt_hash.clear();
+        Ok(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&payload)?)
+        ))
+    }
+
+    fn seal(mut self) -> Result<Self> {
+        self.receipt_hash.clear();
+        self.receipt_hash = self.expected_hash()?;
+        self.validate()?;
+        Ok(self)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.schema_version != WORKER_PARAMETER_RESOLUTION_SCHEMA_VERSION {
+            bail!("unsupported worker parameter resolution schema");
+        }
+        for (field, value) in [
+            ("task_id", self.task_id.as_str()),
+            ("worker", self.worker.as_str()),
+            ("status", self.status.as_str()),
+            ("created_at", self.created_at.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                bail!("worker parameter resolution {field} cannot be empty");
+            }
+        }
+        if self.receipt_hash != self.expected_hash()? {
+            bail!("worker parameter resolution receipt hash mismatch");
+        }
+        Ok(())
+    }
 }
 
 impl WorkerToolPolicy {
@@ -1821,6 +2101,11 @@ pub fn prompt_model_family(worker_model: Option<&str>, worker: &str) -> String {
 pub struct WorkerPacket {
     pub task_id: String,
     pub worker: String,
+    /// The logical step that this dispatch is allowed to execute.  It is a
+    /// hard prompt contract field so compaction/recovery cannot silently fall
+    /// back to the beginning of the work order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_step_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1866,6 +2151,411 @@ pub struct WorkerPacket {
     pub prompt_capsule_path: Option<String>,
 }
 
+fn parameter_value_hash(value: &str) -> String {
+    format!("{:x}", Sha256::digest(value.as_bytes()))
+}
+
+fn resolve_string_parameter(
+    parameters: &mut Vec<WorkerParameterResolution>,
+    errors: &mut Vec<String>,
+    value: Option<&Value>,
+    name: &str,
+    required: bool,
+    default_source: &str,
+) -> Option<String> {
+    let Some(value) = value else {
+        let state = if required {
+            errors.push(format!("required parameter `{name}` is missing"));
+            WorkerParameterState::Invalid
+        } else {
+            WorkerParameterState::Defaulted
+        };
+        parameters.push(WorkerParameterResolution {
+            name: name.to_string(),
+            state,
+            value_type: "missing".to_string(),
+            source: if required {
+                "dispatch_contract".to_string()
+            } else {
+                default_source.to_string()
+            },
+            value_hash: None,
+            detail: required
+                .then(|| "required field was absent".to_string())
+                .or_else(|| Some(format!("defaulted by {default_source}"))),
+        });
+        return None;
+    };
+    let Some(value) = value.as_str() else {
+        let detail = if value.is_null() {
+            "explicit null is not a valid dispatch parameter".to_string()
+        } else {
+            "parameter must be a string".to_string()
+        };
+        errors.push(format!("{name}: {detail}"));
+        parameters.push(WorkerParameterResolution {
+            name: name.to_string(),
+            state: WorkerParameterState::Invalid,
+            value_type: if value.is_null() {
+                "null".to_string()
+            } else {
+                value_type_name(value).to_string()
+            },
+            source: "caller".to_string(),
+            value_hash: None,
+            detail: Some(detail),
+        });
+        return None;
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        let detail = "empty string is not a valid dispatch parameter".to_string();
+        errors.push(format!("{name}: {detail}"));
+        parameters.push(WorkerParameterResolution {
+            name: name.to_string(),
+            state: WorkerParameterState::Invalid,
+            value_type: "string".to_string(),
+            source: "caller".to_string(),
+            value_hash: None,
+            detail: Some(detail),
+        });
+        return None;
+    }
+    parameters.push(WorkerParameterResolution {
+        name: name.to_string(),
+        state: WorkerParameterState::Configured,
+        value_type: "string".to_string(),
+        source: "caller".to_string(),
+        value_hash: Some(parameter_value_hash(value)),
+        detail: None,
+    });
+    Some(value.to_string())
+}
+
+fn resolve_structural_parameter(
+    parameters: &mut Vec<WorkerParameterResolution>,
+    errors: &mut Vec<String>,
+    value: Option<&Value>,
+    name: &str,
+    expected_type: &str,
+) {
+    let Some(value) = value else {
+        errors.push(format!("required parameter `{name}` is missing"));
+        parameters.push(WorkerParameterResolution {
+            name: name.to_string(),
+            state: WorkerParameterState::Invalid,
+            value_type: "missing".to_string(),
+            source: "dispatch_contract".to_string(),
+            value_hash: None,
+            detail: Some("required field was absent".to_string()),
+        });
+        return;
+    };
+    if value.is_null() || value_type_name(value) != expected_type {
+        let detail = if value.is_null() {
+            "explicit null is not a valid dispatch parameter".to_string()
+        } else {
+            format!("parameter must be {expected_type}")
+        };
+        errors.push(format!("{name}: {detail}"));
+        parameters.push(WorkerParameterResolution {
+            name: name.to_string(),
+            state: WorkerParameterState::Invalid,
+            value_type: value_type_name(value).to_string(),
+            source: "caller".to_string(),
+            value_hash: None,
+            detail: Some(detail),
+        });
+        return;
+    }
+    parameters.push(WorkerParameterResolution {
+        name: name.to_string(),
+        state: WorkerParameterState::Configured,
+        value_type: expected_type.to_string(),
+        source: "caller".to_string(),
+        value_hash: None,
+        detail: None,
+    });
+}
+
+fn validate_tool_policy_parameters(
+    parameters: &mut Vec<WorkerParameterResolution>,
+    errors: &mut Vec<String>,
+    value: Option<&Value>,
+    prefix: &str,
+) {
+    let Some(object) = value.and_then(Value::as_object) else {
+        return;
+    };
+    for field in [
+        "question",
+        "allow_recursive_gear_tasks",
+        "can_write",
+        "can_review",
+        "can_explore",
+    ] {
+        let name = format!("{prefix}.{field}");
+        let Some(value) = object.get(field) else {
+            errors.push(format!("{name}: required boolean field was absent"));
+            parameters.push(WorkerParameterResolution {
+                name,
+                state: WorkerParameterState::Invalid,
+                value_type: "missing".to_string(),
+                source: "dispatch_contract".to_string(),
+                value_hash: None,
+                detail: Some("required boolean field was absent".to_string()),
+            });
+            continue;
+        };
+        if !value.is_boolean() {
+            let detail = if value.is_null() {
+                "explicit null is not a valid boolean".to_string()
+            } else {
+                "parameter must be a boolean".to_string()
+            };
+            errors.push(format!("{name}: {detail}"));
+            parameters.push(WorkerParameterResolution {
+                name,
+                state: WorkerParameterState::Invalid,
+                value_type: value_type_name(value).to_string(),
+                source: "caller".to_string(),
+                value_hash: None,
+                detail: Some(detail),
+            });
+        }
+    }
+}
+
+fn value_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn validate_worker_parameter_value(value: &Value) -> Result<WorkerParameterResolutionReceipt> {
+    let mut parameters = Vec::new();
+    let mut errors = Vec::new();
+    let task_id = resolve_string_parameter(
+        &mut parameters,
+        &mut errors,
+        value.get("task_id"),
+        "task_id",
+        true,
+        "dispatch_contract",
+    );
+    let worker = resolve_string_parameter(
+        &mut parameters,
+        &mut errors,
+        value.get("worker"),
+        "worker",
+        true,
+        "dispatch_contract",
+    );
+    resolve_string_parameter(
+        &mut parameters,
+        &mut errors,
+        value.get("goal"),
+        "goal",
+        true,
+        "dispatch_contract",
+    );
+    resolve_structural_parameter(
+        &mut parameters,
+        &mut errors,
+        value.get("tools"),
+        "tools",
+        "object",
+    );
+    validate_tool_policy_parameters(&mut parameters, &mut errors, value.get("tools"), "tools");
+    resolve_structural_parameter(
+        &mut parameters,
+        &mut errors,
+        value.get("scope"),
+        "scope",
+        "object",
+    );
+    resolve_structural_parameter(
+        &mut parameters,
+        &mut errors,
+        value.get("verification"),
+        "verification",
+        "object",
+    );
+    resolve_structural_parameter(
+        &mut parameters,
+        &mut errors,
+        value.get("stop_conditions"),
+        "stop_conditions",
+        "array",
+    );
+    resolve_structural_parameter(
+        &mut parameters,
+        &mut errors,
+        value.get("category_resolution"),
+        "category_resolution",
+        "object",
+    );
+    resolve_structural_parameter(
+        &mut parameters,
+        &mut errors,
+        value.get("category_resolution_result"),
+        "category_resolution_result",
+        "object",
+    );
+
+    resolve_string_parameter(
+        &mut parameters,
+        &mut errors,
+        value.get("worker_model"),
+        "worker_model",
+        false,
+        "provider_default",
+    );
+    let configured_variant = resolve_string_parameter(
+        &mut parameters,
+        &mut errors,
+        value.get("variant"),
+        "variant",
+        false,
+        "provider_default",
+    );
+    resolve_string_parameter(
+        &mut parameters,
+        &mut errors,
+        value.get("prompt_append"),
+        "prompt_append",
+        false,
+        "category_default",
+    );
+    let applied_variant = value.get("variant_applied");
+    if configured_variant.is_some() && applied_variant.is_none() {
+        parameters.push(WorkerParameterResolution {
+            name: "variant_applied".to_string(),
+            state: WorkerParameterState::Unknown,
+            value_type: "missing".to_string(),
+            source: "provider_runtime".to_string(),
+            value_hash: None,
+            detail: Some("configured variant has no observed applied value".to_string()),
+        });
+    } else {
+        resolve_string_parameter(
+            &mut parameters,
+            &mut errors,
+            applied_variant,
+            "variant_applied",
+            false,
+            "provider_default",
+        );
+    }
+
+    if let (Some(configured_variant), Some(applied_variant)) = (
+        configured_variant.as_deref(),
+        applied_variant.and_then(Value::as_str),
+    ) && !configured_variant.eq_ignore_ascii_case(applied_variant)
+        && applied_variant != "none"
+    {
+        errors.push(format!(
+            "variant conflict: configured `{configured_variant}` but applied `{applied_variant}`"
+        ));
+    }
+    if let (Some(tools), Some(category_resolution)) = (
+        value.get("tools").and_then(Value::as_object),
+        value
+            .get("category_resolution")
+            .and_then(Value::as_object),
+    ) && category_resolution.get("tools") != Some(&Value::Object(tools.clone()))
+    {
+        errors.push(
+            "tool policy conflict: packet tools differ from category resolution tools".to_string(),
+        );
+    }
+    if value
+        .get("tools")
+        .and_then(|tools| tools.get("allow_recursive_gear_tasks"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        errors.push(
+            "recursive Gear task dispatch is not allowed from a worker packet".to_string(),
+        );
+    }
+
+    let category_resolution_result = value
+        .get("category_resolution_result")
+        .and_then(Value::as_object);
+    let category_result_variant = category_resolution_result
+        .and_then(|object| object.keys().next())
+        .map(ToString::to_string);
+    let requested_category = category_resolution_result
+        .and_then(|object| object.values().next())
+        .and_then(Value::as_object)
+        .and_then(|object| object.get("requested_category"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let configured_route = value
+        .get("category_resolution")
+        .and_then(Value::as_object)
+        .and_then(|object| object.get("fallback_chain"))
+        .and_then(Value::as_array)
+        .is_some_and(|routes| !routes.is_empty());
+    let has_fallback_route = value
+        .get("category_resolution")
+        .and_then(Value::as_object)
+        .and_then(|object| object.get("nearest_fallback"))
+        .is_some_and(|route| !route.is_null());
+    let mut precedence = vec![if requested_category.is_some() {
+        "explicit_route_hint".to_string()
+    } else {
+        "default_category".to_string()
+    }];
+    precedence.push(if configured_route {
+        "configured_category_route".to_string()
+    } else {
+        "default_worker_route".to_string()
+    });
+    if has_fallback_route {
+        precedence.push("fallback_route".to_string());
+    }
+    if category_result_variant.as_deref() == Some("model_unavailable") {
+        precedence.push("model_unavailable_blocker".to_string());
+    }
+    let status = if !errors.is_empty() {
+        "invalid"
+    } else if parameters
+        .iter()
+        .any(|parameter| parameter.state == WorkerParameterState::Unknown)
+    {
+        "unknown"
+    } else {
+        "resolved"
+    };
+    WorkerParameterResolutionReceipt {
+        schema_version: WORKER_PARAMETER_RESOLUTION_SCHEMA_VERSION,
+        task_id: task_id.unwrap_or_else(|| "<invalid>".to_string()),
+        worker: worker.unwrap_or_else(|| "<invalid>".to_string()),
+        requested_category: requested_category.clone(),
+        resolved_category: (category_result_variant.as_deref() == Some("resolved"))
+            .then(|| requested_category.clone())
+            .flatten(),
+        precedence,
+        parameters,
+        status: status.to_string(),
+        errors,
+        receipt_hash: String::new(),
+        created_at: timestamp(),
+    }
+    .seal()
+}
+
+fn validate_worker_packet_parameters(packet: &WorkerPacket) -> Result<WorkerParameterResolutionReceipt> {
+    validate_worker_parameter_value(&serde_json::to_value(packet)?)
+}
+
 const RULE_INJECTION_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1874,7 +2564,13 @@ struct RuleInjectionEntry {
     real_path: String,
     content_hash: String,
     bytes: usize,
+    #[serde(default)]
+    modified_at_ms: u128,
     distance: usize,
+    #[serde(default)]
+    precedence: usize,
+    #[serde(default)]
+    match_reason: String,
     freshness: String,
     injected: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1889,6 +2585,10 @@ struct RuleInjectionReceipt {
     target_paths: Vec<String>,
     entries: Vec<RuleInjectionEntry>,
     errors: Vec<String>,
+    #[serde(default)]
+    context_conflict: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_conflict_reason: Option<String>,
     injected_content_hash: String,
     receipt_hash: String,
     created_at: String,
@@ -1904,6 +2604,10 @@ struct SkillInjectionEntry {
     bytes: usize,
     modified_at_ms: u128,
     distance: usize,
+    #[serde(default)]
+    precedence: usize,
+    #[serde(default)]
+    match_reason: String,
     freshness: String,
     injected: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1915,6 +2619,10 @@ struct SkillInjectionReceipt {
     schema_version: u32,
     task_id: String,
     workspace: String,
+    #[serde(default)]
+    worker: String,
+    #[serde(default)]
+    worker_category: String,
     target_paths: Vec<String>,
     cache_key: String,
     cache_hit: bool,
@@ -2233,6 +2941,399 @@ pub struct WorkerOutcome {
     pub raw_output_path: Option<PathBuf>,
     pub command: Option<String>,
     pub exit_code: Option<i32>,
+}
+
+/// Reconciles a child worker's self-reported changed-file claim with the
+/// repository observation captured after its turn.  A worker claim is never
+/// treated as proof by itself: missing claims remain `unverified`, while an
+/// explicit claim for a file that did not change is a discrepancy that must be
+/// repaired or independently reviewed.
+pub const WORKER_CLAIM_RECONCILIATION_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkerClaimReconciliationReceipt {
+    pub schema_version: u32,
+    pub task_id: String,
+    pub workspace: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub claimed_changed_files: Vec<String>,
+    pub observed_changed_files: Vec<String>,
+    pub missing_claims: Vec<String>,
+    pub unclaimed_changes: Vec<String>,
+    pub observed_diff_hash: Option<String>,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub receipt_hash: String,
+    pub created_at: String,
+}
+
+impl WorkerClaimReconciliationReceipt {
+    fn expected_hash(&self) -> Result<String> {
+        let mut payload = self.clone();
+        payload.receipt_hash.clear();
+        Ok(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&payload)?)
+        ))
+    }
+
+    fn seal(mut self) -> Result<Self> {
+        self.receipt_hash.clear();
+        self.receipt_hash = self.expected_hash()?;
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != WORKER_CLAIM_RECONCILIATION_SCHEMA_VERSION {
+            bail!("unsupported worker claim reconciliation schema");
+        }
+        if self.task_id.trim().is_empty() || self.workspace.trim().is_empty() {
+            bail!("worker claim reconciliation identity cannot be empty");
+        }
+        if !matches!(self.status.as_str(), "reconciled" | "discrepancy" | "unverified") {
+            bail!("unknown worker claim reconciliation status `{}`", self.status);
+        }
+        if self.receipt_hash != self.expected_hash()? {
+            bail!("worker claim reconciliation receipt hash mismatch");
+        }
+        Ok(())
+    }
+}
+
+fn worker_workspace(store: &StateStore) -> PathBuf {
+    store
+        .root()
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| store.root().to_path_buf())
+}
+
+fn normalize_claim_path(workspace: &Path, raw_path: &str) -> String {
+    let trimmed = raw_path
+        .trim()
+        .trim_matches(['`', '"', '\'', ',', ';']);
+    let candidate = Path::new(trimmed);
+    let relative = if candidate.is_absolute() {
+        candidate
+            .strip_prefix(workspace)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|_| candidate.to_path_buf())
+    } else {
+        candidate.to_path_buf()
+    };
+    relative
+        .to_string_lossy()
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .to_string()
+}
+
+/// Persist the reconciliation between a worker report and the observed
+/// repository state.  The comparison intentionally does not infer that every
+/// observed path belongs to this worker because the runtime may start with
+/// user-owned dirty files; the immutable baseline/scope gate remains the
+/// authority for that attribution.
+pub fn reconcile_worker_claims(
+    store: &StateStore,
+    task_id: &str,
+    result: &WorkerResult,
+    outcome: &WorkerOutcome,
+) -> Result<WorkerClaimReconciliationReceipt> {
+    let workspace = worker_workspace(store);
+    let workspace_for_paths = workspace.canonicalize().unwrap_or_else(|_| workspace.clone());
+    let parsed_report = parsed_worker_report(result);
+    let mut claimed_changed_files = parsed_report
+        .changed_files
+        .iter()
+        .map(|path| normalize_claim_path(&workspace_for_paths, path))
+        .filter(|path| !path.is_empty() && !path.starts_with(".gear/"))
+        .collect::<Vec<_>>();
+    claimed_changed_files.sort();
+    claimed_changed_files.dedup();
+
+    let snapshot = git_snapshot(&workspace);
+    let (observed_changed_files, observed_diff_hash, status, missing_claims, unclaimed_changes, reason) =
+        match snapshot {
+            Ok(snapshot) if snapshot.is_git_repo => {
+                let mut observed = snapshot
+                    .changed_files
+                    .iter()
+                    .map(|path| normalize_claim_path(&workspace_for_paths, path))
+                    .filter(|path| !path.is_empty() && !path.starts_with(".gear/"))
+                    .collect::<Vec<_>>();
+                observed.sort();
+                observed.dedup();
+                let observed_set = observed.iter().collect::<HashSet<_>>();
+                let claimed_set = claimed_changed_files.iter().collect::<HashSet<_>>();
+                let missing = claimed_changed_files
+                    .iter()
+                    .filter(|path| !observed_set.contains(path))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let unclaimed = observed
+                    .iter()
+                    .filter(|path| !claimed_set.contains(path))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let (status, reason) = if !missing.is_empty() {
+                    (
+                        "discrepancy",
+                        Some("worker claimed files that were absent from the repository observation"),
+                    )
+                } else if claimed_changed_files.is_empty() && !observed.is_empty() {
+                    (
+                        "unverified",
+                        Some("worker changed files were observed but the worker report declared no file claims"),
+                    )
+                } else {
+                    ("reconciled", None)
+                };
+                (
+                    observed,
+                    snapshot.diff_hash,
+                    status.to_string(),
+                    missing,
+                    unclaimed,
+                    reason.map(str::to_string),
+                )
+            }
+            Ok(_) => (
+                Vec::new(),
+                None,
+                "unverified".to_string(),
+                Vec::new(),
+                Vec::new(),
+                Some("workspace is not a Git repository".to_string()),
+            ),
+            Err(error) => (
+                Vec::new(),
+                None,
+                "unverified".to_string(),
+                Vec::new(),
+                Vec::new(),
+                Some(format!("repository observation failed: {error:#}")),
+            ),
+        };
+
+    let receipt = WorkerClaimReconciliationReceipt {
+        schema_version: WORKER_CLAIM_RECONCILIATION_SCHEMA_VERSION,
+        task_id: task_id.to_string(),
+        workspace: workspace.to_string_lossy().to_string(),
+        session_id: outcome.session_id.clone(),
+        claimed_changed_files,
+        observed_changed_files,
+        missing_claims,
+        unclaimed_changes,
+        observed_diff_hash,
+        status,
+        reason,
+        receipt_hash: String::new(),
+        created_at: timestamp(),
+    }
+    .seal()?;
+    store.write_worker_json_atomic(task_id, "claim-reconciliation.json", &receipt)?;
+    Ok(receipt)
+}
+
+pub fn worker_claim_reconciliation_path(result: &WorkerResult) -> Option<PathBuf> {
+    result
+        .result_path
+        .parent()
+        .map(|parent| parent.join("claim-reconciliation.json"))
+}
+
+const TEAM_SESSION_RECONCILIATION_SCHEMA_VERSION: u32 = 1;
+
+/// Durable boundary for OMO team/session semantics. Gear currently runs with
+/// team mode disabled, but provider transcripts can still contain team-shaped
+/// events.  Those events must be classified instead of being silently treated
+/// as a usable single-worker result.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TeamSessionReconciliationReceipt {
+    pub schema_version: u32,
+    pub task_id: String,
+    pub workspace: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub team_mode_enabled: bool,
+    pub observed_team_events: usize,
+    pub orphan_events: usize,
+    pub member_error_events: usize,
+    pub undelivered_message_events: usize,
+    pub reorderable_message_events: usize,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub receipt_hash: String,
+    pub created_at: String,
+}
+
+impl TeamSessionReconciliationReceipt {
+    fn expected_hash(&self) -> Result<String> {
+        let mut payload = self.clone();
+        payload.receipt_hash.clear();
+        Ok(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&payload)?)
+        ))
+    }
+
+    fn seal(mut self) -> Result<Self> {
+        self.receipt_hash.clear();
+        self.receipt_hash = self.expected_hash()?;
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != TEAM_SESSION_RECONCILIATION_SCHEMA_VERSION {
+            bail!("unsupported team-session reconciliation schema");
+        }
+        if self.task_id.trim().is_empty() || self.workspace.trim().is_empty() {
+            bail!("team-session reconciliation identity cannot be empty");
+        }
+        if !matches!(self.status.as_str(), "disabled" | "reconciled" | "degraded" | "blocked")
+        {
+            bail!("unknown team-session reconciliation status `{}`", self.status);
+        }
+        if self.reorderable_message_events > self.undelivered_message_events {
+            bail!("reorderable messages cannot exceed undelivered messages");
+        }
+        if self.receipt_hash != self.expected_hash()? {
+            bail!("team-session reconciliation receipt hash mismatch");
+        }
+        Ok(())
+    }
+}
+
+fn event_has_key(value: &Value, keys: &[&str]) -> bool {
+    match value {
+        Value::Object(object) => object.iter().any(|(key, child)| {
+            let normalized = key
+                .chars()
+                .filter(|character| character.is_ascii_alphanumeric())
+                .collect::<String>()
+                .to_ascii_lowercase();
+            keys.iter().any(|candidate| normalized == *candidate)
+                || (normalized == "event"
+                    && child.as_str().is_some_and(|event_name| {
+                        let normalized_event = event_name
+                            .chars()
+                            .filter(|character| character.is_ascii_alphanumeric())
+                            .collect::<String>()
+                            .to_ascii_lowercase();
+                        keys.iter().any(|candidate| normalized_event == *candidate)
+                    }))
+                || event_has_key(child, keys)
+        }),
+        Value::Array(values) => values.iter().any(|child| event_has_key(child, keys)),
+        Value::String(string) => {
+            let normalized = string
+                .chars()
+                .filter(|character| character.is_ascii_alphanumeric())
+                .collect::<String>()
+                .to_ascii_lowercase();
+            keys.iter().any(|candidate| normalized == *candidate)
+        }
+        _ => false,
+    }
+}
+
+fn reconcile_team_session(
+    store: &StateStore,
+    task_id: &str,
+    outcome: &WorkerOutcome,
+) -> Result<TeamSessionReconciliationReceipt> {
+    let workspace = worker_workspace(store);
+    let transcript_path = store.worker_dir(task_id).join("transcript.jsonl");
+    let mut observed_team_events = 0;
+    let mut orphan_events = 0;
+    let mut member_error_events = 0;
+    let mut undelivered_message_events = 0;
+    let mut reorderable_message_events = 0;
+    let mut malformed_lines = 0;
+
+    if let Ok(transcript) = fs::read_to_string(&transcript_path) {
+        for line in transcript.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            let Ok(value) = serde_json::from_str::<Value>(line) else {
+                malformed_lines += 1;
+                continue;
+            };
+            let team_event = event_has_key(
+                &value,
+                &["teamrunid", "teamrun", "memberid", "membername", "teammember"],
+            );
+            if !team_event {
+                continue;
+            }
+            observed_team_events += 1;
+            if event_has_key(&value, &["orphan", "leaderdeleted", "leadmissing"]) {
+                orphan_events += 1;
+            }
+            if event_has_key(&value, &["membererror", "memberfailed", "memberfailure"]) {
+                member_error_events += 1;
+            }
+            if event_has_key(
+                &value,
+                &["undelivered", "deliveryfailed", "messagenotdelivered"],
+            ) {
+                undelivered_message_events += 1;
+                if event_has_key(&value, &["reorderable", "safe_reorder", "retryable"]) {
+                    reorderable_message_events += 1;
+                }
+            }
+        }
+    } else if transcript_path.exists() {
+        malformed_lines += 1;
+    }
+
+    let status = if observed_team_events == 0 {
+        if malformed_lines > 0 {
+            "degraded"
+        } else {
+            "disabled"
+        }
+    } else if observed_team_events > 0 {
+        "blocked"
+    } else {
+        "reconciled"
+    };
+    let reason = if observed_team_events > 0 {
+        Some("team-shaped session events were observed while Gear team mode is disabled".to_string())
+    } else if malformed_lines > 0 {
+        Some("team-session transcript contained malformed event lines".to_string())
+    } else {
+        Some("team mode disabled; no team/session events observed".to_string())
+    };
+    let receipt = TeamSessionReconciliationReceipt {
+        schema_version: TEAM_SESSION_RECONCILIATION_SCHEMA_VERSION,
+        task_id: task_id.to_string(),
+        workspace: workspace.to_string_lossy().to_string(),
+        session_id: outcome.session_id.clone(),
+        team_mode_enabled: false,
+        observed_team_events,
+        orphan_events,
+        member_error_events,
+        undelivered_message_events,
+        reorderable_message_events,
+        status: status.to_string(),
+        reason,
+        receipt_hash: String::new(),
+        created_at: timestamp(),
+    }
+    .seal()?;
+    store.write_worker_json_atomic(task_id, "team-session-reconciliation.json", &receipt)?;
+    Ok(receipt)
+}
+
+pub fn team_session_reconciliation_path(result: &WorkerResult) -> Option<PathBuf> {
+    result
+        .result_path
+        .parent()
+        .map(|parent| parent.join("team-session-reconciliation.json"))
 }
 
 pub const RESIDENT_SESSION_DESCRIPTOR_SCHEMA_VERSION: u32 = 1;
@@ -3635,6 +4736,8 @@ pub fn discover_workspace_rules(
     });
     let mut seen_real_paths = std::collections::HashSet::new();
     let mut seen_content_hashes = std::collections::HashSet::new();
+    let mut directive_values = HashMap::<(usize, String), String>::new();
+    let mut conflict_reasons = Vec::new();
     let mut entries = Vec::new();
     let mut injected_sections = Vec::new();
     for (path, real_path, distance, omission) in candidates {
@@ -3648,7 +4751,10 @@ pub fn discover_workspace_rules(
                 real_path: String::new(),
                 content_hash: String::new(),
                 bytes: 0,
+                modified_at_ms: 0,
                 distance,
+                precedence: distance,
+                match_reason: "walk_up".to_string(),
                 freshness: "unavailable".to_string(),
                 injected: false,
                 omission_reason: omission,
@@ -3662,7 +4768,10 @@ pub fn discover_workspace_rules(
                 real_path: real_path_string,
                 content_hash: String::new(),
                 bytes: 0,
+                modified_at_ms: 0,
                 distance,
+                precedence: distance,
+                match_reason: "walk_up".to_string(),
                 freshness: "duplicate_realpath".to_string(),
                 injected: false,
                 omission_reason: Some("duplicate realpath".to_string()),
@@ -3675,7 +4784,10 @@ pub fn discover_workspace_rules(
                 real_path: real_path_string,
                 content_hash: String::new(),
                 bytes: 0,
+                modified_at_ms: 0,
                 distance,
+                precedence: distance,
+                match_reason: "walk_up".to_string(),
                 freshness: "unavailable".to_string(),
                 injected: false,
                 omission_reason: Some("not a regular file".to_string()),
@@ -3691,7 +4803,10 @@ pub fn discover_workspace_rules(
                     real_path: real_path_string,
                     content_hash: String::new(),
                     bytes: 0,
+                    modified_at_ms: 0,
                     distance,
+                    precedence: distance,
+                    match_reason: "walk_up".to_string(),
                     freshness: "unavailable".to_string(),
                     injected: false,
                     omission_reason: Some("read failed".to_string()),
@@ -3700,13 +4815,31 @@ pub fn discover_workspace_rules(
             }
         };
         let content_hash = prompt_content_hash(&content);
+        let modified_at_ms = fs::metadata(&real_path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |duration| duration.as_millis());
+        for (key, value) in rule_directives(&content) {
+            let identity = (distance, key.clone());
+            if let Some(previous) = directive_values.insert(identity, value.clone())
+                && previous != value
+            {
+                conflict_reasons.push(format!(
+                    "same-layer rule directive `{key}` has conflicting values `{previous}` and `{value}`"
+                ));
+            }
+        }
         if !seen_content_hashes.insert(content_hash.clone()) {
             entries.push(RuleInjectionEntry {
                 relative_path,
                 real_path: real_path_string,
                 content_hash,
                 bytes: content.len(),
+                modified_at_ms,
                 distance,
+                precedence: distance,
+                match_reason: "walk_up".to_string(),
                 freshness: "duplicate_content".to_string(),
                 injected: false,
                 omission_reason: Some("duplicate content".to_string()),
@@ -3718,7 +4851,10 @@ pub fn discover_workspace_rules(
             real_path: real_path_string,
             content_hash: content_hash.clone(),
             bytes: content.len(),
+            modified_at_ms,
             distance,
+            precedence: distance,
+            match_reason: "walk_up".to_string(),
             freshness: "current".to_string(),
             injected: true,
             omission_reason: None,
@@ -3741,6 +4877,8 @@ pub fn discover_workspace_rules(
         target_paths,
         entries,
         errors,
+        context_conflict: !conflict_reasons.is_empty(),
+        context_conflict_reason: conflict_reasons.first().cloned(),
         injected_content_hash,
         receipt_hash: String::new(),
         created_at: timestamp(),
@@ -3748,7 +4886,48 @@ pub fn discover_workspace_rules(
     receipt.receipt_hash = receipt.expected_hash()?;
     receipt.validate()?;
     let receipt_path = store.write_worker_json_atomic(&task.id, "rules-injection.json", &receipt)?;
+    if receipt.context_conflict {
+        bail!(
+            "workspace rule context conflict; review required (receipt: {})",
+            receipt_path.display()
+        );
+    }
     Ok((injected_rules, Some(receipt_path.to_string_lossy().to_string())))
+}
+
+fn rule_directives(content: &str) -> Vec<(String, String)> {
+    const KEYS: &[&str] = &[
+        "allow",
+        "allowed",
+        "command",
+        "commands",
+        "deny",
+        "disabled",
+        "enabled",
+        "forbid",
+        "forbidden",
+        "must",
+        "must_not",
+        "required",
+        "scope",
+        "tools",
+    ];
+    content
+        .lines()
+        .filter_map(|line| {
+            let line = line
+                .trim()
+                .trim_start_matches(['-', '*', '+'])
+                .trim_start();
+            let (key, value) = line.split_once(':')?;
+            let key = key.trim().to_ascii_lowercase().replace('-', "_");
+            if KEYS.contains(&key.as_str()) {
+                Some((key, value.trim().to_string()))
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 fn skill_is_disabled(content: &str) -> bool {
@@ -3777,6 +4956,94 @@ fn skill_is_disabled(content: &str) -> bool {
     false
 }
 
+fn skill_frontmatter_directives(content: &str) -> HashMap<String, String> {
+    let mut directives = HashMap::new();
+    let mut lines = content.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return directives;
+    }
+    for line in lines {
+        let line = line.trim();
+        if line == "---" {
+            break;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim().to_ascii_lowercase().replace('-', "_");
+        if matches!(
+            key.as_str(),
+            "agent"
+                | "agents"
+                | "worker"
+                | "workers"
+                | "restricted_to"
+                | "required"
+        ) {
+            directives.insert(key, value.trim().to_string());
+        }
+    }
+    directives
+}
+
+fn skill_restricted_agents(content: &str) -> (Vec<String>, bool) {
+    let directives = skill_frontmatter_directives(content);
+    let mut agents = Vec::new();
+    for key in ["agent", "agents", "worker", "workers", "restricted_to"] {
+        let Some(value) = directives.get(key) else {
+            continue;
+        };
+        if let Ok(values) = serde_json::from_str::<Vec<String>>(value) {
+            agents.extend(values);
+            continue;
+        }
+        agents.extend(
+            value
+                .trim_matches(['[', ']'])
+                .split(|character: char| character == ',' || character.is_whitespace())
+                .filter_map(|value| {
+                    let value = value.trim_matches(['"', '\'']);
+                    (!value.is_empty()).then(|| value.to_string())
+                }),
+        );
+    }
+    agents.sort_unstable();
+    agents.dedup();
+    let required = directives
+        .get("required")
+        .is_some_and(|value| matches!(
+            value.trim().trim_matches(['"', '\'']).to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "required"
+        ));
+    (agents, required)
+}
+
+fn normalize_skill_agent(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches(['"', '\''])
+        .to_ascii_lowercase()
+        .replace(['-', ' '], "_")
+}
+
+fn skill_is_allowed_for_worker(
+    content: &str,
+    worker_name: &str,
+    worker_category: &str,
+) -> (bool, bool, Vec<String>) {
+    let (restricted_agents, required) = skill_restricted_agents(content);
+    if restricted_agents.is_empty() {
+        return (true, required, restricted_agents);
+    }
+    let worker_name = normalize_skill_agent(worker_name);
+    let worker_category = normalize_skill_agent(worker_category);
+    let allowed = restricted_agents.iter().any(|agent| {
+        let agent = normalize_skill_agent(agent);
+        agent == "*" || agent == "all" || agent == worker_name || agent == worker_category
+    });
+    (allowed, required, restricted_agents)
+}
+
 /// Resolve project-local `.agents/skills/*/SKILL.md` files for the task scope.
 ///
 /// Resolution is deliberately bounded to the workspace realpath and to the
@@ -3787,6 +5054,22 @@ pub fn discover_workspace_skills(
     store: &StateStore,
     workspace: &Path,
     task: &Task,
+) -> Result<(Option<String>, Option<String>)> {
+    discover_workspace_skills_for_worker(
+        store,
+        workspace,
+        task,
+        task.assigned_worker.as_deref().unwrap_or("unknown"),
+        "unknown",
+    )
+}
+
+fn discover_workspace_skills_for_worker(
+    store: &StateStore,
+    workspace: &Path,
+    task: &Task,
+    worker_name: &str,
+    worker_category: &str,
 ) -> Result<(Option<String>, Option<String>)> {
     let workspace_real = workspace.canonicalize().unwrap_or_else(|_| workspace.to_path_buf());
     let workspace_display = workspace_real.to_string_lossy().to_string();
@@ -3844,9 +5127,11 @@ pub fn discover_workspace_skills(
     target_paths.sort();
     target_paths.dedup();
     let cache_key = prompt_content_hash(&format!(
-        "{}|{}",
+        "{}|{}|{}|{}",
         workspace_display,
-        target_paths.join("|")
+        target_paths.join("|"),
+        normalize_skill_agent(worker_name),
+        normalize_skill_agent(worker_category),
     ));
     // Scope the persistent cache by workspace and target set. Distinct
     // parallel workers no longer overwrite unrelated target baselines, while
@@ -3909,6 +5194,22 @@ pub fn discover_workspace_skills(
         }
     }
     candidates.sort_by(|left, right| left.2.cmp(&right.2).then_with(|| left.0.cmp(&right.0)));
+    let mut selected_skill_paths = HashMap::<String, (PathBuf, usize)>::new();
+    for (path, _, distance) in &candidates {
+        let Some(skill_name) = path
+            .parent()
+            .and_then(Path::file_name)
+            .map(|name| name.to_string_lossy().to_string())
+        else {
+            continue;
+        };
+        let replace = selected_skill_paths
+            .get(&skill_name)
+            .is_none_or(|(_, selected_distance)| distance >= selected_distance);
+        if replace {
+            selected_skill_paths.insert(skill_name, (path.clone(), *distance));
+        }
+    }
 
     let previous_by_path = previous.as_ref().map(|receipt| {
         receipt
@@ -3921,6 +5222,7 @@ pub fn discover_workspace_skills(
     let mut seen_content_hashes = std::collections::HashSet::new();
     let mut entries = Vec::new();
     let mut injected_sections = Vec::new();
+    let mut required_unavailable = Vec::new();
     let mut all_cached = previous
         .as_ref()
         .is_some_and(|receipt| receipt.cache_key == cache_key);
@@ -3938,6 +5240,8 @@ pub fn discover_workspace_skills(
                 bytes: 0,
                 modified_at_ms: 0,
                 distance,
+                precedence: distance,
+                match_reason: "scope_walk".to_string(),
                 freshness: "duplicate_realpath".to_string(),
                 injected: false,
                 omission_reason: Some("duplicate realpath".to_string()),
@@ -3956,6 +5260,8 @@ pub fn discover_workspace_skills(
                     bytes: 0,
                     modified_at_ms: 0,
                     distance,
+                    precedence: distance,
+                    match_reason: "scope_walk".to_string(),
                     freshness: "unavailable".to_string(),
                     injected: false,
                     omission_reason: Some("read failed".to_string()),
@@ -3963,13 +5269,66 @@ pub fn discover_workspace_skills(
                 continue;
             }
         };
+        let content_hash = prompt_content_hash(&content);
+        let modified_at_ms = fs::metadata(&real_path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |duration| duration.as_millis());
+        let skill_name = path
+            .parent()
+            .and_then(Path::file_name)
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "<unnamed>".to_string());
+        let (allowed_for_worker, required, restricted_agents) =
+            skill_is_allowed_for_worker(&content, worker_name, worker_category);
+        if !allowed_for_worker {
+            all_cached = false;
+            let reason = format!(
+                "skill `{skill_name}` is restricted to agents: {}",
+                restricted_agents.join(", ")
+            );
+            if required {
+                required_unavailable.push(reason.clone());
+            }
+            entries.push(SkillInjectionEntry {
+                relative_path,
+                real_path: real_path_string,
+                content_hash,
+                bytes: content.len(),
+                modified_at_ms,
+                distance,
+                precedence: distance,
+                match_reason: "agent_restricted".to_string(),
+                freshness: "restricted".to_string(),
+                injected: false,
+                omission_reason: Some(reason),
+            });
+            continue;
+        }
+        if selected_skill_paths
+            .get(&skill_name)
+            .is_some_and(|(selected_path, _)| selected_path != &path)
+        {
+            all_cached = false;
+            entries.push(SkillInjectionEntry {
+                relative_path,
+                real_path: real_path_string,
+                content_hash,
+                bytes: content.len(),
+                modified_at_ms,
+                distance,
+                precedence: distance,
+                match_reason: "scope_walk".to_string(),
+                freshness: "shadowed_precedence".to_string(),
+                injected: false,
+                omission_reason: Some(format!(
+                    "skill `{skill_name}` is shadowed by a more specific target"
+                )),
+            });
+            continue;
+        }
         if skill_is_disabled(&content) {
-            let content_hash = prompt_content_hash(&content);
-            let modified_at_ms = fs::metadata(&real_path)
-                .and_then(|metadata| metadata.modified())
-                .ok()
-                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-                .map_or(0, |duration| duration.as_millis());
             let previously_cached = previous_by_path
                 .as_ref()
                 .and_then(|entries| entries.get(&relative_path))
@@ -3986,6 +5345,8 @@ pub fn discover_workspace_skills(
                 bytes: content.len(),
                 modified_at_ms,
                 distance,
+                precedence: distance,
+                match_reason: "scope_walk".to_string(),
                 freshness: if previously_cached {
                     "disabled_cached".to_string()
                 } else {
@@ -3996,7 +5357,6 @@ pub fn discover_workspace_skills(
             });
             continue;
         }
-        let content_hash = prompt_content_hash(&content);
         if !seen_content_hashes.insert(content_hash.clone()) {
             all_cached = false;
             entries.push(SkillInjectionEntry {
@@ -4004,19 +5364,16 @@ pub fn discover_workspace_skills(
                 real_path: real_path_string,
                 content_hash,
                 bytes: content.len(),
-                modified_at_ms: 0,
+                modified_at_ms,
                 distance,
+                precedence: distance,
+                match_reason: "scope_walk".to_string(),
                 freshness: "duplicate_content".to_string(),
                 injected: false,
                 omission_reason: Some("duplicate content".to_string()),
             });
             continue;
         }
-        let modified_at_ms = fs::metadata(&real_path)
-            .and_then(|metadata| metadata.modified())
-            .ok()
-            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-            .map_or(0, |duration| duration.as_millis());
         let previous_entry = previous_by_path
             .as_ref()
             .and_then(|entries| entries.get(&relative_path));
@@ -4039,6 +5396,8 @@ pub fn discover_workspace_skills(
             bytes: content.len(),
             modified_at_ms,
             distance,
+            precedence: distance,
+            match_reason: "scope_walk".to_string(),
             freshness: freshness.to_string(),
             injected: true,
             omission_reason: None,
@@ -4059,6 +5418,8 @@ pub fn discover_workspace_skills(
         schema_version: SKILL_INJECTION_SCHEMA_VERSION,
         task_id: task.id.clone(),
         workspace: workspace_display,
+        worker: worker_name.to_string(),
+        worker_category: worker_category.to_string(),
         target_paths,
         cache_key,
         cache_hit: all_cached,
@@ -4080,10 +5441,41 @@ pub fn discover_workspace_skills(
         .with_context(|| format!("failed to write {}", cache_tmp.display()))?;
     fs::rename(&cache_tmp, &cache_path)
         .with_context(|| format!("failed to replace {}", cache_path.display()))?;
+    if !required_unavailable.is_empty() {
+        bail!(
+            "required workspace skill is unavailable for worker `{worker_name}` (receipt: {}): {}",
+            receipt_path.display(),
+            required_unavailable.join("; ")
+        );
+    }
     Ok((
         injected_skills,
         Some(receipt_path.to_string_lossy().to_string()),
     ))
+}
+
+/// Read the durable step cursor used when a worker session is revived or
+/// recreated. An unreadable cursor is an integrity failure: falling back to
+/// the first plan step would silently restart a partially completed task.
+fn read_durable_current_step_id(store: &StateStore, task_id: &str) -> Result<Option<String>> {
+    let path = store.worker_dir(task_id).join("current-step-id");
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to read durable current step cursor {}", path.display())
+            });
+        }
+    };
+    let step_id = contents.trim();
+    if step_id.is_empty() || step_id.lines().count() != 1 {
+        bail!(
+            "durable current step cursor {} is empty or malformed",
+            path.display()
+        );
+    }
+    Ok(Some(step_id.to_string()))
 }
 
 fn start_command_backed_worker(
@@ -4112,6 +5504,14 @@ fn start_command_backed_worker(
         .model_params()
         .map_err(|error| anyhow::anyhow!(error))?;
     let plan_task = task.inputs.plan_task.as_ref();
+    let current_step_id = read_durable_current_step_id(store, &task.id)?.or_else(|| {
+        plan_task.and_then(|plan_task| {
+            plan_task
+                .execution_steps_or_legacy()
+                .first()
+                .map(|step| step.step_id.clone())
+        })
+    });
     let packet_goal = plan_task
         .map(|plan_task| plan_task.worker_goal(goal))
         .unwrap_or_else(|| goal.to_string());
@@ -4163,8 +5563,13 @@ fn start_command_backed_worker(
     let prompt_capsule_path = store.worker_dir(&task.id).join("prompt-capsule.json");
     let (injected_rules, rules_injection_path) =
         discover_workspace_rules(store, workspace, task)?;
-    let (injected_skills, skills_injection_path) =
-        discover_workspace_skills(store, workspace, task)?;
+    let (injected_skills, skills_injection_path) = discover_workspace_skills_for_worker(
+        store,
+        workspace,
+        task,
+        worker_name,
+        route.category.as_str(),
+    )?;
     let pending_reconcile_path = store
         .worker_dir(&task.id)
         .join("prompt-reconcile-pending.json");
@@ -4193,6 +5598,7 @@ fn start_command_backed_worker(
     let packet = WorkerPacket {
         task_id: task.id.clone(),
         worker: worker_name.to_string(),
+        current_step_id,
         worker_model: route.worker_model.map(ToString::to_string),
         variant: route.variant.clone(),
         variant_applied: model_params.and_then(|params| params.variant),
@@ -4225,6 +5631,23 @@ fn start_command_backed_worker(
         serde_json::to_string_pretty(&packet).context("failed to serialize worker packet")?;
     let packet_path =
         store.write_worker_file(&task.id, "packet.json", &format!("{packet_json}\n"))?;
+
+    // Resolve optional/required dispatch parameters before any prompt or
+    // provider process is started. The receipt distinguishes omitted safe
+    // defaults from explicit invalid values and records the precedence that
+    // produced the selected route.
+    let parameter_resolution = validate_worker_packet_parameters(&packet)?;
+    store.write_worker_json_atomic(
+        &task.id,
+        "parameter-resolution.json",
+        &parameter_resolution,
+    )?;
+    if parameter_resolution.status == "invalid" {
+        bail!(
+            "worker dispatch parameter validation failed: {}",
+            parameter_resolution.errors.join("; ")
+        );
+    }
 
     let prompt = worker_prompt(&packet)?;
     // Save full prompt as audit artifact (uncompiled, all sections).
@@ -4338,15 +5761,21 @@ fn start_command_backed_worker(
     // workers.  This directory is bound to the handle's lifetime and cleaned
     // up when the handle is dropped.
     let omo_config_dir = if route.worker_kind == WorkerKind::OpencodeSession {
-        Some(setup_omo_plugin_config_dir()?)
+        Some(setup_omo_plugin_config_dir_with_read_only(!packet.tools.can_write)?)
     } else {
         None
     };
+    // The goal lease is the only hard wall-clock boundary for a provider-backed
+    // OpenCode session. Persist it per worker so every turn (including a
+    // PlanCritic repair turn) can derive a bounded external-call timeout
+    // without confusing the generic stale-task policy with a model deadline.
+    persist_worker_runtime_deadline(store, task)?;
 
     Ok(Arc::new(CommandWorkerSessionHandle {
         store: store.clone(),
         workspace: workspace.to_path_buf(),
         task_id: task.id.clone(),
+        task_attempt: task.attempt,
         worker_name: worker_name.to_string(),
         skip_worker: config.skip_worker,
         command: route.worker_command.map(ToString::to_string),
@@ -4411,6 +5840,7 @@ struct CommandWorkerSessionHandle {
     store: StateStore,
     workspace: PathBuf,
     task_id: String,
+    task_attempt: usize,
     worker_name: String,
     skip_worker: bool,
     command: Option<String>,
@@ -4458,6 +5888,70 @@ pub struct DestructiveCommandRejectedReceipt {
     pub matched_pattern: String,
     pub rejected_before_spawn: bool,
     pub recorded_at: String,
+}
+
+const TOOL_PAIR_VALIDATION_SCHEMA_VERSION: u32 = 1;
+
+/// Binds parsed tool-call events to the task/workspace/worker turn that
+/// produced them. Command-backed workers do not expose a separate result
+/// stream, so a parsed invocation is explicitly `unknown` until a result is
+/// observed instead of being treated as a successful tool call.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ToolPairValidationReceipt {
+    schema_version: u32,
+    task_id: String,
+    workspace: String,
+    worker: String,
+    turn_kind: String,
+    turn_epoch: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
+    started_calls: usize,
+    finished_calls: usize,
+    unknown_results: usize,
+    orphan_finished: usize,
+    status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    event_hash: String,
+    receipt_hash: String,
+    created_at: String,
+}
+
+impl ToolPairValidationReceipt {
+    fn expected_hash(&self) -> Result<String> {
+        let mut payload = self.clone();
+        payload.receipt_hash.clear();
+        Ok(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&payload)?)
+        ))
+    }
+
+    fn seal(mut self) -> Result<Self> {
+        self.receipt_hash.clear();
+        self.receipt_hash = self.expected_hash()?;
+        self.validate()?;
+        Ok(self)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.schema_version != TOOL_PAIR_VALIDATION_SCHEMA_VERSION {
+            bail!("unsupported tool-pair validation schema");
+        }
+        if self.task_id.trim().is_empty() || self.workspace.trim().is_empty() {
+            bail!("tool-pair validation receipt identity cannot be empty");
+        }
+        if self.finished_calls < self.unknown_results
+            || self.finished_calls.saturating_add(self.orphan_finished) < self.started_calls
+        {
+            bail!("tool-pair validation receipt counts are inconsistent");
+        }
+        if self.receipt_hash != self.expected_hash()? {
+            bail!("tool-pair validation receipt hash mismatch");
+        }
+        Ok(())
+    }
 }
 
 impl CommandWorkerSessionHandle {
@@ -4645,10 +6139,56 @@ impl CommandWorkerSessionHandle {
             state.active_command = true;
             state.cancellation_token.clone()
         })?;
+        let external_timeout = worker_external_timeout(
+            &self.store,
+            &self.task_id,
+            self.command_timeout,
+        )?;
         let mut env = HashMap::new();
+        let turn_epoch = self.with_session_state(|state| state.turn_epoch)?;
+        let worker_directory = self.store.worker_dir(&self.task_id);
         env.insert(
             "GEARBOX_WORKER_PACKET".to_string(),
             self.packet_path.to_string_lossy().to_string(),
+        );
+        env.insert(
+            "GEARBOX_WORKER_DIR".to_string(),
+            worker_directory.to_string_lossy().to_string(),
+        );
+        env.insert(
+            "GEARBOX_EXTERNAL_TASK_ID".to_string(),
+            self.task_id.clone(),
+        );
+        env.insert(
+            "GEARBOX_WORKER_TASK_ID".to_string(),
+            self.task_id.clone(),
+        );
+        env.insert(
+            "GEARBOX_EXTERNAL_OWNER".to_string(),
+            self.worker_name.clone(),
+        );
+        env.insert(
+            "GEARBOX_EXTERNAL_ATTEMPT".to_string(),
+            turn_epoch.to_string(),
+        );
+        env.insert(
+            "GEARBOX_EXTERNAL_REQUEST_KIND".to_string(),
+            turn_kind.clone(),
+        );
+        env.insert(
+            "GEARBOX_EXTERNAL_IDEMPOTENT".to_string(),
+            "false".to_string(),
+        );
+        env.insert(
+            "GEARBOX_EXTERNAL_RETRY_POLICY".to_string(),
+            "none".to_string(),
+        );
+        env.insert(
+            "GEARBOX_WORKER_CLEANUP_RECEIPT".to_string(),
+            worker_directory
+                .join("process-cleanup.json")
+                .to_string_lossy()
+                .to_string(),
         );
         env.insert(
             "GEARBOX_WORKER_PROMPT".to_string(),
@@ -4729,6 +6269,17 @@ impl CommandWorkerSessionHandle {
             "GEARBOX_WORKER_PROVIDER_ERROR_RECOVERY".to_string(),
             "1".to_string(),
         );
+        if self
+            .store
+            .worker_dir(&self.task_id)
+            .join(WORKER_RUNTIME_DEADLINE_FILE)
+            .is_file()
+        {
+            env.insert(
+                "GEARBOX_EXTERNAL_REQUIRE_DEADLINE".to_string(),
+                "true".to_string(),
+            );
+        }
 
         // Headless OpenCode workers do not need OpenCode's project/VCS watcher:
         // Gear owns the durable event stream and diff/review evidence.  The
@@ -4776,7 +6327,7 @@ impl CommandWorkerSessionHandle {
             command,
             &env,
             Some(&cancellation_token),
-            self.command_timeout,
+            external_timeout,
         );
         self.with_session_state(|state| {
             state.active_command = false;
@@ -4917,7 +6468,6 @@ impl CommandWorkerSessionHandle {
             outcome_path: result.outcome_path.clone(),
             summary: result.summary.clone(),
         })?;
-        let turn_epoch = self.with_session_state(|state| state.turn_epoch)?;
         self.store.write_worker_file(
             &self.task_id,
             &format!("turn-{turn_epoch}-result.json"),
@@ -4991,7 +6541,7 @@ impl CommandWorkerSessionHandle {
             *follow_up_count += 1;
             *follow_up_count
         };
-        let raw_path = self.store.write_worker_file(
+        self.store.write_worker_file(
             &self.task_id,
             &format!("{kind}-{interaction_index}.md"),
             &format!(
@@ -5004,12 +6554,8 @@ impl CommandWorkerSessionHandle {
             _ => PromptCapsuleRecoveryReason::Resume,
         };
         let output_stem = format!("{kind}-{interaction_index}");
-        let step_path = self.store.worker_dir(&self.task_id).join("current-step-id");
-        let current_step_id = fs::read_to_string(&step_path)
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-        let prompt_path = match compile_recovery_prompt(
+        let current_step_id = read_durable_current_step_id(&self.store, &self.task_id)?;
+        let prompt_path = match compile_recovery_prompt_with_attempt(
             &self.store,
             &self.task_id,
             command,
@@ -5020,12 +6566,17 @@ impl CommandWorkerSessionHandle {
             &self.prompt_capsule_path,
             &output_stem,
             current_step_id.as_deref(),
+            self.task_attempt as u64,
         ) {
             Ok(compiled) => compiled,
             Err(error) => {
-                // Degraded: fall back to the raw prompt file
-                eprintln!("Gear recovery capsule compilation degraded: {error:#}");
-                raw_path
+                // A recovery prompt that bypasses the capsule can omit the
+                // current step, scope, or required evidence contract. Keep
+                // the raw prompt as an audit artifact, but refuse to send it
+                // to the worker; the caller must create a bounded repair or
+                // start a fresh session instead.
+                eprintln!("Gear recovery capsule compilation blocked: {error:#}");
+                return Err(error).context("recovery prompt capsule compilation blocked dispatch");
             }
         };
         let result = self.execute_command_with_prompt(
@@ -5083,6 +6634,11 @@ impl CommandWorkerSessionHandle {
             return Ok(());
         }
 
+        let mut started_calls = 0;
+        let mut finished_calls = 0;
+        let mut unknown_results = 0;
+        let orphan_finished = 0;
+        let mut truncated_group = false;
         let mut pos = 0;
         let bytes = stdout.as_bytes();
 
@@ -5139,6 +6695,7 @@ impl CommandWorkerSessionHandle {
 
             let Some(closing_offset) = closing_pos else {
                 // No closing tag found, emit remaining as text
+                truncated_group = true;
                 let delta = &stdout[pos..];
                 if !delta.is_empty() {
                     self.emit_event(WorkerEvent::AssistantTextDelta {
@@ -5190,19 +6747,24 @@ impl CommandWorkerSessionHandle {
                         String::new()
                     };
 
+                    started_calls += 1;
                     self.emit_event(WorkerEvent::ToolCallStarted {
                         kind: kind.to_string(),
                         tool_name: tool_name.clone(),
                         arguments: args,
                     })?;
 
-                    // Emit ToolCallFinished right after start for post-hoc parsing
-                    // (we don't have a separate result stream for command-backed workers)
+                    // Command-backed transcripts do not carry a separate tool-result
+                    // stream. Preserve that fact as explicit unknown evidence instead
+                    // of emitting an empty result that downstream code could mistake
+                    // for a successful tool call.
                     self.emit_event(WorkerEvent::ToolCallFinished {
                         kind: kind.to_string(),
                         tool_name,
-                        result: String::new(),
+                        result: "unknown: tool result was not present in worker output".to_string(),
                     })?;
+                    finished_calls += 1;
+                    unknown_results += 1;
 
                     if let Some(close_offset) = invoke_close {
                         invoke_pos = abs_invoke_start + close_offset + 9; // skip "</invoke>"
@@ -5234,6 +6796,67 @@ impl CommandWorkerSessionHandle {
             };
             pos = group_end + closing_tag_len;
         }
+
+        let (status, reason) = if started_calls == 0 && !truncated_group {
+            ("not_applicable", None)
+        } else if truncated_group {
+            (
+                "unknown",
+                Some("tool-call group was truncated before its closing tag"),
+            )
+        } else if orphan_finished > 0 {
+            (
+                "error",
+                Some("tool-call result had no matching invocation"),
+            )
+        } else if unknown_results > 0 {
+            (
+                "unknown",
+                Some("command-backed worker output did not contain tool results"),
+            )
+        } else if started_calls != finished_calls {
+            (
+                "error",
+                Some("tool-call start/result counts did not match"),
+            )
+        } else {
+            ("pass", None)
+        };
+        let session_id = read_resident_session_descriptor(&self.store, &self.task_id)?
+            .map(|descriptor| descriptor.resumable_session_id().to_string());
+        let turn_epoch = self.with_session_state(|state| state.turn_epoch)?;
+        let receipt = ToolPairValidationReceipt {
+            schema_version: TOOL_PAIR_VALIDATION_SCHEMA_VERSION,
+            task_id: self.task_id.clone(),
+            workspace: self.workspace.to_string_lossy().to_string(),
+            worker: self.worker_name.clone(),
+            turn_kind: kind.to_string(),
+            turn_epoch,
+            session_id,
+            started_calls,
+            finished_calls,
+            unknown_results,
+            orphan_finished,
+            status: status.to_string(),
+            reason: reason.map(str::to_string),
+            event_hash: prompt_content_hash(stdout),
+            receipt_hash: String::new(),
+            created_at: timestamp(),
+        }
+        .seal()?;
+        let receipt_file = format!("tool-pair-validation-{kind}-{turn_epoch}.json");
+        self.store.write_worker_json_atomic(
+            &self.task_id,
+            &receipt_file,
+            &receipt,
+        )?;
+        // Keep a stable latest receipt for runtime consumers while retaining
+        // one immutable receipt per turn for replay and audit.
+        self.store.write_worker_json_atomic(
+            &self.task_id,
+            "tool-pair-validation.json",
+            &receipt,
+        )?;
 
         Ok(())
     }
@@ -5390,9 +7013,32 @@ impl WorkerSessionHandle for CommandWorkerSessionHandle {
     }
 }
 
+fn phase_request_marker(packet: &WorkerPacket) -> Option<String> {
+    if packet.inputs.phase_route_locked && packet.inputs.plan_task.is_none() {
+        Some(format!(
+            "[full phase request follows below; sha256={} bytes={}]",
+            prompt_content_hash(&packet.goal),
+            packet.goal.len()
+        ))
+    } else {
+        None
+    }
+}
+
+fn worker_prompt_packet_json(packet: &WorkerPacket) -> Result<String> {
+    let Some(marker) = phase_request_marker(packet) else {
+        return serde_json::to_string_pretty(packet)
+            .context("failed to serialize worker prompt packet");
+    };
+    let mut packet_value = serde_json::to_value(packet)
+        .context("failed to serialize worker prompt packet value")?;
+    packet_value["goal"] = Value::String(marker);
+    serde_json::to_string_pretty(&packet_value)
+        .context("failed to serialize bounded phase worker prompt packet")
+}
+
 pub fn worker_prompt(packet: &WorkerPacket) -> Result<String> {
-    let packet_json =
-        serde_json::to_string_pretty(packet).context("failed to serialize worker prompt packet")?;
+    let packet_json = worker_prompt_packet_json(packet)?;
     let prompt_append = packet
         .prompt_append
         .as_deref()
@@ -5614,10 +7260,12 @@ pub fn prompt_manifest_for_packet(
     packet: &WorkerPacket,
     rendered_prompt: &str,
 ) -> Result<PromptManifest> {
+    let hard_goal = phase_request_marker(packet).unwrap_or_else(|| packet.goal.clone());
     let hard_contract = serde_json::to_string(&json!({
         "task_id": &packet.task_id,
         "worker": &packet.worker,
-        "goal": &packet.goal,
+        "current_step_id": &packet.current_step_id,
+        "goal": hard_goal,
         "scope": &packet.scope,
         "tools": &packet.tools,
         "constraints": &packet.constraints,
@@ -5797,6 +7445,7 @@ pub fn prompt_semantic_contract_hash(packet: &WorkerPacket) -> Result<String> {
     let contract = json!({
         "task_id": &packet.task_id,
         "worker": &packet.worker,
+        "current_step_id": &packet.current_step_id,
         "goal": &packet.goal,
         "scope": &packet.scope,
         "tools": &packet.tools,
@@ -5833,6 +7482,7 @@ pub const PROMPT_CAPSULE_SCHEMA_VERSION: u32 = 1;
 // with smaller contexts, but make the unknown-model default large enough to
 // admit the durable contract before soft sections are clipped.
 const DEFAULT_CONTEXT_LIMIT_TOKENS: usize = 12288;
+const DEFAULT_PAID_CONTEXT_LIMIT_TOKENS: usize = 32768;
 /// Output headroom is opt-in because providers expose different completion
 /// limits.  A caller that knows the provider's output contract can reserve
 /// space without changing the context limit itself.
@@ -5924,11 +7574,30 @@ fn prompt_budget_policy(runtime_model: Option<&str>) -> PromptBudgetPolicy {
             })
         })
         .unwrap_or_else(|| {
-            (
-                DEFAULT_CONTEXT_LIMIT_TOKENS,
-                true,
-                "conservative_default".to_string(),
-            )
+            let normalized_model = runtime_model
+                .map(|model| model.trim().to_ascii_lowercase())
+                .unwrap_or_default();
+            let paid_model = normalized_model
+                .strip_prefix("opencode-go/")
+                .is_some_and(|model| !model.trim().is_empty());
+            let deepseek_flash_model = normalized_model.contains("deepseek-v4-flash");
+            if paid_model || deepseek_flash_model {
+                (
+                    DEFAULT_PAID_CONTEXT_LIMIT_TOKENS,
+                    true,
+                    if deepseek_flash_model {
+                        "deepseek_flash_conservative_default".to_string()
+                    } else {
+                        "paid_model_conservative_default".to_string()
+                    },
+                )
+            } else {
+                (
+                    DEFAULT_CONTEXT_LIMIT_TOKENS,
+                    true,
+                    "conservative_default".to_string(),
+                )
+            }
         });
 
     let (reserved_output_tokens, headroom_source) = match env::var("GEARBOX_WORKER_OUTPUT_HEADROOM_TOKENS")
@@ -6069,12 +7738,89 @@ impl PromptCapsule {
         if self.schema_version != PROMPT_CAPSULE_SCHEMA_VERSION {
             bail!("unsupported prompt capsule schema {}", self.schema_version);
         }
+        if self.task_id.trim().is_empty() || self.worker.trim().is_empty() {
+            bail!("prompt capsule identity cannot be empty");
+        }
+        if self.semantic_contract_hash.trim().is_empty()
+            || self.rendered_prompt_hash.trim().is_empty()
+            || self.recovery_key.trim().is_empty()
+            || self.recovery_reason.trim().is_empty()
+        {
+            bail!("prompt capsule binding fields cannot be empty");
+        }
+        if self.context_limit_tokens == 0
+            || self.budget_tokens > self.context_limit_tokens
+            || self.reserved_output_tokens > self.context_limit_tokens
+        {
+            bail!("prompt capsule budget is outside its context limit");
+        }
+        if self.used_tokens > self.budget_tokens
+            || self.remaining_tokens != self.budget_tokens.saturating_sub(self.used_tokens)
+        {
+            bail!("prompt capsule token accounting is inconsistent");
+        }
         if self
             .sections
             .iter()
             .any(|section| section.required && !section.included)
         {
             bail!("prompt capsule omits a required hard section");
+        }
+        if self.sections.iter().any(|section| {
+            section.included && section.retained_tokens > self.budget_tokens
+                || !section.included
+                    && (section.retained_tokens != 0 || section.retained_bytes != 0)
+        }) {
+            bail!("prompt capsule section retention is invalid");
+        }
+        Ok(())
+    }
+
+    /// Validate a persisted capsule against the packet and manifest that are
+    /// authoritative for the current dispatch. A capsule can outlive a
+    /// session, so checking only its schema/required flags would allow stale
+    /// route or task identity to be reused after recovery.
+    pub fn validate_against(
+        &self,
+        packet: &WorkerPacket,
+        manifest: &PromptManifest,
+    ) -> Result<()> {
+        self.validate()?;
+        if self.task_id != packet.task_id {
+            bail!("prompt capsule task identity does not match worker packet");
+        }
+        if self.worker != packet.worker {
+            bail!("prompt capsule worker identity does not match worker packet");
+        }
+        let expected_runtime_model = packet.worker_model.clone().or_else(|| {
+            packet
+                .coordinator_model
+                .as_ref()
+                .map(|model| model.name.clone())
+        });
+        if self.runtime_model != expected_runtime_model {
+            bail!("prompt capsule runtime model does not match worker packet");
+        }
+        if self.semantic_contract_hash != manifest.semantic_contract_hash {
+            bail!("prompt capsule semantic contract hash mismatch");
+        }
+        if self.context_limit_tokens == 0 || self.budget_tokens > self.context_limit_tokens {
+            bail!("prompt capsule budget is outside its context limit");
+        }
+        if self.used_tokens > self.budget_tokens {
+            bail!("prompt capsule used token count exceeds budget");
+        }
+        for required in manifest.sections.iter().filter(|section| section.required) {
+            let Some(capsule_section) = self.sections.iter().find(|section| section.id == required.id)
+            else {
+                bail!("prompt capsule is missing required section `{}`", required.id);
+            };
+            if !capsule_section.included || !capsule_section.required {
+                bail!("prompt capsule required section `{}` is not included", required.id);
+            }
+            if capsule_section.content_hash != required.content_hash {
+                bail!("prompt capsule section `{}` content hash mismatch", required.id);
+            }
         }
         Ok(())
     }
@@ -6092,6 +7838,7 @@ pub fn build_prompt_capsule(
     rendered_prompt: &str,
     reason: &PromptCapsuleRecoveryReason,
 ) -> Result<PromptCapsule> {
+    manifest.validate(packet, rendered_prompt)?;
     let runtime_model = packet.worker_model.clone().or_else(|| {
         packet
             .coordinator_model
@@ -6198,7 +7945,13 @@ pub fn build_prompt_capsule(
     let used_tokens: usize = sections
         .iter()
         .filter(|section| section.included)
-        .map(|section| section.estimated_tokens)
+        .map(|section| {
+            section.retained_tokens.saturating_add(if section.clipped {
+                CLIPPED_SECTION_OVERHEAD_TOKENS
+            } else {
+                0
+            })
+        })
         .sum();
 
     let model_family =
@@ -6233,7 +7986,7 @@ pub fn build_prompt_capsule(
         compiled_prompt_path: None,
         compiled_prompt_hash: String::new(),
     };
-    capsule.validate()?;
+    capsule.validate_against(packet, manifest)?;
     Ok(capsule)
 }
 
@@ -6269,16 +8022,17 @@ pub struct RecoveryCapsuleReceipt {
 ///
 /// ## Dedup
 ///
-/// A recovery receipt keyed by `(task_id, semantic_contract_hash, recovery_reason)`
-/// is written on first compilation. If the same key is encountered again the
-/// function writes a `reused` receipt and returns the existing compiled prompt
-/// path without recompiling.
+/// A recovery receipt keyed by the task, semantic contract, recovery reason,
+/// body hash, step anchor, and attempt is written on first compilation. If the
+/// same key is encountered again the function writes a `reused` receipt and
+/// returns the existing compiled prompt path without recompiling.
 ///
 /// ## Degraded
 ///
 /// When the packet or manifest cannot be read (e.g. an older task directory
 /// created before the capsule system), the function writes a `degraded`
-/// receipt and returns `Err` so the caller can fall back to the raw prompt.
+/// receipt and returns `Err`. The raw prompt remains an audit artifact only;
+/// callers must not bypass this gate by sending it uncompiled.
 pub fn compile_recovery_prompt(
     store: &StateStore,
     task_id: &str,
@@ -6290,6 +8044,34 @@ pub fn compile_recovery_prompt(
     capsule_path: &Path,
     output_stem: &str,
     current_step_id: Option<&str>,
+) -> Result<PathBuf> {
+    compile_recovery_prompt_with_attempt(
+        store,
+        task_id,
+        command,
+        raw_prompt,
+        reason,
+        packet_path,
+        manifest_path,
+        capsule_path,
+        output_stem,
+        current_step_id,
+        0,
+    )
+}
+
+fn compile_recovery_prompt_with_attempt(
+    store: &StateStore,
+    task_id: &str,
+    command: &str,
+    raw_prompt: &str,
+    reason: &PromptCapsuleRecoveryReason,
+    packet_path: &Path,
+    manifest_path: &Path,
+    capsule_path: &Path,
+    output_stem: &str,
+    current_step_id: Option<&str>,
+    task_attempt: u64,
 ) -> Result<PathBuf> {
     let prompt_body_hash = prompt_content_hash(raw_prompt);
     let body_hash_prefix = if prompt_body_hash.len() > 16 {
@@ -6310,6 +8092,7 @@ pub fn compile_recovery_prompt(
             let receipt = serde_json::json!({
                 "schema_version": 1u32,
                 "task_id": task_id,
+                "attempt": task_attempt,
                 "recovery_reason": reason.as_key(),
                 "body_hash": body_hash_prefix,
                 "step_suffix": step_suffix,
@@ -6337,6 +8120,7 @@ pub fn compile_recovery_prompt(
             let receipt = serde_json::json!({
                 "schema_version": 1u32,
                 "task_id": task_id,
+                "attempt": task_attempt,
                 "recovery_reason": reason.as_key(),
                 "body_hash": body_hash_prefix,
                 "step_suffix": step_suffix,
@@ -6355,58 +8139,20 @@ pub fn compile_recovery_prompt(
             return Err(e);
         }
     };
+    let manifest_hash = prompt_manifest_hash(&manifest)?;
 
     let instance_recovery_key = format!(
-        "{}:{}:{}",
+        "{}:{}:{}:{}:{}",
         prompt_capsule_recovery_key(task_id, &manifest.semantic_contract_hash, reason),
         body_hash_prefix,
         step_suffix,
+        task_attempt,
+        output_stem,
     );
 
     let key_hash = format!("{:x}", Sha256::digest(instance_recovery_key.as_bytes()));
     let receipt_filename = format!("recovery-{key_hash}.json");
     let receipt_path = store.worker_dir(task_id).join(&receipt_filename);
-
-    if receipt_path.is_file() {
-        if let Ok(receipt_val) = fs::read_to_string(&receipt_path)
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).map_err(|e| e.into()))
-        {
-            if receipt_val
-                .get("status")
-                .and_then(|s| s.as_str())
-                .is_some_and(|s| s == "compiled")
-            {
-                if let Some(compiled_path_str) = receipt_val
-                    .get("compiled_prompt_path")
-                    .and_then(|p| p.as_str())
-                {
-                    let existing = PathBuf::from(compiled_path_str);
-                    if existing.is_file() {
-                        let reused = serde_json::json!({
-                            "schema_version": 1u32,
-                            "task_id": task_id,
-                            "recovery_key": &instance_recovery_key,
-                            "recovery_reason": reason.as_key(),
-                            "semantic_contract_hash": manifest.semantic_contract_hash,
-                            "compiled_prompt_path": compiled_path_str,
-                            "compiled_prompt_hash": receipt_val
-                                .get("compiled_prompt_hash")
-                                .and_then(|h| h.as_str())
-                                .unwrap_or(""),
-                            "status": "reused",
-                            "created_at": crate::state::timestamp(),
-                        });
-                        store.write_worker_json_atomic(
-                            task_id,
-                            &format!("recovery-reused-{key_hash}.json"),
-                            &reused,
-                        )?;
-                        return Ok(existing);
-                    }
-                }
-            }
-        }
-    }
 
     let step_line = current_step_id
         .filter(|s| !s.trim().is_empty())
@@ -6419,6 +8165,10 @@ pub fn compile_recovery_prompt(
         raw_prompt.trim(),
     );
 
+    // Validate the persisted capsule before considering receipt reuse. A valid
+    // compiled file alone is not enough: deletion or tampering of the capsule
+    // must invalidate the reuse path and prevent stale evidence from flowing
+    // into a new recovery dispatch.
     let capsule: PromptCapsule = if capsule_path.exists() {
         match fs::read_to_string(capsule_path)
             .map_err(|e| anyhow::anyhow!("failed to read prompt capsule: {e}"))
@@ -6429,6 +8179,7 @@ pub fn compile_recovery_prompt(
                 let receipt = serde_json::json!({
                     "schema_version": 1u32,
                     "task_id": task_id,
+                    "attempt": task_attempt,
                     "recovery_reason": reason.as_key(),
                     "body_hash": body_hash_prefix,
                     "step_suffix": step_suffix,
@@ -6450,6 +8201,85 @@ pub fn compile_recovery_prompt(
     } else {
         build_prompt_capsule(&packet, &manifest, &recovery_append, reason)?
     };
+    capsule.validate_against(&packet, &manifest)?;
+
+    if receipt_path.is_file() {
+        if let Ok(receipt_val) = fs::read_to_string(&receipt_path)
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).map_err(|e| e.into()))
+        {
+            let receipt_matches_current_contract = receipt_val
+                .get("task_id")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| value == task_id)
+                && receipt_val
+                    .get("recovery_key")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|value| value == instance_recovery_key.as_str())
+                && receipt_val
+                    .get("semantic_contract_hash")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|value| value == manifest.semantic_contract_hash)
+                && receipt_val
+                    .get("prompt_manifest_hash")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|value| value == manifest_hash);
+            if receipt_matches_current_contract
+                && receipt_val
+                .get("status")
+                .and_then(|s| s.as_str())
+                .is_some_and(|s| s == "compiled")
+            {
+                if let Some(compiled_path_str) = receipt_val
+                    .get("compiled_prompt_path")
+                    .and_then(|p| p.as_str())
+                {
+                    let existing = PathBuf::from(compiled_path_str);
+                    let worker_root = store
+                        .worker_dir(task_id)
+                        .canonicalize()
+                        .unwrap_or_else(|_| store.worker_dir(task_id));
+                    let existing_owned = existing
+                        .canonicalize()
+                        .ok()
+                        .is_some_and(|path| path.starts_with(&worker_root));
+                    let stored_hash = receipt_val
+                        .get("compiled_prompt_hash")
+                        .and_then(|value| value.as_str())
+                        .filter(|value| !value.trim().is_empty());
+                    let content_hash_matches = existing
+                        .is_file()
+                        .then(|| fs::read_to_string(&existing).ok())
+                        .flatten()
+                        .zip(stored_hash)
+                        .is_some_and(|(content, hash)| prompt_content_hash(&content) == hash);
+                    if existing_owned && content_hash_matches {
+                        let reused = serde_json::json!({
+                            "schema_version": 1u32,
+                            "task_id": task_id,
+                            "attempt": task_attempt,
+                            "recovery_key": &instance_recovery_key,
+                            "recovery_reason": reason.as_key(),
+                            "semantic_contract_hash": manifest.semantic_contract_hash,
+                            "prompt_manifest_hash": &manifest_hash,
+                            "compiled_prompt_path": compiled_path_str,
+                            "compiled_prompt_hash": receipt_val
+                                .get("compiled_prompt_hash")
+                                .and_then(|h| h.as_str())
+                                .unwrap_or(""),
+                            "status": "reused",
+                            "created_at": crate::state::timestamp(),
+                        });
+                        store.write_worker_json_atomic(
+                            task_id,
+                            &format!("recovery-reused-{key_hash}.json"),
+                            &reused,
+                        )?;
+                        return Ok(existing);
+                    }
+                }
+            }
+        }
+    }
 
     let base_compiled = worker_compiled_prompt(&packet, &capsule)?;
     let base_tokens = estimate_prompt_tokens(&base_compiled);
@@ -6457,6 +8287,7 @@ pub fn compile_recovery_prompt(
         let receipt = serde_json::json!({
             "schema_version": 1u32,
             "task_id": task_id,
+            "attempt": task_attempt,
             "recovery_reason": reason.as_key(),
             "body_hash": body_hash_prefix,
             "step_suffix": step_suffix,
@@ -6521,6 +8352,7 @@ pub fn compile_recovery_prompt(
     let updated_capsule = serde_json::json!({
         "schema_version": 1u32,
         "task_id": &capsule.task_id,
+        "attempt": task_attempt,
         "worker": &capsule.worker,
         "runtime_model": &capsule.runtime_model,
         "model_family": &capsule.model_family,
@@ -6546,9 +8378,11 @@ pub fn compile_recovery_prompt(
     let receipt = serde_json::json!({
         "schema_version": 1u32,
         "task_id": task_id,
+        "attempt": task_attempt,
         "recovery_key": &instance_recovery_key,
         "recovery_reason": reason.as_key(),
         "semantic_contract_hash": &capsule.semantic_contract_hash,
+        "prompt_manifest_hash": &manifest_hash,
         "compiled_prompt_path": compiled_path.to_string_lossy().as_ref(),
         "compiled_prompt_hash": &compiled_hash,
         "status": "compiled",
@@ -7157,6 +8991,20 @@ pub fn worker_receipt_evidence_paths(result: &WorkerResult) -> Vec<PathBuf> {
         .parent()
         .map(|worker_directory| worker_directory.join("provider-cooldown.json"));
     push_if_exists(&mut paths, &provider_cooldown_path);
+    let claim_reconciliation_path = worker_claim_reconciliation_path(result);
+    push_if_exists(&mut paths, &claim_reconciliation_path);
+    let external_call_path = result
+        .result_path
+        .parent()
+        .map(|worker_directory| worker_directory.join("external-call.json"));
+    push_if_exists(&mut paths, &external_call_path);
+    let external_call_start_path = result
+        .result_path
+        .parent()
+        .map(|worker_directory| worker_directory.join("external-call-start.json"));
+    push_if_exists(&mut paths, &external_call_start_path);
+    let team_session_path = team_session_reconciliation_path(result);
+    push_if_exists(&mut paths, &team_session_path);
     paths
 }
 
@@ -7387,6 +9235,8 @@ pub fn write_result_and_outcome_with_outcome(
     result: &WorkerResult,
     outcome: &WorkerOutcome,
 ) -> Result<()> {
+    reconcile_worker_claims(store, task_id, result, outcome)?;
+    reconcile_team_session(store, task_id, outcome)?;
     let result_json =
         serde_json::to_string_pretty(result).context("failed to serialize worker result")?;
     store.write_worker_file(task_id, "result.json", &format!("{result_json}\n"))?;
@@ -7987,6 +9837,7 @@ mod tests {
         WorkerPacket {
             task_id: "task_manifest".to_string(),
             worker: "opencode".to_string(),
+            current_step_id: Some("step-001".to_string()),
             worker_model: Some("deepseek-v4-flash-free".to_string()),
             variant: Some("medium".to_string()),
             variant_applied: Some("medium".to_string()),
@@ -8026,6 +9877,44 @@ mod tests {
     }
 
     #[test]
+    fn worker_parameter_resolution_distinguishes_defaults_and_rejects_invalid_values() -> Result<()> {
+        let mut packet = prompt_manifest_test_packet();
+        packet.category_resolution.tools = packet.tools.clone();
+        let receipt = validate_worker_packet_parameters(&packet)?;
+        assert_eq!(receipt.status, "resolved");
+        assert!(receipt
+            .parameters
+            .iter()
+            .any(|parameter| parameter.name == "worker_model"
+                && parameter.state == WorkerParameterState::Configured));
+        assert!(receipt
+            .parameters
+            .iter()
+            .all(|parameter| parameter.state != WorkerParameterState::Invalid));
+        receipt.validate()?;
+
+        let mut invalid = serde_json::to_value(&packet)?;
+        invalid["worker"] = Value::Null;
+        invalid["tools"]["can_write"] = json!("yes");
+        invalid["variant_applied"] = json!("fast");
+        let invalid_receipt = validate_worker_parameter_value(&invalid)?;
+        assert_eq!(invalid_receipt.status, "invalid");
+        assert!(invalid_receipt
+            .errors
+            .iter()
+            .any(|error| error.contains("worker") && error.contains("null")));
+        assert!(invalid_receipt
+            .errors
+            .iter()
+            .any(|error| error.contains("tools.can_write") && error.contains("boolean")));
+        assert!(invalid_receipt
+            .errors
+            .iter()
+            .any(|error| error.contains("variant conflict")));
+        Ok(())
+    }
+
+    #[test]
     fn workspace_rules_follow_root_to_target_order_and_write_receipt() -> Result<()> {
         let workspace = tempfile::tempdir()?;
         let source = workspace.path().join("src");
@@ -8046,8 +9935,45 @@ mod tests {
         assert_eq!(receipt.schema_version, RULE_INJECTION_SCHEMA_VERSION);
         assert_eq!(receipt.target_paths, vec!["src"]);
         assert_eq!(receipt.entries.iter().filter(|entry| entry.injected).count(), 2);
+        let injected_entries = receipt
+            .entries
+            .iter()
+            .filter(|entry| entry.injected)
+            .collect::<Vec<_>>();
+        assert!(injected_entries.iter().all(|entry| {
+            entry.modified_at_ms > 0
+                && entry.match_reason == "walk_up"
+                && entry.precedence == entry.distance
+        }));
         assert!(!receipt.receipt_hash.is_empty());
         assert_eq!(receipt.injected_content_hash, prompt_content_hash(&rules));
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_rule_conflicts_are_persisted_and_block_dispatch() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let source = workspace.path().join("src");
+        fs::create_dir_all(&source)?;
+        fs::write(workspace.path().join("AGENTS.md"), "scope: root\n")?;
+        fs::write(workspace.path().join(".rules"), "scope: sibling\n")?;
+        let store = StateStore::new(workspace.path());
+        store.initialize()?;
+        let mut task = default_task_with_id("rules-conflict");
+        task.scope = Scope::new(vec!["src".to_string()], Vec::new(), 3);
+
+        let error = discover_workspace_rules(&store, workspace.path(), &task)
+            .expect_err("conflicting same-layer directives must block dispatch");
+        assert!(error.to_string().contains("context conflict"));
+        let receipt_path = store.worker_dir(&task.id).join("rules-injection.json");
+        let receipt: RuleInjectionReceipt =
+            serde_json::from_slice(&fs::read(receipt_path)?)?;
+        receipt.validate()?;
+        assert!(receipt.context_conflict);
+        assert!(receipt
+            .context_conflict_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("scope")));
         Ok(())
     }
 
@@ -8087,6 +10013,11 @@ mod tests {
         assert!(receipt
             .entries
             .iter()
+            .filter(|entry| entry.injected)
+            .all(|entry| entry.modified_at_ms > 0 && entry.precedence == entry.distance));
+        assert!(receipt
+            .entries
+            .iter()
             .any(|entry| entry.freshness == "disabled" && !entry.injected));
 
         let mut second_task = default_task_with_id("skills-second");
@@ -8114,6 +10045,95 @@ mod tests {
         )?)?;
         assert!(!receipt.cache_hit);
         assert!(receipt.entries.iter().any(|entry| entry.freshness == "stale"));
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_skills_prefer_more_specific_same_name() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let source = workspace.path().join("src");
+        fs::create_dir_all(workspace.path().join(".agents/skills/review"))?;
+        fs::create_dir_all(source.join(".agents/skills/review"))?;
+        fs::write(
+            workspace.path().join(".agents/skills/review/SKILL.md"),
+            "# Root review\nUse the root workflow.\n",
+        )?;
+        fs::write(
+            source.join(".agents/skills/review/SKILL.md"),
+            "# Target review\nUse the target workflow.\n",
+        )?;
+        let store = StateStore::new(workspace.path());
+        store.initialize()?;
+        let mut task = default_task_with_id("skills-precedence");
+        task.scope = Scope::new(vec!["src".to_string()], Vec::new(), 3);
+
+        let (skills, receipt_path) = discover_workspace_skills(&store, workspace.path(), &task)?;
+        let skills = skills.context("specific skill should be injected")?;
+        assert!(skills.contains("Target review"));
+        assert!(!skills.contains("Root review"));
+        let receipt: SkillInjectionReceipt =
+            serde_json::from_slice(&fs::read(receipt_path.context("receipt path")?)?)?;
+        receipt.validate()?;
+        assert!(receipt.entries.iter().any(|entry| {
+            entry.freshness == "shadowed_precedence"
+                && !entry.injected
+                && entry
+                    .omission_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("more specific target"))
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_skills_enforce_agent_restrictions_and_required_failures() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        fs::create_dir_all(workspace.path().join(".agents/skills/review-only"))?;
+        fs::write(
+            workspace
+                .path()
+                .join(".agents/skills/review-only/SKILL.md"),
+            "---\nagents: [review]\nrequired: true\n---\n# Review-only skill\n",
+        )?;
+        let store = StateStore::new(workspace.path());
+        store.initialize()?;
+        let task = default_task_with_id("skills-restricted");
+
+        let error = discover_workspace_skills_for_worker(
+            &store,
+            workspace.path(),
+            &task,
+            "opencode",
+            "deep",
+        )
+        .expect_err("required skill restricted to another worker must block dispatch");
+        assert!(error.to_string().contains("required workspace skill"));
+        let receipt: SkillInjectionReceipt = serde_json::from_slice(&fs::read(
+            store.worker_dir(&task.id).join("skills-injection.json"),
+        )?)?;
+        receipt.validate()?;
+        assert_eq!(receipt.worker, "opencode");
+        assert_eq!(receipt.worker_category, "deep");
+        assert!(receipt.entries.iter().any(|entry| {
+            entry.match_reason == "agent_restricted"
+                && entry.freshness == "restricted"
+                && !entry.injected
+        }));
+
+        let review_task = default_task_with_id("skills-restricted-review");
+        let (skills, receipt_path) = discover_workspace_skills_for_worker(
+            &store,
+            workspace.path(),
+            &review_task,
+            "opencode",
+            "review",
+        )?;
+        assert!(skills.is_some_and(|skills| skills.contains("Review-only skill")));
+        let receipt: SkillInjectionReceipt = serde_json::from_slice(&fs::read(
+            receipt_path.context("review skill receipt path")?,
+        )?)?;
+        receipt.validate()?;
+        assert!(receipt.entries.iter().any(|entry| entry.injected));
         Ok(())
     }
 
@@ -8195,6 +10215,7 @@ mod tests {
     fn prompt_manifest_separates_hard_contract_from_route_drift() -> Result<()> {
         let packet = prompt_manifest_test_packet();
         let prompt = worker_prompt(&packet)?;
+        assert!(prompt.contains("\"current_step_id\"") && prompt.contains("step-001"));
         let manifest = prompt_manifest_for_packet(&packet, &prompt)?;
         manifest.validate(&packet, &prompt)?;
         assert!(
@@ -8239,10 +10260,57 @@ mod tests {
             prompt_semantic_contract_hash(&changed_contract)?
         );
 
-        let mut tampered = manifest.clone();
+        let mut changed_step = packet.clone();
+        changed_step.current_step_id = Some("step-002".to_string());
+        assert_ne!(
+            manifest.semantic_contract_hash,
+            prompt_semantic_contract_hash(&changed_step)?
+        );
+
+        let mut tampered = manifest;
         tampered.task_id = "other-task".to_string();
         assert!(tampered.validate(&packet, &prompt).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn phase_prompt_goal_is_hash_bound_without_duplicate_hard_payload() -> Result<()> {
+        let previous_limit = env::var("GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS").ok();
+        let result = (|| -> Result<()> {
+            let mut packet = prompt_manifest_test_packet();
+            packet.worker_model = Some("opencode-go/deepseek-v4-flash".to_string());
+            packet.inputs.phase_route_locked = true;
+            packet.goal = "phase evidence ".repeat(8_000);
+            let prompt = worker_prompt(&packet)?;
+            assert!(prompt.contains(&packet.goal));
+            assert!(prompt.contains("full phase request follows below"));
+            let manifest = prompt_manifest_for_packet(&packet, &prompt)?;
+            let hard_tokens: usize = manifest
+                .sections
+                .iter()
+                .filter(|section| section.required)
+                .map(|section| section.estimated_tokens)
+                .sum();
+            assert!(hard_tokens < 32_768, "phase prompt was duplicated in hard sections");
+            unsafe {
+                env::set_var("GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS", "32768");
+            }
+            let capsule = build_prompt_capsule(
+                &packet,
+                &manifest,
+                &prompt,
+                &PromptCapsuleRecoveryReason::Dispatch,
+            )?;
+            capsule.validate()?;
+            Ok(())
+        })();
+        unsafe {
+            match previous_limit {
+                Some(value) => env::set_var("GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS", value),
+                None => env::remove_var("GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS"),
+            }
+        }
+        result
     }
 
     #[test]
@@ -8398,6 +10466,76 @@ mod tests {
     }
 
     #[test]
+    fn persisted_prompt_capsule_is_bound_to_current_packet_and_manifest() -> Result<()> {
+        let packet = prompt_manifest_test_packet();
+        let prompt = worker_prompt(&packet)?;
+        let manifest = prompt_manifest_for_packet(&packet, &prompt)?;
+        let mut capsule = build_prompt_capsule(
+            &packet,
+            &manifest,
+            &prompt,
+            &PromptCapsuleRecoveryReason::Resume,
+        )?;
+        capsule.validate_against(&packet, &manifest)?;
+
+        capsule.task_id = "stale-task".to_string();
+        let error = capsule
+            .validate_against(&packet, &manifest)
+            .expect_err("stale capsule must not be reused");
+        assert!(error.to_string().contains("task identity"));
+        Ok(())
+    }
+
+    #[test]
+    fn prompt_budget_policy_uses_a_larger_default_for_paid_opencode_models() {
+        let previous_global = env::var("GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS").ok();
+        let previous_paid =
+            env::var("GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS_OPENCODE_GO_MIMO_V2_5").ok();
+        unsafe {
+            env::remove_var("GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS");
+            env::remove_var("GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS_OPENCODE_GO_MIMO_V2_5");
+        }
+
+        let paid_policy = prompt_budget_policy(Some("opencode-go/mimo-v2.5"));
+        assert_eq!(paid_policy.context_limit_tokens, DEFAULT_PAID_CONTEXT_LIMIT_TOKENS);
+        assert_eq!(paid_policy.prompt_budget_tokens, DEFAULT_PAID_CONTEXT_LIMIT_TOKENS);
+        assert!(paid_policy.estimated);
+        assert_eq!(paid_policy.source, "paid_model_conservative_default");
+
+        let unknown_policy = prompt_budget_policy(Some("opencode/mimo-v2.5-free"));
+        assert_eq!(unknown_policy.context_limit_tokens, DEFAULT_CONTEXT_LIMIT_TOKENS);
+        assert_eq!(unknown_policy.source, "conservative_default");
+
+        let deepseek_free_policy =
+            prompt_budget_policy(Some("opencode/deepseek-v4-flash-free"));
+        assert_eq!(
+            deepseek_free_policy.context_limit_tokens,
+            DEFAULT_PAID_CONTEXT_LIMIT_TOKENS
+        );
+        assert_eq!(
+            deepseek_free_policy.source,
+            "deepseek_flash_conservative_default"
+        );
+        assert!(deepseek_free_policy.estimated);
+
+        unsafe {
+            match previous_global {
+                Some(value) => env::set_var("GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS", value),
+                None => env::remove_var("GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS"),
+            }
+            match previous_paid {
+                Some(value) => env::set_var(
+                    "GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS_OPENCODE_GO_MIMO_V2_5",
+                    value,
+                ),
+                None => env::remove_var(
+                    "GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS_OPENCODE_GO_MIMO_V2_5",
+                ),
+            }
+        }
+    }
+
+    #[test]
     fn prompt_budget_policy_records_precedence_and_headroom() {
         let previous_global = env::var("GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS").ok();
         let previous_model = env::var("GEARBOX_WORKER_CONTEXT_LIMIT_TOKENS_OPENCODE_DEEPSEEK_V4_FLASH").ok();
@@ -8468,6 +10606,10 @@ mod tests {
             let clipped = clipped.context("expected a soft section to be clipped")?;
             assert!(clipped.retained_bytes < clipped.bytes);
             assert!(clipped.deleted_bytes > 0);
+            assert!(
+                capsule.used_tokens <= capsule.budget_tokens,
+                "capsule accounting must use retained tokens, not pre-clipping estimates"
+            );
             let compiled = worker_compiled_prompt(&packet, &capsule)?;
             assert!(compiled.contains("Bounded"));
             assert!(estimate_prompt_tokens(&compiled) <= capsule.budget_tokens);
@@ -8624,6 +10766,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn durable_current_step_cursor_is_fail_closed_and_preferred() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task_id = "task_step_cursor";
+        let step_path = store.worker_dir(task_id).join("current-step-id");
+
+        assert_eq!(read_durable_current_step_id(&store, task_id)?, None);
+        fs::create_dir_all(store.worker_dir(task_id))?;
+        fs::write(&step_path, "step-002\n")?;
+        assert_eq!(
+            read_durable_current_step_id(&store, task_id)?.as_deref(),
+            Some("step-002")
+        );
+        fs::write(&step_path, "\nstep-003\nstep-004")?;
+        let error = read_durable_current_step_id(&store, task_id)
+            .expect_err("multi-line cursor must not fall back to the first plan step");
+        assert!(error.to_string().contains("malformed"));
+        Ok(())
+    }
+
     fn prompt_reconcile_test_descriptor(
         task_id: &str,
         worker_model: Option<&str>,
@@ -8670,7 +10834,7 @@ mod tests {
         assert!(resumed.session_reused);
         resumed.validate_against(&packet, &manifest)?;
 
-        let mut rerouted = packet.clone();
+        let mut rerouted = packet;
         rerouted.worker_model = Some("opencode/mimo-v2.5-free".to_string());
         let rerouted_prompt = worker_prompt(&rerouted)?;
         let rerouted_manifest = prompt_manifest_for_packet(&rerouted, &rerouted_prompt)?;
@@ -10150,6 +12314,14 @@ mod tests {
             coordinator_brief: None,
             route_hint: None,
         })?;
+        let parameter_receipt: WorkerParameterResolutionReceipt = serde_json::from_slice(
+            &fs::read(store.worker_dir(&task.id).join("parameter-resolution.json"))?,
+        )?;
+        parameter_receipt.validate()?;
+        assert!(matches!(
+            parameter_receipt.status.as_str(),
+            "resolved" | "unknown"
+        ));
         let outcome = handle.wait_for_outcome()?;
 
         assert_eq!(outcome.status, WorkerStatus::Skipped);
@@ -11139,6 +13311,7 @@ esac
             store: store.clone(),
             workspace: temp_dir.path().to_path_buf(),
             task_id: task_id.to_string(),
+            task_attempt: 1,
             worker_name: "test_worker".to_string(),
             skip_worker: false,
             command: None,
@@ -11261,6 +13434,18 @@ esac
             tool_events.contains("\"tool_call_finished\""),
             "tool-events should contain tool_call_finished"
         );
+        assert!(
+            tool_events.contains("unknown: tool result was not present"),
+            "missing command-backed tool results must remain explicit unknown evidence"
+        );
+        let validation: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
+            store.worker_dir(task_id).join("tool-pair-validation.json"),
+        )?)?;
+        assert_eq!(validation["status"], "unknown");
+        assert_eq!(validation["started_calls"], 2);
+        assert_eq!(validation["finished_calls"], 2);
+        assert_eq!(validation["unknown_results"], 2);
+        assert_eq!(validation["task_id"], task_id);
 
         Ok(())
     }
@@ -11290,6 +13475,7 @@ esac
             store: store.clone(),
             workspace: temp_dir.path().to_path_buf(),
             task_id: task_id.to_string(),
+            task_attempt: 1,
             worker_name: "test_worker".to_string(),
             skip_worker: false,
             command: None,
@@ -11393,6 +13579,7 @@ esac
             store: store.clone(),
             workspace: temp_dir.path().to_path_buf(),
             task_id: task_id.to_string(),
+            task_attempt: 1,
             worker_name: "test_worker".to_string(),
             skip_worker: false,
             command: None,
@@ -12142,6 +14329,92 @@ esac
         assert!(contract.supports_interaction);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn opencode_session_worker_bounds_provider_call_by_goal_lease() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let goal_id = "goal_runtime_deadline";
+        let now = chrono::Utc::now();
+        let lease_path = store.goal_run_lease_path(goal_id);
+        let lease = crate::state::GoalRunLease {
+            schema_version: 1,
+            goal_id: goal_id.to_string(),
+            epoch_id: "epoch_runtime_deadline".to_string(),
+            owner_session_id: "session_runtime_deadline".to_string(),
+            lease_id: "lease_runtime_deadline".to_string(),
+            acquired_at: now.to_rfc3339(),
+            expires_at: (now + chrono::Duration::milliseconds(500)).to_rfc3339(),
+        };
+        fs::write(&lease_path, format!("{}\n", serde_json::to_string_pretty(&lease)?))?;
+        let task = Task {
+            id: "task_runtime_deadline".to_string(),
+            goal_id: goal_id.to_string(),
+            parent_task_id: None,
+            title: "bounded provider call".to_string(),
+            kind: crate::state::TaskKind::Review,
+            status: crate::state::TaskStatus::Pending,
+            assigned_worker: Some(WorkerKind::OpencodeSession.as_str().to_string()),
+            attempt: 1,
+            scope: Scope::new(Vec::new(), vec![".git".to_string()], 1),
+            inputs: TaskInputs::default(),
+            outputs: crate::state::TaskOutputs::default(),
+        };
+        let config = WorkerConfig {
+            worker_kind: WorkerKind::OpencodeSession,
+            worker_command: Some("sleep 2".to_string()),
+            worker_model: Some("opencode-go/deepseek-v4-flash".to_string()),
+            worker_routes: Vec::new(),
+            unavailable_worker_models: Vec::new(),
+            premium_worker_budget: 1,
+            max_parallel_workers: 1,
+            max_parallel_per_key: 1,
+            stale_task_timeout_secs: 30,
+            skip_worker: false,
+            default_worker_for_small_tasks: WorkerKind::ZedAgent,
+            require_worker: true,
+        };
+
+        let handle = OpencodeSessionWorker {}.start(WorkerStartRequest {
+            store: &store,
+            workspace: temp_dir.path(),
+            task: &task,
+            route_attempt: 1,
+            goal: "bound a slow provider call to the goal lease",
+            verification_commands: &[],
+            config: &config,
+            cancellation_token: None,
+            coordinator_model: None,
+            coordinator_brief: None,
+            route_hint: None,
+        })?;
+        let error = handle
+            .wait_for_result()
+            .expect_err("provider command must stop at the goal lease deadline");
+        assert!(error.to_string().contains("timed out"));
+
+        let worker_dir = store.worker_dir(&task.id);
+        let deadline_receipt: serde_json::Value = serde_json::from_str(&fs::read_to_string(
+            worker_dir.join(WORKER_RUNTIME_DEADLINE_FILE),
+        )?)?;
+        assert_eq!(
+            deadline_receipt["goal_id"].as_str(),
+            Some(goal_id),
+            "deadline receipt must bind the goal"
+        );
+        assert!(deadline_receipt["deadline_at_ms"].as_u64().is_some());
+
+        let external_receipt: serde_json::Value = serde_json::from_str(&fs::read_to_string(
+            worker_dir.join("external-call.json"),
+        )?)?;
+        assert_eq!(external_receipt["status"].as_str(), Some("deadline_exceeded"));
+        assert!(external_receipt["deadline_at_ms"].as_u64().is_some());
+        assert!(worker_dir.join("external-call-start.json").is_file());
+        assert!(worker_dir.join("process-cleanup.json").is_file());
+        Ok(())
+    }
+
     #[test]
     fn test_codex_adapter_dispatch_contract() {
         let cmd = WorkerKind::Codex.default_command(Some("gpt-4.1"));
@@ -12516,7 +14789,22 @@ esac
 
     #[test]
     fn omo_plugin_config_dir_creates_expected_structure() -> Result<()> {
-        let dir = setup_omo_plugin_config_dir()?;
+        let dir = setup_omo_plugin_config_dir_with_read_only(false)?;
+        let opencode_config_path = dir.path().join("opencode").join("opencode.json");
+        assert!(
+            opencode_config_path.is_file(),
+            "expected {} to exist",
+            opencode_config_path.display()
+        );
+        let opencode_content = fs::read_to_string(&opencode_config_path)?;
+        let opencode_parsed: serde_json::Value = serde_json::from_str(&opencode_content)?;
+        let plugins = opencode_parsed["plugin"]
+            .as_array()
+            .expect("OpenCode plugin registration should be an array");
+        assert!(
+            plugins.iter().any(|plugin| plugin == "oh-my-openagent"),
+            "expected oh-my-openagent plugin registration"
+        );
         let config_path = dir.path().join("opencode").join("oh-my-openagent.json");
         assert!(
             config_path.is_file(),
@@ -12543,6 +14831,8 @@ esac
             .expect("team_mode should be an object");
         assert_eq!(team_mode["enabled"], false);
         assert_eq!(team_mode["max_parallel_members"], 2);
+        assert_eq!(obj["model_fallback"], false);
+        assert_eq!(obj["runtime_fallback"], false);
         let bg_task = obj["background_task"]
             .as_object()
             .expect("background_task should be an object");
@@ -12550,14 +14840,30 @@ esac
         let disabled = obj["disabled_mcps"]
             .as_array()
             .expect("disabled_mcps should be an array");
-        assert!(disabled.is_empty(), "expected empty disabled_mcps");
+        assert_eq!(disabled, &[serde_json::json!("lsp")]);
+        Ok(())
+    }
+
+    #[test]
+    fn omo_plugin_config_dir_denies_mutating_tools_for_read_only_workers() -> Result<()> {
+        let dir = setup_omo_plugin_config_dir_with_read_only(true)?;
+        let config_path = dir.path().join("opencode").join("opencode.json");
+        let content = fs::read_to_string(config_path)?;
+        let parsed: serde_json::Value = serde_json::from_str(&content)?;
+        assert_eq!(parsed["permission"]["edit"], "deny");
+        assert_eq!(parsed["permission"]["bash"]["*"], "allow");
+        assert_eq!(parsed["permission"]["bash"]["* > *"], "deny");
+        assert_eq!(parsed["permission"]["bash"]["*git add*"], "deny");
+        assert_eq!(parsed["permission"]["task"], "deny");
+        assert_eq!(parsed["permission"]["read"], "allow");
+        assert_eq!(parsed["permission"]["grep"], "allow");
         Ok(())
     }
 
     #[test]
     fn omo_plugin_config_dir_is_cleaned_up_on_drop() -> Result<()> {
         let config_path = {
-            let dir = setup_omo_plugin_config_dir()?;
+            let dir = setup_omo_plugin_config_dir_with_read_only(false)?;
             let path = dir.path().join("opencode").join("oh-my-openagent.json");
             assert!(path.is_file(), "config file should exist before drop");
             path
@@ -12606,11 +14912,12 @@ esac
         )?;
         assert!(result_a.is_file(), "first call should produce a compiled prompt");
 
-        // Same body A, different stem → should reuse (same body hash + same step)
+        // Replaying the exact interaction (same stem) may reuse its compiled
+        // prompt; a new interaction stem must receive a fresh artifact.
         let result_a_reuse = compile_recovery_prompt(
             &store, task_id, command, body_a, &reason,
             &packet_path, &manifest_path, &capsule_path,
-            "follow-up-2", Some("step-002"),
+            "follow-up-1", Some("step-002"),
         )?;
         assert_eq!(
             result_a, result_a_reuse,
@@ -12624,6 +14931,37 @@ esac
             .any(|e| e.file_name().to_string_lossy().contains("recovery-reused"));
         assert!(has_reused, "should have a reused receipt");
 
+        let result_a_new_interaction = compile_recovery_prompt(
+            &store,
+            task_id,
+            command,
+            body_a,
+            &reason,
+            &packet_path,
+            &manifest_path,
+            &capsule_path,
+            "follow-up-2",
+            Some("step-002"),
+        )?;
+        assert_ne!(
+            result_a,
+            result_a_new_interaction,
+            "a new interaction attempt must not reuse the old compiled prompt"
+        );
+
+        // A receipt alone is not proof that the compiled artifact is still
+        // the one that was issued.  Tampering must force a fresh compilation
+        // instead of returning the modified prompt under the old key.
+        let original_content = fs::read_to_string(&result_a)?;
+        fs::write(&result_a, "tampered recovery prompt")?;
+        let rebuilt = compile_recovery_prompt(
+            &store, task_id, command, body_a, &reason,
+            &packet_path, &manifest_path, &capsule_path,
+            "follow-up-1", Some("step-002"),
+        )?;
+        assert_eq!(rebuilt, result_a, "same interaction should rebuild in place");
+        assert_eq!(fs::read_to_string(rebuilt)?, original_content);
+
         // Body B → different compiled prompt
         let body_b = "different follow-up instruction B";
         let result_b = compile_recovery_prompt(
@@ -12636,6 +14974,64 @@ esac
             "different body should produce different compiled prompt"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn compile_recovery_prompt_rejects_corrupt_capsule_before_reuse() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task_id = "task_corrupt_capsule";
+        let mut packet = prompt_manifest_test_packet();
+        packet.task_id = task_id.to_string();
+        let prompt = worker_prompt(&packet)?;
+        let manifest = prompt_manifest_for_packet(&packet, &prompt)?;
+        let capsule = build_prompt_capsule(
+            &packet,
+            &manifest,
+            &prompt,
+            &PromptCapsuleRecoveryReason::Resume,
+        )?;
+        let packet_path = temp_dir.path().join("packet.json");
+        let manifest_path = temp_dir.path().join("manifest.json");
+        let capsule_path = temp_dir.path().join("capsule.json");
+        fs::write(&packet_path, serde_json::to_string(&packet)?)?;
+        fs::write(&manifest_path, serde_json::to_string(&manifest)?)?;
+        fs::write(&capsule_path, serde_json::to_string(&capsule)?)?;
+
+        let reason = PromptCapsuleRecoveryReason::Resume;
+        let first = compile_recovery_prompt(
+            &store,
+            task_id,
+            "echo ok",
+            "resume body",
+            &reason,
+            &packet_path,
+            &manifest_path,
+            &capsule_path,
+            "resume-1",
+            Some("step-002"),
+        )?;
+        assert!(first.is_file());
+
+        // A receipt and compiled file cannot authorize a recovery when the
+        // persisted capsule is no longer parseable.
+        fs::write(&capsule_path, "{not-json")?;
+        let error = compile_recovery_prompt(
+            &store,
+            task_id,
+            "echo ok",
+            "resume body",
+            &reason,
+            &packet_path,
+            &manifest_path,
+            &capsule_path,
+            "resume-corrupt",
+            Some("step-002"),
+        )
+        .expect_err("corrupt capsule must block receipt reuse");
+        assert!(error.to_string().contains("invalid capsule JSON"));
         Ok(())
     }
 
@@ -12767,6 +15163,53 @@ esac
     }
 
     #[test]
+    fn recovery_capsule_failure_does_not_send_uncompiled_prompt() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task_id = "task_recovery_blocked";
+        let handle = CommandWorkerSessionHandle {
+            store,
+            workspace: temp_dir.path().to_path_buf(),
+            task_id: task_id.to_string(),
+            task_attempt: 1,
+            worker_name: "test_worker".to_string(),
+            skip_worker: false,
+            command: Some("touch should-not-run".to_string()),
+            command_timeout: Some(Duration::from_secs(30)),
+            worker_model: None,
+            model_variant: None,
+            tool_policy: WorkerToolPolicy::default(),
+            packet_path: temp_dir.path().join("missing-packet.json"),
+            prompt_path: temp_dir.path().join("prompt.md"),
+            prompt_manifest_path: temp_dir.path().join("missing-manifest.json"),
+            prompt_reconcile_path: temp_dir.path().join("prompt-reconcile.json"),
+            prompt_capsule_path: temp_dir.path().join("missing-capsule.json"),
+            subscriptions: Arc::new(WorkerSessionSubscriptions::default()),
+            session_state: Mutex::new(ResidentSessionState {
+                cancellation_token: CancellationToken::new(),
+                active_command: false,
+                revive_count: 0,
+                interrupt_count: 0,
+                turn_epoch: 0,
+                stale_reason: None,
+            }),
+            result: Mutex::new(None),
+            last_output: Mutex::new(None),
+            follow_up_count: Mutex::new(0),
+            supports_interaction: true,
+            omo_config_dir: None,
+        };
+
+        let error = handle
+            .send_follow_up("resume the current step".to_string())
+            .expect_err("missing capsule inputs must block recovery dispatch");
+        assert!(error.to_string().contains("capsule compilation blocked"));
+        assert!(!temp_dir.path().join("should-not-run").exists());
+        Ok(())
+    }
+
+    #[test]
     fn destructive_command_is_rejected_before_process_spawn() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let store = StateStore::new(temp_dir.path());
@@ -12776,6 +15219,7 @@ esac
             store: store.clone(),
             workspace: temp_dir.path().to_path_buf(),
             task_id: task_id.to_string(),
+            task_attempt: 1,
             worker_name: "test_worker".to_string(),
             skip_worker: false,
             command: Some("sh -c 'git checkout main; touch spawned-by-worker'".to_string()),
@@ -12874,6 +15318,129 @@ esac
         assert_eq!(receipt["status"], "degraded");
         assert_eq!(receipt["error_category"], "manifest_read_failure");
 
+        Ok(())
+    }
+
+    #[test]
+    fn worker_claim_reconciliation_persists_discrepancy_for_unobserved_claim() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let workspace = temp_dir.path();
+        let git_init = crate::tools::run_raw_git(workspace, &["init", "-q"])?;
+        assert!(git_init.success);
+        fs::write(workspace.join("observed.rs"), "fn observed() {}\n")?;
+
+        let store = StateStore::new(workspace);
+        store.initialize()?;
+        let task_id = "task_claim_reconcile";
+        let last_message = store.write_worker_file(
+            task_id,
+            "last-message.md",
+            "# Changed Files\n\n- missing.rs\n\n# Summary\n\nclaimed a file that was not written\n",
+        )?;
+        let result = WorkerResult {
+            status: WorkerStatus::Succeeded,
+            command: Some("echo worker".to_string()),
+            exit_code: Some(0),
+            summary: "worker completed".to_string(),
+            packet_path: store.worker_dir(task_id).join("packet.json"),
+            prompt_path: store.worker_dir(task_id).join("prompt.md"),
+            stdout_path: None,
+            stderr_path: None,
+            last_message_path: Some(last_message),
+            result_path: store.worker_dir(task_id).join("result.json"),
+            outcome_path: store.worker_dir(task_id).join("outcome.json"),
+        };
+        let outcome = WorkerOutcome {
+            status: WorkerStatus::Succeeded,
+            session_id: Some("session-claim".to_string()),
+            session_capability: None,
+            summary: "worker completed".to_string(),
+            changed_files: vec!["missing.rs".to_string()],
+            commands_run: vec!["echo worker".to_string()],
+            known_failures: Vec::new(),
+            raw_output_path: result.last_message_path.clone(),
+            command: result.command.clone(),
+            exit_code: result.exit_code,
+        };
+
+        let receipt = reconcile_worker_claims(&store, task_id, &result, &outcome)?;
+        assert_eq!(receipt.status, "discrepancy");
+        assert_eq!(receipt.missing_claims, vec!["missing.rs"]);
+        assert!(receipt.observed_changed_files.contains(&"observed.rs".to_string()));
+        receipt.validate()?;
+        assert!(
+            store
+                .worker_dir(task_id)
+                .join("claim-reconciliation.json")
+                .exists()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn team_session_reconciliation_blocks_team_events_when_team_mode_is_disabled() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task_id = "task_team_reconcile";
+        store.write_worker_file(
+            task_id,
+            "transcript.jsonl",
+            "{\"event\":\"member_error\",\"team_run_id\":\"team-1\",\"member_id\":\"member-1\"}\n{\"event\":\"message\",\"team_run_id\":\"team-1\",\"undelivered\":true,\"reorderable\":true}\n{\"event\":\"orphan\",\"team_run_id\":\"team-1\",\"leader_deleted\":true}\n",
+        )?;
+        let outcome = WorkerOutcome {
+            status: WorkerStatus::Succeeded,
+            session_id: Some("session-team".to_string()),
+            session_capability: None,
+            summary: "team-shaped output".to_string(),
+            changed_files: Vec::new(),
+            commands_run: Vec::new(),
+            known_failures: Vec::new(),
+            raw_output_path: None,
+            command: None,
+            exit_code: Some(0),
+        };
+
+        let receipt = reconcile_team_session(&store, task_id, &outcome)?;
+        assert_eq!(receipt.status, "blocked");
+        assert_eq!(receipt.observed_team_events, 3);
+        assert_eq!(receipt.orphan_events, 1);
+        assert_eq!(receipt.member_error_events, 1);
+        assert_eq!(receipt.undelivered_message_events, 1);
+        assert_eq!(receipt.reorderable_message_events, 1);
+        receipt.validate()?;
+        assert!(
+            store
+                .worker_dir(task_id)
+                .join("team-session-reconciliation.json")
+                .exists()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn team_session_reconciliation_records_disabled_without_team_events() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = StateStore::new(temp_dir.path());
+        store.initialize()?;
+        let task_id = "task_team_disabled";
+        let outcome = WorkerOutcome {
+            status: WorkerStatus::Succeeded,
+            session_id: Some("session-single".to_string()),
+            session_capability: None,
+            summary: "single worker output".to_string(),
+            changed_files: Vec::new(),
+            commands_run: Vec::new(),
+            known_failures: Vec::new(),
+            raw_output_path: None,
+            command: None,
+            exit_code: Some(0),
+        };
+
+        let receipt = reconcile_team_session(&store, task_id, &outcome)?;
+        assert_eq!(receipt.status, "disabled");
+        assert_eq!(receipt.observed_team_events, 0);
+        receipt.validate()?;
         Ok(())
     }
 }

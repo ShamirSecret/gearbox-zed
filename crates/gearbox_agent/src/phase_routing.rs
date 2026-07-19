@@ -21,6 +21,22 @@ pub const ALL_PHASE_PROFILES: &[PhaseProfile] = &[
     PhaseProfile::Summarizer,
 ];
 
+/// OpenCode planning and review phases may deliberately dispatch through the
+/// Explore worker category so the external tool resolver is read-only. The
+/// phase's conceptual category remains part of the route decision; receipts
+/// record the effective Explore category as an explicit, bounded override.
+fn allows_read_only_explore_category(phase: &PhaseProfile) -> bool {
+    matches!(
+        phase,
+        PhaseProfile::Planner
+            | PhaseProfile::PlanCritic
+            | PhaseProfile::ReviewerTask
+            | PhaseProfile::ReviewerFinal
+            | PhaseProfile::StrategistNextGoal
+            | PhaseProfile::Summarizer
+    )
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PhaseRouteTable {
     pub schema_version: u32,
@@ -673,10 +689,11 @@ impl PhaseRouteTable {
 }
 
 /// Return the explicitly supported paid OpenCode Go fallback for a free
-/// OpenCode phase route.  The fallback is role-specific: Mimo handles
-/// planning/review, while DeepSeek handles execution/summarization.  Custom
-/// or already-paid routes remain single-candidate routes so explicit user
-/// configuration is not silently rewritten.
+/// OpenCode phase route. DeepSeek free routes stay within the same model
+/// family for every phase; legacy Mimo free routes retain their role-specific
+/// planning/review fallback. Custom or already-paid routes remain
+/// single-candidate routes so explicit user configuration is not silently
+/// rewritten.
 pub(crate) fn opencode_paid_fallback_model(
     phase: PhaseProfile,
     configured_model: &str,
@@ -684,6 +701,9 @@ pub(crate) fn opencode_paid_fallback_model(
     let (provider, model) = configured_model.split_once('/')?;
     if provider != "opencode" || !model.ends_with("-free") {
         return None;
+    }
+    if model == "deepseek-v4-flash-free" {
+        return Some("opencode-go/deepseek-v4-flash");
     }
     match phase {
         PhaseProfile::Planner | PhaseProfile::PlanCritic | PhaseProfile::ReviewerTask
@@ -1163,8 +1183,13 @@ impl PhaseRouteReceipt {
             {
                 bail!("worker phase receipt actual worker violates its route decision");
             }
+            let category_matches_decision = self.actual_category == Some(self.decision.category);
+            let category_is_bounded_read_only_override = self.actual_category
+                == Some(WorkerCategory::Explore)
+                && allows_read_only_explore_category(&self.decision.phase);
             if self.decision.candidate.backend != PhaseBackend::LegacyCategory
-                && self.actual_category != Some(self.decision.category)
+                && !category_matches_decision
+                && !category_is_bounded_read_only_override
             {
                 bail!("worker phase receipt actual category violates its route decision");
             }
@@ -1826,6 +1851,30 @@ mod tests {
             reviewer: "opencode-go/mimo-v2.5".to_string(),
         })?;
         assert_eq!(paid_table.profile(&PhaseProfile::Planner)?.candidates.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn deepseek_free_routes_never_fallback_to_mimo() -> Result<()> {
+        let table = PhaseRouteTable::opencode_only(OpenCodeModelProfiles {
+            planner: "opencode/deepseek-v4-flash-free".to_string(),
+            executor: "opencode/deepseek-v4-flash-free".to_string(),
+            reviewer: "opencode/deepseek-v4-flash-free".to_string(),
+        })?;
+        for phase in [
+            PhaseProfile::Planner,
+            PhaseProfile::PlanCritic,
+            PhaseProfile::ExecutorDeep,
+            PhaseProfile::ReviewerFinal,
+        ] {
+            let candidates = &table.profile(&phase)?.candidates;
+            assert_eq!(candidates.len(), 2);
+            assert!(matches!(
+                &candidates[1].model,
+                PhaseModelBinding::BackendDeclared(model)
+                    if model == "opencode-go/deepseek-v4-flash"
+            ));
+        }
         Ok(())
     }
 

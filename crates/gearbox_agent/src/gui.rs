@@ -108,9 +108,9 @@ pub struct GearRuntimeProcessHealth {
 /// Durable resource-protection receipts projected for the GUI.
 ///
 /// The runtime remains the source of truth: this is only a bounded summary of
-/// `resource-policy.json` and `process-cleanup.json` artifacts. A missing
-/// receipt is surfaced as `not_recorded` instead of being interpreted as a
-/// successful cleanup.
+/// `resource-policy.json`, `process-cleanup.json`, and process-resource
+/// artifacts. A missing receipt is surfaced as `not_recorded` instead of
+/// being interpreted as a successful cleanup.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GearRuntimeResourceProtectionSummary {
     #[serde(default)]
@@ -127,6 +127,20 @@ pub struct GearRuntimeResourceProtectionSummary {
     pub cleanup_receipts: usize,
     #[serde(default)]
     pub cleanup_orphans: usize,
+    #[serde(default)]
+    pub resource_receipts: usize,
+    #[serde(default)]
+    pub resource_samples: usize,
+    #[serde(default)]
+    pub resource_processes: usize,
+    #[serde(default)]
+    pub resource_peak_rss_bytes: u64,
+    #[serde(default)]
+    pub resource_failures: usize,
+    #[serde(default)]
+    pub external_call_receipts: usize,
+    #[serde(default)]
+    pub external_call_failures: usize,
     #[serde(default = "default_resource_status")]
     pub watcher_status: String,
     #[serde(default = "default_resource_status")]
@@ -284,6 +298,8 @@ pub struct GearRuntimePlanRevisionDiff {
     pub requires_re_review: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canonical_applied: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1656,45 +1672,139 @@ fn resource_protection_snapshot(
                 .map(|entry| entry.file_name().to_string_lossy().into_owned()),
         );
     }
+    if store.root().join("internal-git").is_dir() {
+        task_ids.push("internal-git".to_string());
+    }
     task_ids.sort();
     task_ids.dedup();
 
     let mut summary = GearRuntimeResourceProtectionSummary::default();
     for task_id in task_ids.into_iter().take(64) {
-        let worker_dir = store.worker_dir(&task_id);
+        let worker_dir = if task_id == "internal-git" {
+            store.root().join("internal-git")
+        } else {
+            store.worker_dir(&task_id)
+        };
         let policy_path = worker_dir.join("resource-policy.json");
-        if let Some(policy) = read_bounded_json_value(&policy_path) {
-            summary.policy_receipts = summary.policy_receipts.saturating_add(1);
-            match policy.get("status").and_then(Value::as_str) {
-                Some("disabled") => {
-                    summary.watcher_disabled = summary.watcher_disabled.saturating_add(1)
+        if policy_path.exists() {
+            if let Some(policy) = read_bounded_json_value(&policy_path) {
+                summary.policy_receipts = summary.policy_receipts.saturating_add(1);
+                match policy.get("status").and_then(Value::as_str) {
+                    Some("disabled") => {
+                        summary.watcher_disabled = summary.watcher_disabled.saturating_add(1)
+                    }
+                    Some("enabled") => {
+                        summary.watcher_enabled = summary.watcher_enabled.saturating_add(1)
+                    }
+                    _ => {}
                 }
-                Some("enabled") => {
-                    summary.watcher_enabled = summary.watcher_enabled.saturating_add(1)
+                match policy.get("protection_status").and_then(Value::as_str) {
+                    Some("configured") => {
+                        summary.protection_configured =
+                            summary.protection_configured.saturating_add(1)
+                    }
+                    Some("degraded" | "unavailable") => {
+                        summary.protection_degraded = summary.protection_degraded.saturating_add(1)
+                    }
+                    _ => {}
                 }
-                _ => {}
-            }
-            match policy.get("protection_status").and_then(Value::as_str) {
-                Some("configured") => {
-                    summary.protection_configured =
-                        summary.protection_configured.saturating_add(1)
-                }
-                Some("degraded" | "unavailable") => {
-                    summary.protection_degraded = summary.protection_degraded.saturating_add(1)
-                }
-                _ => {}
+            } else {
+                // A present but unreadable/oversized receipt is evidence of
+                // degraded protection, not an absent receipt or a clean run.
+                summary.protection_degraded = summary.protection_degraded.saturating_add(1);
             }
         }
 
         let cleanup_path = worker_dir.join("process-cleanup.json");
-        if let Some(cleanup) = read_bounded_json_value(&cleanup_path) {
-            summary.cleanup_receipts = summary.cleanup_receipts.saturating_add(1);
-            if cleanup
-                .get("remaining_owned_pids")
-                .and_then(Value::as_array)
-                .is_some_and(|pids| !pids.is_empty())
-            {
-                summary.cleanup_orphans = summary.cleanup_orphans.saturating_add(1);
+        if cleanup_path.exists() {
+            if let Some(cleanup) = read_bounded_json_value(&cleanup_path) {
+                summary.cleanup_receipts = summary.cleanup_receipts.saturating_add(1);
+                if cleanup
+                    .get("remaining_owned_pids")
+                    .and_then(Value::as_array)
+                    .is_some_and(|pids| !pids.is_empty())
+                {
+                    summary.cleanup_orphans = summary.cleanup_orphans.saturating_add(1);
+                }
+            } else {
+                summary.protection_degraded = summary.protection_degraded.saturating_add(1);
+            }
+        }
+
+        let mut resource_paths = Vec::new();
+        let default_resource_path = worker_dir.join("process-resources.json");
+        if default_resource_path.exists() {
+            resource_paths.push(default_resource_path);
+        }
+        if let Ok(entries) = fs::read_dir(&worker_dir) {
+            resource_paths.extend(entries.flatten().filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                (name.starts_with("process-resources-") && name.ends_with(".json"))
+                    .then_some(entry.path())
+            }));
+        }
+        for resource_path in resource_paths.into_iter().take(64) {
+            if let Some(resources) = read_bounded_json_value(&resource_path) {
+                summary.resource_receipts = summary.resource_receipts.saturating_add(1);
+                summary.resource_samples = summary.resource_samples.saturating_add(
+                    resources
+                        .get("samples")
+                        .and_then(Value::as_array)
+                        .map_or(0, Vec::len),
+                );
+                if let Some(samples) = resources.get("samples").and_then(Value::as_array) {
+                    for sample in samples {
+                        if let Some(processes) = sample.get("processes").and_then(Value::as_array)
+                        {
+                            summary.resource_processes =
+                                summary.resource_processes.saturating_add(processes.len());
+                            for process in processes {
+                                if let Some(rss_bytes) =
+                                    process.get("rss_bytes").and_then(Value::as_u64)
+                                {
+                                    summary.resource_peak_rss_bytes = summary
+                                        .resource_peak_rss_bytes
+                                        .max(rss_bytes);
+                                }
+                            }
+                        }
+                    }
+                }
+                if matches!(
+                    resources.get("status").and_then(Value::as_str),
+                    Some("error" | "degraded")
+                ) || resources
+                    .get("failure")
+                    .is_some_and(|failure| !failure.is_null())
+                {
+                    summary.resource_failures = summary.resource_failures.saturating_add(1);
+                }
+            } else {
+                summary.protection_degraded = summary.protection_degraded.saturating_add(1);
+            }
+        }
+
+        if let Ok(receipts) = fs::read_dir(&worker_dir) {
+            for entry in receipts.flatten().take(64) {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !(name.starts_with("external-call") || name.starts_with("verification-"))
+                    || !name.ends_with(".json")
+                    || name.ends_with("-start.json")
+                {
+                    continue;
+                }
+                let Some(receipt) = read_bounded_json_value(&entry.path()) else {
+                    summary.protection_degraded = summary.protection_degraded.saturating_add(1);
+                    continue;
+                };
+                summary.external_call_receipts = summary.external_call_receipts.saturating_add(1);
+                if matches!(
+                    receipt.get("status").and_then(Value::as_str),
+                    Some("blocked" | "failed" | "error" | "cancelled" | "deadline_exceeded")
+                ) {
+                    summary.external_call_failures =
+                        summary.external_call_failures.saturating_add(1);
+                }
             }
         }
     }
@@ -2673,7 +2783,38 @@ fn plan_revision_diff(
         .artifact_dir(goal_id)
         .join(format!("plan-revision-manifest-{}.json", current.revision));
     diff.manifest_path = Some(manifest_path.to_string_lossy().to_string());
-    diff.canonical_applied = canonical.map(|plan| plan.plan_hash == current.plan_hash);
+    let canonical_plan = match canonical {
+        Some(plan) => Some(plan.clone()),
+        None => match store.read_plan_graph(goal_id) {
+            Ok(plan) => plan,
+            Err(error) => {
+                diff.canonical_applied = Some(false);
+                diff.canonical_reason = Some(bounded_text(
+                    &format!("canonical plan bundle is unreadable: {error}"),
+                    600,
+                ));
+                None
+            }
+        },
+    };
+    if let Some(canonical_plan) = canonical_plan {
+        let applied = canonical_plan.plan_hash == current.plan_hash
+            && canonical_plan.plan_id == current.plan_id
+            && canonical_plan.revision == current.revision;
+        diff.canonical_applied = Some(applied);
+        if !applied {
+            diff.canonical_reason = Some(format!(
+                "canonical plan is stale (canonical revision/hash {}/{}; candidate revision/hash {}/{})",
+                canonical_plan.revision,
+                bounded_text(&canonical_plan.plan_hash, 16),
+                current.revision,
+                bounded_text(&current.plan_hash, 16),
+            ));
+        }
+    } else if diff.canonical_reason.is_none() {
+        diff.canonical_applied = Some(false);
+        diff.canonical_reason = Some("canonical plan bundle is missing".to_string());
+    }
     let protected_task_ids = ledger
         .into_iter()
         .flat_map(|ledger| ledger.nodes.iter())
@@ -3652,6 +3793,11 @@ mod tests {
         assert!(diff.added_tasks.is_empty());
         assert!(diff.removed_tasks.is_empty());
         assert_eq!(diff.manifest_status.as_deref(), Some("missing"));
+        assert_eq!(diff.canonical_applied, Some(false));
+        assert_eq!(
+            diff.canonical_reason.as_deref(),
+            Some("canonical plan bundle is missing")
+        );
 
         let manifest = crate::plan_graph::PlanRevisionManifest::derive(
             &old,
@@ -3674,6 +3820,7 @@ mod tests {
         .context("valid manifest projection should be readable")?;
         assert_eq!(diff.manifest_status.as_deref(), Some("valid"));
         assert_eq!(diff.canonical_applied, Some(true));
+        assert!(diff.canonical_reason.is_none());
         assert_eq!(diff.requires_re_review, Some(true));
         assert_eq!(diff.manifest_reason.as_deref(), Some("test revision projection"));
         assert_eq!(diff.affected_logical_task_ids, vec![new.draft.tasks[0].task_id.clone()]);
@@ -4818,6 +4965,54 @@ mod tests {
         }
         store
             .write_worker_file(
+                "task-enabled",
+                "external-call.json",
+                "{\"status\":\"deadline_exceeded\",\"owner\":\"executor\"}\n",
+            )
+            .expect("write external call receipt");
+        store
+            .write_worker_file(
+                "task-disabled",
+                "process-resources.json",
+                &format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "schema_version": 1,
+                        "mechanism_id": "owned_process_resource_sampling",
+                        "status": "succeeded",
+                        "samples": [
+                            {"phase": "start", "processes": [{"pid": 10}]},
+                            {"phase": "finish", "processes": [{"pid": 10}]}
+                        ]
+                    })
+                ),
+            )
+            .expect("write process resource receipt");
+        let internal_git_dir = store.root().join("internal-git");
+        fs::create_dir_all(&internal_git_dir).expect("create internal Git receipt directory");
+        fs::write(
+            internal_git_dir.join("process-resources-git-1.json"),
+            serde_json::to_string(&serde_json::json!({
+                "schema_version": 1,
+                "mechanism_id": "owned_process_resource_sampling",
+                "status": "succeeded",
+                "samples": [{"phase": "start", "processes": [{"pid": 11}]}]
+            }))
+            .expect("serialize internal Git resource receipt"),
+        )
+        .expect("write internal Git resource receipt");
+        store
+            .write_worker_file(
+                "task-disabled",
+                "external-call-blocked.json",
+                "{\"status\":\"blocked\",\"owner\":\"executor\"}\n",
+            )
+            .expect("write blocked external call receipt");
+        store
+            .write_worker_file("task-disabled", "external-call-corrupt.json", "{\n")
+            .expect("write corrupt external call receipt");
+        store
+            .write_worker_file(
                 "task-oversized",
                 "resource-policy.json",
                 &serde_json::to_string(&serde_json::json!({
@@ -4835,8 +5030,16 @@ mod tests {
         assert_eq!(summary.watcher_enabled, 1);
         assert_eq!(summary.watcher_status, "mixed");
         assert_eq!(summary.protection_status, "mixed");
+        assert_eq!(summary.protection_degraded, 3);
         assert_eq!(summary.cleanup_receipts, 2);
         assert_eq!(summary.cleanup_orphans, 1);
+        assert_eq!(summary.resource_receipts, 2);
+        assert_eq!(summary.resource_samples, 3);
+        assert_eq!(summary.resource_processes, 3);
+        assert_eq!(summary.resource_peak_rss_bytes, 0);
+        assert_eq!(summary.resource_failures, 0);
+        assert_eq!(summary.external_call_receipts, 2);
+        assert_eq!(summary.external_call_failures, 2);
     }
 
     #[test]

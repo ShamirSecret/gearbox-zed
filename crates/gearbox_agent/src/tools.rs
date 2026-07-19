@@ -1,18 +1,18 @@
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command as StdCommand, Stdio as StdStdio};
 use std::sync::{
     Arc, Mutex, MutexGuard, OnceLock,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sha2::{Digest, Sha256};
-use smol::process::{Command, Stdio};
-
 use crate::state::{CommandRecord, Scope};
 
 const OUTPUT_LIMIT: usize = 12_000;
@@ -21,6 +21,9 @@ const OUTPUT_LIMIT: usize = 12_000;
 // limit remains finite to keep long worker sessions from retaining unbounded
 // output, while ordinary shell command excerpts keep the smaller limit.
 const WORKER_OUTPUT_LIMIT: usize = 64_000;
+const PROCESS_RESOURCE_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
+const PROCESS_RESOURCE_SAMPLE_LIMIT: usize = 64;
+const PROCESS_RESOURCE_SCHEMA_VERSION: u32 = 1;
 static COMMAND_OUTPUT_COUNTER: AtomicU64 = AtomicU64::new(1);
 static GEAR_RUST_COMMAND_GATE: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -59,6 +62,531 @@ pub struct ShellCommandResult {
     pub stdout_truncated: bool,
     #[serde(default)]
     pub stderr_truncated: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalEffectKind {
+    Shell,
+    WebFetch,
+    Lsp,
+    Mcp,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExternalEffectRequest {
+    pub kind: ExternalEffectKind,
+    pub owner: String,
+    pub workspace: PathBuf,
+    pub target: String,
+    pub deadline_at_ms: Option<u64>,
+    pub cancellation_requested: bool,
+    pub terminal_session: bool,
+    pub redirect_count: usize,
+    pub max_redirects: usize,
+    pub idempotent: bool,
+    pub retry_requested: bool,
+    pub require_deadline: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalEffectDecision {
+    pub status: String,
+    pub reason: String,
+    pub retry_allowed: bool,
+}
+
+impl ExternalEffectDecision {
+    fn admitted(reason: impl Into<String>, retry_allowed: bool) -> Self {
+        Self {
+            status: "admitted".to_string(),
+            reason: reason.into(),
+            retry_allowed,
+        }
+    }
+
+    fn blocked(reason: impl Into<String>) -> Self {
+        Self {
+            status: "blocked".to_string(),
+            reason: reason.into(),
+            retry_allowed: false,
+        }
+    }
+}
+
+/// Validate the common admission contract shared by shell, WebFetch, LSP and
+/// MCP effects.  The concrete transports remain optional, but they all use
+/// the same cancellation/deadline/redirect/replay boundary when present.
+pub fn admit_external_effect(
+    request: &ExternalEffectRequest,
+    now_ms: u64,
+) -> ExternalEffectDecision {
+    if request.owner.trim().is_empty() {
+        return ExternalEffectDecision::blocked("external effect owner is empty");
+    }
+    if request.target.trim().is_empty() {
+        return ExternalEffectDecision::blocked("external effect target is empty");
+    }
+    if request.cancellation_requested {
+        return ExternalEffectDecision::blocked("external effect was cancelled before admission");
+    }
+    if request.terminal_session {
+        return ExternalEffectDecision::blocked("external effect belongs to a terminal session");
+    }
+    if request.require_deadline
+        && request
+            .deadline_at_ms
+            .is_none_or(|deadline_at_ms| deadline_at_ms <= now_ms)
+    {
+        return ExternalEffectDecision::blocked("external effect deadline is missing or expired");
+    }
+    if request.redirect_count > request.max_redirects {
+        return ExternalEffectDecision::blocked("external effect redirect limit exceeded");
+    }
+    if matches!(request.kind, ExternalEffectKind::WebFetch) {
+        if !request.target.starts_with("https://") && !request.target.starts_with("http://") {
+            return ExternalEffectDecision::blocked("WebFetch target must use http(s)");
+        }
+        if request.target.contains("..") {
+            return ExternalEffectDecision::blocked(
+                "WebFetch target contains a path traversal segment",
+            );
+        }
+    } else {
+        let workspace = match request.workspace.canonicalize() {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                return ExternalEffectDecision::blocked(format!(
+                    "external effect workspace cannot be resolved: {error}"
+                ));
+            }
+        };
+        let target_path = Path::new(&request.target);
+        if target_path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+        {
+            return ExternalEffectDecision::blocked(
+                "external effect target contains a parent-directory escape",
+            );
+        }
+        let target_path = if target_path.is_absolute() {
+            target_path.to_path_buf()
+        } else {
+            workspace.join(target_path)
+        };
+        let Some(target) = canonicalize_with_missing_tail(&target_path) else {
+            return ExternalEffectDecision::blocked(
+                "external effect target cannot be resolved for containment",
+            );
+        };
+        if !target.starts_with(&workspace) {
+            return ExternalEffectDecision::blocked(
+                "external effect target escapes the workspace boundary",
+            );
+        }
+    }
+    if request.retry_requested && !request.idempotent {
+        return ExternalEffectDecision::blocked(
+            "automatic retry is forbidden for a non-idempotent external effect",
+        );
+    }
+    if request.retry_requested {
+        ExternalEffectDecision::admitted("idempotent retry admitted", true)
+    } else {
+        ExternalEffectDecision::admitted("external effect admitted", false)
+    }
+}
+
+fn canonicalize_with_missing_tail(path: &Path) -> Option<PathBuf> {
+    let mut missing_components: Vec<OsString> = Vec::new();
+    let mut current = path;
+    loop {
+        if let Ok(mut canonical) = current.canonicalize() {
+            for component in missing_components.iter().rev() {
+                canonical.push(component);
+            }
+            return Some(canonical);
+        }
+        let component = current.file_name()?.to_os_string();
+        missing_components.push(component);
+        current = current.parent()?;
+    }
+}
+
+fn external_effect_kind(request_kind: &str) -> ExternalEffectKind {
+    match request_kind.trim().to_ascii_lowercase().as_str() {
+        "webfetch" | "web_fetch" | "fetch" => ExternalEffectKind::WebFetch,
+        "lsp" => ExternalEffectKind::Lsp,
+        "mcp" => ExternalEffectKind::Mcp,
+        _ => ExternalEffectKind::Shell,
+    }
+}
+
+fn external_effect_request(
+    workspace: &Path,
+    command: &str,
+    env: &HashMap<String, String>,
+    timeout: Option<Duration>,
+    started_at_ms: u64,
+) -> ExternalEffectRequest {
+    let request_kind = env
+        .get("GEARBOX_EXTERNAL_REQUEST_KIND")
+        .map(String::as_str)
+        .unwrap_or("shell");
+    let kind = external_effect_kind(request_kind);
+    let deadline_at_ms = timeout.map(|duration| {
+        started_at_ms.saturating_add(duration.as_millis().try_into().unwrap_or(u64::MAX))
+    });
+    let target = env
+        .get("GEARBOX_EXTERNAL_TARGET")
+        .cloned()
+        .unwrap_or_else(|| command.to_string());
+    ExternalEffectRequest {
+        kind,
+        owner: env
+            .get("GEARBOX_EXTERNAL_OWNER")
+            .cloned()
+            .unwrap_or_else(|| "gear-worker".to_string()),
+        workspace: workspace.to_path_buf(),
+        target,
+        deadline_at_ms,
+        cancellation_requested: env
+            .get("GEARBOX_EXTERNAL_CANCELLED")
+            .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
+        terminal_session: env
+            .get("GEARBOX_EXTERNAL_TERMINAL")
+            .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
+        redirect_count: env
+            .get("GEARBOX_EXTERNAL_REDIRECT_COUNT")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0),
+        max_redirects: env
+            .get("GEARBOX_EXTERNAL_MAX_REDIRECTS")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(5),
+        idempotent: env
+            .get("GEARBOX_EXTERNAL_IDEMPOTENT")
+            .is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes")),
+        retry_requested: env
+            .get("GEARBOX_EXTERNAL_RETRY_REQUESTED")
+            .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
+        // Network/protocol effects must always carry a deadline. Shell
+        // commands retain the caller's explicit opt-in because verification
+        // commands may intentionally be unbounded; the concrete transport
+        // kinds never inherit that permissive default.
+        require_deadline: env
+            .get("GEARBOX_EXTERNAL_REQUIRE_DEADLINE")
+            .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            || !matches!(kind, ExternalEffectKind::Shell),
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn external_transport_command(
+    command: &str,
+    env: &HashMap<String, String>,
+    timeout: Option<Duration>,
+) -> Result<Option<String>> {
+    let kind = external_effect_kind(
+        env.get("GEARBOX_EXTERNAL_REQUEST_KIND")
+            .map(String::as_str)
+            .unwrap_or("shell"),
+    );
+    match kind {
+        ExternalEffectKind::Shell => Ok(None),
+        ExternalEffectKind::WebFetch => {
+            let target = env
+                .get("GEARBOX_EXTERNAL_TARGET")
+                .filter(|target| !target.trim().is_empty())
+                .map(String::as_str)
+                .unwrap_or(command);
+            let max_redirects = env
+                .get("GEARBOX_EXTERNAL_MAX_REDIRECTS")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(5);
+            let max_time = timeout
+                .map(|duration| duration.as_secs_f64().max(0.001).to_string())
+                .unwrap_or_else(|| "300".to_string());
+            Ok(Some(format!(
+                "curl --fail --silent --show-error --location --proto '=http,https' --max-redirs {} --max-time {} -- {}",
+                max_redirects,
+                shell_quote(&max_time),
+                shell_quote(target),
+            )))
+        }
+        ExternalEffectKind::Lsp | ExternalEffectKind::Mcp => {
+            let request = env
+                .get("GEARBOX_EXTERNAL_PROTOCOL_REQUEST")
+                .context("protocol external effect is missing GEARBOX_EXTERNAL_PROTOCOL_REQUEST")?;
+            if request.trim().is_empty() {
+                bail!("protocol external effect request cannot be empty");
+            }
+            if matches!(kind, ExternalEffectKind::Lsp) {
+                // LSP uses the JSON-RPC stream framing defined by the
+                // language-server protocol.  Sending bare JSON happens to
+                // work with a permissive test command but leaves a real
+                // language server waiting forever for Content-Length.
+                let content_length = request.len();
+                Ok(Some(format!(
+                    "printf 'Content-Length: %s\r\n\r\n%s' {} {} | {}",
+                    shell_quote(&content_length.to_string()),
+                    shell_quote(request),
+                    command,
+                )))
+            } else {
+                // MCP transports exchange newline-delimited JSON rather than
+                // LSP's header-framed stream.
+                Ok(Some(format!(
+                    "printf '%s' {} | {}",
+                    shell_quote(request),
+                    command,
+                )))
+            }
+        }
+    }
+}
+
+pub const EXTERNAL_CALL_RECEIPT_SCHEMA_VERSION: u32 = 1;
+
+/// Durable lifecycle evidence for a shell/subprocess call owned by one Gear
+/// worker.  The receipt deliberately records retry policy rather than
+/// retrying blindly: only callers that explicitly mark an operation
+/// idempotent may opt into a retry route.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExternalCallReceipt {
+    pub schema_version: u32,
+    pub call_id: String,
+    pub task_id: String,
+    pub owner: String,
+    pub workspace: String,
+    pub command_hash: String,
+    pub request_kind: String,
+    #[serde(default)]
+    pub target: String,
+    pub attempt: u64,
+    pub idempotent: bool,
+    pub retry_policy: String,
+    pub retry_allowed: bool,
+    pub started_at_ms: u64,
+    pub deadline_at_ms: Option<u64>,
+    pub finished_at_ms: u64,
+    pub cancellation_requested: bool,
+    pub status: String,
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_receipt_path: Option<String>,
+    pub receipt_hash: String,
+}
+
+impl ExternalCallReceipt {
+    fn expected_hash(&self) -> Result<String> {
+        let mut payload = self.clone();
+        payload.receipt_hash.clear();
+        Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(&payload)?)))
+    }
+
+    fn seal(mut self) -> Result<Self> {
+        self.receipt_hash.clear();
+        self.receipt_hash = self.expected_hash()?;
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != EXTERNAL_CALL_RECEIPT_SCHEMA_VERSION {
+            bail!("unsupported external call receipt schema");
+        }
+        for (field, value) in [
+            ("call_id", self.call_id.as_str()),
+            ("task_id", self.task_id.as_str()),
+            ("owner", self.owner.as_str()),
+            ("workspace", self.workspace.as_str()),
+            ("command_hash", self.command_hash.as_str()),
+            ("request_kind", self.request_kind.as_str()),
+            ("target", self.target.as_str()),
+            ("retry_policy", self.retry_policy.as_str()),
+            ("status", self.status.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                bail!("external call receipt {field} cannot be empty");
+            }
+        }
+        if self.receipt_hash != self.expected_hash()? {
+            bail!("external call receipt hash mismatch");
+        }
+        if self.retry_allowed && (!self.idempotent || self.retry_policy == "none") {
+            bail!("external call receipt grants retry for a non-idempotent or disabled policy");
+        }
+        if self.finished_at_ms < self.started_at_ms {
+            bail!("external call receipt finished_at_ms precedes started_at_ms");
+        }
+        if let Some(deadline_at_ms) = self.deadline_at_ms {
+            if deadline_at_ms < self.started_at_ms {
+                bail!("external call receipt deadline precedes started_at_ms");
+            }
+            if self.status == "deadline_exceeded" && self.finished_at_ms < deadline_at_ms {
+                bail!("deadline-exceeded receipt finished before its deadline");
+            }
+        }
+        Ok(())
+    }
+}
+
+struct ExternalCallContext {
+    receipt_path: PathBuf,
+    start_receipt_path: PathBuf,
+    cleanup_receipt_path: Option<PathBuf>,
+    call_id: String,
+    task_id: String,
+    owner: String,
+    workspace: String,
+    command_hash: String,
+    request_kind: String,
+    target: String,
+    attempt: u64,
+    idempotent: bool,
+    retry_policy: String,
+    started_at_ms: u64,
+    deadline_at_ms: Option<u64>,
+}
+
+fn now_epoch_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn external_call_context(
+    workspace: &Path,
+    command: &str,
+    env: &HashMap<String, String>,
+    timeout: Option<Duration>,
+) -> Option<ExternalCallContext> {
+    let worker_dir = env
+        .get("GEARBOX_WORKER_DIR")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())?;
+    let started_at_ms = now_epoch_millis();
+    let task_id = env
+        .get("GEARBOX_EXTERNAL_TASK_ID")
+        .or_else(|| env.get("GEARBOX_WORKER_TASK_ID"))
+        .cloned()
+        .unwrap_or_else(|| "unknown-task".to_string());
+    let owner = env
+        .get("GEARBOX_EXTERNAL_OWNER")
+        .cloned()
+        .unwrap_or_else(|| "gear-worker".to_string());
+    let request_kind = env
+        .get("GEARBOX_EXTERNAL_REQUEST_KIND")
+        .cloned()
+        .unwrap_or_else(|| "shell".to_string());
+    let target = env
+        .get("GEARBOX_EXTERNAL_TARGET")
+        .cloned()
+        .unwrap_or_else(|| command.to_string());
+    let attempt = env
+        .get("GEARBOX_EXTERNAL_ATTEMPT")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let idempotent = env
+        .get("GEARBOX_EXTERNAL_IDEMPOTENT")
+        .is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
+    let retry_policy = env
+        .get("GEARBOX_EXTERNAL_RETRY_POLICY")
+        .cloned()
+        .unwrap_or_else(|| "none".to_string());
+    let receipt_stem = env
+        .get("GEARBOX_EXTERNAL_RECEIPT_STEM")
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .unwrap_or_else(|| "external-call".to_string());
+    let command_hash = format!("{:x}", Sha256::digest(command.as_bytes()));
+    let call_id = format!(
+        "external-{:x}",
+        Sha256::digest(
+            format!("{task_id}|{owner}|{command_hash}|{attempt}|{started_at_ms}").as_bytes(),
+        )
+    );
+    let deadline_at_ms = timeout.map(|duration| started_at_ms.saturating_add(duration.as_millis() as u64));
+    Some(ExternalCallContext {
+        receipt_path: worker_dir.join(format!("{receipt_stem}.json")),
+        start_receipt_path: worker_dir.join(format!("{receipt_stem}-start.json")),
+        cleanup_receipt_path: env
+            .get("GEARBOX_WORKER_CLEANUP_RECEIPT")
+            .map(PathBuf::from),
+        call_id,
+        task_id,
+        owner,
+        workspace: workspace.to_string_lossy().to_string(),
+        command_hash,
+        request_kind,
+        target,
+        attempt,
+        idempotent,
+        retry_policy,
+        started_at_ms,
+        deadline_at_ms,
+    })
+}
+
+fn write_external_call_receipt(path: &Path, receipt: &ExternalCallReceipt) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("external call receipt has no parent directory")?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create external call receipt directory {}", parent.display()))?;
+    let temporary_path = parent.join(format!(".{}.tmp", path.file_name().and_then(|name| name.to_str()).unwrap_or("external-call")));
+    let contents = format!("{}\n", serde_json::to_string_pretty(receipt)?);
+    fs::write(&temporary_path, contents)
+        .with_context(|| format!("failed to write temporary external call receipt {}", temporary_path.display()))?;
+    fs::rename(&temporary_path, path)
+        .with_context(|| format!("failed to publish external call receipt {}", path.display()))?;
+    Ok(())
+}
+
+fn persist_external_call_state(
+    context: &ExternalCallContext,
+    status: &str,
+    finished_at_ms: u64,
+    cancellation_requested: bool,
+    exit_code: Option<i32>,
+    error: Option<String>,
+) -> Result<()> {
+    let receipt = ExternalCallReceipt {
+        schema_version: EXTERNAL_CALL_RECEIPT_SCHEMA_VERSION,
+        call_id: context.call_id.clone(),
+        task_id: context.task_id.clone(),
+        owner: context.owner.clone(),
+        workspace: context.workspace.clone(),
+        command_hash: context.command_hash.clone(),
+        request_kind: context.request_kind.clone(),
+        target: context.target.clone(),
+        attempt: context.attempt,
+        idempotent: context.idempotent,
+        retry_policy: context.retry_policy.clone(),
+        retry_allowed: context.idempotent && context.retry_policy != "none",
+        started_at_ms: context.started_at_ms,
+        deadline_at_ms: context.deadline_at_ms,
+        finished_at_ms,
+        cancellation_requested,
+        status: status.to_string(),
+        exit_code,
+        error,
+        cleanup_receipt_path: context
+            .cleanup_receipt_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().to_string()),
+        receipt_hash: String::new(),
+    }
+    .seal()?;
+    write_external_call_receipt(&context.receipt_path, &receipt)
 }
 
 impl ShellCommandResult {
@@ -245,6 +773,114 @@ pub fn run_shell_command_with_env_and_cancellation_and_timeout(
     cancellation_token: Option<&CancellationToken>,
     timeout: Option<Duration>,
 ) -> Result<ShellCommandResult> {
+    let context = external_call_context(workspace, command, env, timeout);
+    if let Some(context) = context.as_ref() {
+        let admission = admit_external_effect(
+            &external_effect_request(workspace, command, env, timeout, context.started_at_ms),
+            context.started_at_ms,
+        );
+        if admission.status == "blocked" {
+            let reason = format!("external effect admission blocked: {}", admission.reason);
+            // A pre-spawn rejection is still a durable external-effect
+            // observation.  Persist it before returning so the GUI, review,
+            // and recovery paths can distinguish a guarded command from an
+            // unrecorded crash or a command that actually ran.
+            persist_external_call_state(
+                context,
+                "blocked",
+                now_epoch_millis(),
+                cancellation_token.is_some_and(CancellationToken::is_cancelled),
+                None,
+                Some(reason.clone()),
+            )
+            .with_context(|| "failed to persist blocked external call receipt")?;
+            bail!("{reason}");
+        }
+        persist_external_call_state(
+            context,
+            "started",
+            context.started_at_ms,
+            cancellation_token.is_some_and(CancellationToken::is_cancelled),
+            None,
+            None,
+        )?;
+        let start_path = &context.start_receipt_path;
+        let final_path = &context.receipt_path;
+        if start_path != final_path {
+            fs::copy(final_path, start_path).with_context(|| {
+                format!(
+                    "failed to preserve external call start receipt {}",
+                    start_path.display()
+                )
+            })?;
+        }
+    }
+
+    let transport_command = external_transport_command(command, env, timeout);
+    let result = match transport_command {
+        Ok(Some(transport_command)) => run_shell_command_with_env_and_cancellation_and_timeout_inner(
+            workspace,
+            &transport_command,
+            env,
+            cancellation_token,
+            timeout,
+        )
+        .map(|mut result| {
+            result.command = command.to_string();
+            result
+        }),
+        Ok(None) => run_shell_command_with_env_and_cancellation_and_timeout_inner(
+            workspace,
+            command,
+            env,
+            cancellation_token,
+            timeout,
+        ),
+        Err(error) => Err(error),
+    };
+
+    let receipt_result = context.as_ref().map(|context| {
+        let (status, exit_code, error) = match &result {
+            Ok(output) if output.success => ("succeeded", output.exit_code, None),
+            Ok(output) => ("failed", output.exit_code, None),
+            Err(error) if cancellation_token.is_some_and(CancellationToken::is_cancelled) => (
+                "cancelled",
+                None,
+                Some(error.to_string()),
+            ),
+            Err(error)
+                if timeout.is_some() && error.to_string().contains("timed out") =>
+            {
+                ("deadline_exceeded", None, Some(error.to_string()))
+            }
+            Err(error) => ("error", None, Some(error.to_string())),
+        };
+        persist_external_call_state(
+            context,
+            status,
+            now_epoch_millis(),
+            cancellation_token.is_some_and(CancellationToken::is_cancelled),
+            exit_code,
+            error,
+        )
+    });
+
+    match (result, receipt_result) {
+        (Ok(_result), Some(Err(error))) => Err(error.context("failed to persist external call receipt")),
+        (Err(error), Some(Err(receipt_error))) => Err(error.context(format!(
+            "failed to persist external call receipt: {receipt_error:#}"
+        ))),
+        (result, _) => result,
+    }
+}
+
+fn run_shell_command_with_env_and_cancellation_and_timeout_inner(
+    workspace: &Path,
+    command: &str,
+    env: &HashMap<String, String>,
+    cancellation_token: Option<&CancellationToken>,
+    timeout: Option<Duration>,
+) -> Result<ShellCommandResult> {
     let started_at = Instant::now();
     check_cancelled(cancellation_token, command)?;
 
@@ -278,17 +914,52 @@ pub fn run_shell_command_with_env_and_cancellation_and_timeout(
         .with_context(|| format!("failed to run command `{command}`"))?;
     let mut owned_processes = OwnedProcessTree::new(child.id());
     let cleanup_artifact_path = worker_cleanup_artifact_path(env);
+    let resource_artifact_path = worker_resource_artifact_path(env);
+    let mut resource_evidence = resource_artifact_path
+        .as_ref()
+        .map(|_| ProcessResourceEvidence::new(command, env));
+    let mut last_resource_sample_at = Instant::now();
+    record_process_resource_sample(
+        resource_artifact_path.as_deref(),
+        &mut resource_evidence,
+        &owned_processes,
+        "start",
+        true,
+        &mut last_resource_sample_at,
+    )?;
     let monitor_provider_errors = env
         .get("GEARBOX_WORKER_PROVIDER_ERROR_RECOVERY")
         .is_some_and(|value| value == "1");
     let status = loop {
         owned_processes.observe(child.id());
+        record_process_resource_sample(
+            resource_artifact_path.as_deref(),
+            &mut resource_evidence,
+            &owned_processes,
+            "mid",
+            false,
+            &mut last_resource_sample_at,
+        )?;
         if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
+            record_process_resource_sample(
+                resource_artifact_path.as_deref(),
+                &mut resource_evidence,
+                &owned_processes,
+                "cancel_requested",
+                true,
+                &mut last_resource_sample_at,
+            )?;
             terminate_command_process_group(
                 &mut child,
                 &owned_processes,
                 cleanup_artifact_path.as_deref(),
                 "cancelled",
+            )?;
+            finalize_process_resource_evidence(
+                resource_artifact_path.as_deref(),
+                &mut resource_evidence,
+                "cancelled",
+                Some("cancellation requested"),
             )?;
             cleanup_command_output(&stdout_path);
             cleanup_command_output(&stderr_path);
@@ -296,11 +967,25 @@ pub fn run_shell_command_with_env_and_cancellation_and_timeout(
         }
 
         if let Some(timeout) = timeout.filter(|timeout| started_at.elapsed() >= *timeout) {
+            record_process_resource_sample(
+                resource_artifact_path.as_deref(),
+                &mut resource_evidence,
+                &owned_processes,
+                "deadline_exceeded",
+                true,
+                &mut last_resource_sample_at,
+            )?;
             terminate_command_process_group(
                 &mut child,
                 &owned_processes,
                 cleanup_artifact_path.as_deref(),
                 "explicit_timeout",
+            )?;
+            finalize_process_resource_evidence(
+                resource_artifact_path.as_deref(),
+                &mut resource_evidence,
+                "deadline_exceeded",
+                Some("explicit timeout"),
             )?;
             cleanup_command_output(&stdout_path);
             cleanup_command_output(&stderr_path);
@@ -314,15 +999,30 @@ pub fn run_shell_command_with_env_and_cancellation_and_timeout(
             && command_output_indicates_provider_error(&stdout_path, &stderr_path)
         {
             owned_processes.observe(child.id());
+            record_process_resource_sample(
+                resource_artifact_path.as_deref(),
+                &mut resource_evidence,
+                &owned_processes,
+                "provider_error",
+                true,
+                &mut last_resource_sample_at,
+            )?;
             terminate_command_process_group(
                 &mut child,
                 &owned_processes,
                 cleanup_artifact_path.as_deref(),
                 "provider_error",
             )?;
-            break child
+            let status = child
                 .wait()
                 .with_context(|| format!("failed to reap provider-error command `{command}`"))?;
+            finalize_process_resource_evidence(
+                resource_artifact_path.as_deref(),
+                &mut resource_evidence,
+                "provider_error",
+                Some("provider error detected in command output"),
+            )?;
+            break status;
         }
 
         if let Some(status) = child
@@ -334,6 +1034,27 @@ pub fn run_shell_command_with_env_and_cancellation_and_timeout(
 
         std::thread::sleep(Duration::from_millis(50));
     };
+
+    owned_processes.observe(child.id());
+    record_process_resource_sample(
+        resource_artifact_path.as_deref(),
+        &mut resource_evidence,
+        &owned_processes,
+        "finish",
+        true,
+        &mut last_resource_sample_at,
+    )?;
+    if resource_evidence
+        .as_ref()
+        .is_none_or(|evidence| evidence.status == "recording")
+    {
+        finalize_process_resource_evidence(
+            resource_artifact_path.as_deref(),
+            &mut resource_evidence,
+            if status.success() { "succeeded" } else { "failed" },
+            (!status.success()).then_some("command exited unsuccessfully"),
+        )?;
+    }
 
     let stdout = fs::read_to_string(&stdout_path)
         .with_context(|| format!("failed to read {}", stdout_path.display()))?;
@@ -591,27 +1312,70 @@ pub fn check_scope(snapshot: &DiffSnapshot, scope: &Scope) -> ScopeCheck {
     }
 }
 
-fn run_raw_git(workspace: &Path, args: &[&str]) -> Result<ShellCommandResult> {
-    let command = format!("git {}", args.join(" "));
-    let started_at = Instant::now();
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(workspace)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output();
-    let output = smol::block_on(output).with_context(|| format!("failed to run `{command}`"))?;
-
-    Ok(ShellCommandResult {
-        command,
-        exit_code: output.status.code(),
-        success: output.status.success(),
-        stdout: truncate(&String::from_utf8_lossy(&output.stdout), OUTPUT_LIMIT),
-        stderr: truncate(&String::from_utf8_lossy(&output.stderr), OUTPUT_LIMIT),
-        duration_ms: started_at.elapsed().as_millis(),
-        stdout_truncated: output.stdout.len() > OUTPUT_LIMIT,
-        stderr_truncated: output.stderr.len() > OUTPUT_LIMIT,
-    })
+pub(crate) fn run_raw_git(workspace: &Path, args: &[&str]) -> Result<ShellCommandResult> {
+    let command = format!(
+        "git{}",
+        args.iter()
+            .map(|argument| format!(" {}", shell_quote(argument)))
+            .collect::<String>()
+    );
+    let worker_dir = workspace.join(".gear").join("internal-git");
+    fs::create_dir_all(&worker_dir).with_context(|| {
+        format!("failed to create internal Git worker directory {}", worker_dir.display())
+    })?;
+    let packet_path = worker_dir.join("worker-packet.json");
+    if !packet_path.exists() {
+        fs::write(
+            &packet_path,
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": 1,
+                "task_id": "internal-git",
+                "owner": "gear-runtime",
+                "kind": "repository-observation",
+            }))?,
+        )
+        .with_context(|| format!("failed to write {}", packet_path.display()))?;
+    }
+    let receipt_stem = format!(
+        "git-{}",
+        COMMAND_OUTPUT_COUNTER.fetch_add(1, Ordering::SeqCst)
+    );
+    let mut env = HashMap::new();
+    env.insert(
+        "GEARBOX_WORKER_DIR".to_string(),
+        worker_dir.to_string_lossy().to_string(),
+    );
+    env.insert(
+        "GEARBOX_WORKER_PACKET".to_string(),
+        packet_path.to_string_lossy().to_string(),
+    );
+    env.insert(
+        "GEARBOX_EXTERNAL_TASK_ID".to_string(),
+        "internal-git".to_string(),
+    );
+    env.insert(
+        "GEARBOX_EXTERNAL_OWNER".to_string(),
+        "gear-runtime".to_string(),
+    );
+    env.insert(
+        "GEARBOX_EXTERNAL_REQUEST_KIND".to_string(),
+        "shell".to_string(),
+    );
+    env.insert(
+        "GEARBOX_EXTERNAL_TARGET".to_string(),
+        "git".to_string(),
+    );
+    env.insert("GEARBOX_EXTERNAL_ATTEMPT".to_string(), "0".to_string());
+    env.insert("GEARBOX_EXTERNAL_RECEIPT_STEM".to_string(), receipt_stem);
+    let mut result = run_shell_command_with_env_and_cancellation_and_timeout(
+        workspace,
+        &command,
+        &env,
+        None,
+        Some(Duration::from_secs(30)),
+    )?;
+    result.command = format!("git {}", args.join(" "));
+    Ok(result)
 }
 
 fn parse_status_paths(status: &str) -> Vec<String> {
@@ -808,6 +1572,44 @@ impl OwnedProcessTree {
 
         Ok(())
     }
+
+    fn resource_processes(&self) -> Vec<ProcessResourceProcess> {
+        #[cfg(target_os = "linux")]
+        {
+            let mut processes = Vec::with_capacity(self.descendants.len() + 1);
+            if let Some(identity) = self.root_identity.as_ref() {
+                if linux_process_start_time(self.root_pid as libc::pid_t)
+                    == Some(identity.start_time)
+                {
+                    processes.push(process_resource_process(
+                        self.root_pid as libc::pid_t,
+                        identity,
+                    ));
+                }
+            }
+            for (&pid, identity) in &self.descendants {
+                if linux_process_start_time(pid) == Some(identity.start_time) {
+                    processes.push(process_resource_process(pid, identity));
+                }
+            }
+            processes.sort_by_key(|process| process.pid);
+            processes
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            vec![ProcessResourceProcess {
+                pid: self.root_pid,
+                parent_pid: None,
+                process_group: None,
+                session_id: None,
+                start_time: None,
+                rss_bytes: None,
+                command: None,
+                ownership: "worker_process_tree".to_string(),
+            }]
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -832,6 +1634,165 @@ struct ProcessIdentityEvidence {
     start_time: u64,
     process_group: Option<i32>,
     session_id: Option<i32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ProcessResourceEvidence {
+    schema_version: u32,
+    mechanism_id: String,
+    status: String,
+    task_id: String,
+    owner: String,
+    attempt: u64,
+    command_hash: String,
+    #[serde(default)]
+    samples: Vec<ProcessResourceSample>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    failure: Option<String>,
+    recorded_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ProcessResourceSample {
+    phase: String,
+    recorded_at: String,
+    #[serde(default)]
+    processes: Vec<ProcessResourceProcess>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ProcessResourceProcess {
+    pid: u32,
+    parent_pid: Option<i32>,
+    process_group: Option<i32>,
+    session_id: Option<i32>,
+    start_time: Option<u64>,
+    rss_bytes: Option<u64>,
+    command: Option<String>,
+    ownership: String,
+}
+
+impl ProcessResourceEvidence {
+    fn new(command: &str, env: &HashMap<String, String>) -> Self {
+        Self {
+            schema_version: PROCESS_RESOURCE_SCHEMA_VERSION,
+            mechanism_id: "owned_process_resource_sampling".to_string(),
+            status: "recording".to_string(),
+            task_id: env
+                .get("GEARBOX_WORKER_TASK_ID")
+                .or_else(|| env.get("GEARBOX_EXTERNAL_TASK_ID"))
+                .cloned()
+                .unwrap_or_else(|| "unknown-task".to_string()),
+            owner: env
+                .get("GEARBOX_EXTERNAL_OWNER")
+                .cloned()
+                .unwrap_or_else(|| "gear-worker".to_string()),
+            attempt: env
+                .get("GEARBOX_EXTERNAL_ATTEMPT")
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0),
+            command_hash: format!("{:x}", Sha256::digest(command.as_bytes())),
+            samples: Vec::new(),
+            failure: None,
+            recorded_at: crate::state::timestamp(),
+        }
+    }
+
+    fn push_sample(&mut self, sample: ProcessResourceSample) {
+        self.samples.push(sample);
+        if self.samples.len() > PROCESS_RESOURCE_SAMPLE_LIMIT {
+            if self
+                .samples
+                .first()
+                .is_some_and(|sample| sample.phase == "start")
+            {
+                self.samples.remove(1);
+            } else {
+                self.samples.remove(0);
+            }
+        }
+        self.recorded_at = crate::state::timestamp();
+    }
+}
+
+fn record_process_resource_sample(
+    path: Option<&Path>,
+    evidence: &mut Option<ProcessResourceEvidence>,
+    owned_processes: &OwnedProcessTree,
+    phase: &str,
+    force: bool,
+    last_sample_at: &mut Instant,
+) -> Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let Some(evidence) = evidence.as_mut() else {
+        return Ok(());
+    };
+    if !force && last_sample_at.elapsed() < PROCESS_RESOURCE_SAMPLE_INTERVAL {
+        return Ok(());
+    }
+    evidence.push_sample(ProcessResourceSample {
+        phase: phase.to_string(),
+        recorded_at: crate::state::timestamp(),
+        processes: owned_processes.resource_processes(),
+    });
+    write_process_resource_evidence(path, evidence)?;
+    *last_sample_at = Instant::now();
+    Ok(())
+}
+
+fn finalize_process_resource_evidence(
+    path: Option<&Path>,
+    evidence: &mut Option<ProcessResourceEvidence>,
+    status: &str,
+    failure: Option<&str>,
+) -> Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let Some(evidence) = evidence.as_mut() else {
+        return Ok(());
+    };
+    evidence.status = status.to_string();
+    evidence.failure = failure.map(str::to_string);
+    evidence.recorded_at = crate::state::timestamp();
+    write_process_resource_evidence(path, evidence)
+}
+
+fn write_process_resource_evidence(path: &Path, evidence: &ProcessResourceEvidence) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("process resource evidence has no parent directory")?;
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "failed to create process resource evidence directory {}",
+            parent.display()
+        )
+    })?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("process-resources.json");
+    let temporary_path = parent.join(format!(".{file_name}.tmp"));
+    let contents = format!(
+        "{}\n",
+        serde_json::to_string_pretty(evidence)
+            .context("failed to serialize process resource evidence")?
+    );
+    fs::write(&temporary_path, contents).with_context(|| {
+        format!(
+            "failed to write temporary process resource evidence {}",
+            temporary_path.display()
+        )
+    })?;
+    fs::rename(&temporary_path, path).with_context(|| {
+        format!(
+            "failed to publish process resource evidence {}",
+            path.display()
+        )
+    })?;
+    Ok(())
 }
 
 fn write_process_cleanup_evidence(
@@ -920,6 +1881,41 @@ fn worker_cleanup_artifact_path(env: &HashMap<String, String>) -> Option<PathBuf
         .map(|worker_directory| worker_directory.join("process-cleanup.json"))
 }
 
+fn worker_resource_artifact_path(env: &HashMap<String, String>) -> Option<PathBuf> {
+    let packet_path = env.get("GEARBOX_WORKER_PACKET")?;
+    let worker_directory = Path::new(packet_path).parent()?;
+    let stem = env
+        .get("GEARBOX_EXTERNAL_RECEIPT_STEM")
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .or_else(|| {
+            env.get("GEARBOX_EXTERNAL_ATTEMPT")
+                .filter(|value| !value.trim().is_empty())
+                .map(|attempt| format!("attempt-{attempt}"))
+        });
+    Some(match stem {
+        Some(stem) => worker_directory.join(format!("process-resources-{stem}.json")),
+        None => worker_directory.join("process-resources.json"),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn process_resource_process(
+    pid: libc::pid_t,
+    identity: &LinuxProcessIdentity,
+) -> ProcessResourceProcess {
+    ProcessResourceProcess {
+        pid: pid as u32,
+        parent_pid: Some(identity.parent_pid),
+        process_group: Some(identity.process_group),
+        session_id: Some(identity.session_id),
+        start_time: Some(identity.start_time),
+        rss_bytes: linux_process_rss_bytes(pid),
+        command: linux_process_command(pid),
+        ownership: "worker_process_tree".to_string(),
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[derive(Clone, Debug)]
 struct LinuxProcessIdentity {
@@ -980,6 +1976,24 @@ fn linux_process_start_time(pid: libc::pid_t) -> Option<u64> {
         .split_whitespace()
         .nth(19)
         .and_then(|value| value.parse::<u64>().ok())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_rss_bytes(pid: libc::pid_t) -> Option<u64> {
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status.lines().find_map(|line| {
+        let value = line.strip_prefix("VmRSS:")?.trim();
+        let kilobytes = value.strip_suffix(" kB")?.trim().parse::<u64>().ok()?;
+        Some(kilobytes.saturating_mul(1024))
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_command(pid: libc::pid_t) -> Option<String> {
+    fs::read_to_string(format!("/proc/{pid}/comm"))
+        .ok()
+        .map(|command| command.trim().to_string())
+        .filter(|command| !command.is_empty())
 }
 
 #[cfg(unix)]
@@ -1172,6 +2186,49 @@ mod tests {
             git_head_commit(temp_dir.path()).expect("non-Git lookup should not error"),
             None
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn internal_git_observation_keeps_owned_receipts_and_resource_samples() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let init = run_raw_git(workspace.path(), &["init", "-q"])?;
+        assert!(init.success);
+        let status = run_raw_git(workspace.path(), &["status", "--short"])?;
+        assert!(status.success);
+        let internal_dir = workspace.path().join(".gear/internal-git");
+        let receipt_count = fs::read_dir(&internal_dir)?
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("git-")
+                    && entry.file_name().to_string_lossy().ends_with(".json")
+            })
+            .count();
+        assert!(receipt_count >= 2, "internal Git receipts should be durable");
+        let resource_receipt = fs::read_dir(&internal_dir)?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("process-resources-git-") && name.ends_with(".json"))
+            })
+            .context("internal Git process resource receipt should exist")?;
+        let resource: ProcessResourceEvidence =
+            serde_json::from_slice(&fs::read(resource_receipt)?)?;
+        assert_eq!(resource.status, "succeeded");
+        assert!(resource
+            .samples
+            .iter()
+            .any(|sample| sample.phase == "start"));
+        assert!(resource
+            .samples
+            .iter()
+            .any(|sample| sample.phase == "finish"));
+        Ok(())
     }
 
     #[test]
@@ -1440,6 +2497,90 @@ mod tests {
         assert_eq!(cleanup["reason"], "provider_error");
         assert_eq!(cleanup["root_reaped"], true);
         assert!(cleanup["remaining_owned_pids"].as_array().is_some_and(Vec::is_empty));
+        let resources: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(worker_dir.join("process-resources.json"))
+                .expect("process resource evidence should be persisted"),
+        )
+        .expect("process resource evidence should be valid JSON");
+        assert_eq!(resources["schema_version"], 1);
+        assert_eq!(resources["mechanism_id"], "owned_process_resource_sampling");
+        assert_eq!(resources["status"], "provider_error");
+        let samples = resources["samples"]
+            .as_array()
+            .expect("resource samples should be an array");
+        assert!(samples.iter().any(|sample| sample["phase"] == "start"));
+        assert!(samples.iter().any(|sample| sample["phase"] == "finish"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn successful_worker_records_owned_process_resource_samples() {
+        let temp_dir = tempfile::tempdir().expect("failed to create temp directory");
+        let worker_dir = temp_dir.path().join(".gear").join("workers").join("task");
+        fs::create_dir_all(&worker_dir).expect("worker evidence directory should exist");
+        let mut env = HashMap::new();
+        env.insert(
+            "GEARBOX_WORKER_PACKET".to_string(),
+            worker_dir.join("packet.json").to_string_lossy().to_string(),
+        );
+        env.insert("GEARBOX_WORKER_TASK_ID".to_string(), "task".to_string());
+        env.insert("GEARBOX_EXTERNAL_OWNER".to_string(), "executor".to_string());
+        env.insert("GEARBOX_EXTERNAL_ATTEMPT".to_string(), "2".to_string());
+
+        let result = run_shell_command_with_env_and_cancellation_and_timeout(
+            temp_dir.path(),
+            "sleep 0.35",
+            &env,
+            None,
+            Some(Duration::from_secs(2)),
+        )
+        .expect("worker command should succeed");
+        assert!(result.success);
+        let resources: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(worker_dir.join("process-resources-attempt-2.json"))
+                .expect("process resource evidence should be persisted"),
+        )
+        .expect("process resource evidence should be valid JSON");
+        assert_eq!(resources["status"], "succeeded");
+        assert_eq!(resources["task_id"], "task");
+        assert_eq!(resources["owner"], "executor");
+        assert_eq!(resources["attempt"], 2);
+        let samples = resources["samples"]
+            .as_array()
+            .expect("resource samples should be an array");
+        assert!(samples.iter().any(|sample| sample["phase"] == "start"));
+        assert!(samples.iter().any(|sample| sample["phase"] == "mid"));
+        assert!(samples.iter().any(|sample| sample["phase"] == "finish"));
+        assert!(samples.iter().flat_map(|sample| sample["processes"].as_array()).flatten().any(
+            |process| process["rss_bytes"].as_u64().is_some()
+                && process["ownership"] == "worker_process_tree"
+        ));
+    }
+
+    #[test]
+    fn bounded_resource_samples_keep_start_and_latest_finish() {
+        let mut evidence = ProcessResourceEvidence::new("sleep 1", &HashMap::new());
+        evidence.push_sample(ProcessResourceSample {
+            phase: "start".to_string(),
+            recorded_at: crate::state::timestamp(),
+            processes: Vec::new(),
+        });
+        for index in 0..PROCESS_RESOURCE_SAMPLE_LIMIT {
+            evidence.push_sample(ProcessResourceSample {
+                phase: format!("mid-{index}"),
+                recorded_at: crate::state::timestamp(),
+                processes: Vec::new(),
+            });
+        }
+        evidence.push_sample(ProcessResourceSample {
+            phase: "finish".to_string(),
+            recorded_at: crate::state::timestamp(),
+            processes: Vec::new(),
+        });
+
+        assert_eq!(evidence.samples.len(), PROCESS_RESOURCE_SAMPLE_LIMIT);
+        assert_eq!(evidence.samples.first().map(|sample| sample.phase.as_str()), Some("start"));
+        assert_eq!(evidence.samples.last().map(|sample| sample.phase.as_str()), Some("finish"));
     }
 
     #[test]
@@ -1600,5 +2741,503 @@ mod tests {
             error.to_string(),
             "Gear Rust command admission timed out after 0 seconds"
         );
+    }
+
+    #[test]
+    fn external_call_receipt_binds_owner_deadline_and_non_idempotent_retry_policy() {
+        let temp_dir = tempfile::tempdir().expect("failed to create temp directory");
+        let worker_dir = temp_dir.path().join(".gear").join("workers").join("task");
+        fs::create_dir_all(&worker_dir).expect("failed to create worker directory");
+        let mut env = HashMap::new();
+        env.insert(
+            "GEARBOX_WORKER_DIR".to_string(),
+            worker_dir.to_string_lossy().to_string(),
+        );
+        env.insert("GEARBOX_EXTERNAL_TASK_ID".to_string(), "task".to_string());
+        env.insert("GEARBOX_EXTERNAL_OWNER".to_string(), "executor".to_string());
+        env.insert("GEARBOX_EXTERNAL_ATTEMPT".to_string(), "3".to_string());
+        env.insert(
+            "GEARBOX_EXTERNAL_REQUEST_KIND".to_string(),
+            "verification".to_string(),
+        );
+        env.insert("GEARBOX_EXTERNAL_IDEMPOTENT".to_string(), "false".to_string());
+        env.insert("GEARBOX_EXTERNAL_RETRY_POLICY".to_string(), "none".to_string());
+
+        let result = run_shell_command_with_env_and_cancellation_and_timeout(
+            temp_dir.path(),
+            "printf 'ok'",
+            &env,
+            None,
+            Some(Duration::from_secs(2)),
+        )
+        .expect("command should succeed");
+        assert!(result.success);
+
+        let receipt: ExternalCallReceipt = serde_json::from_str(
+            &fs::read_to_string(worker_dir.join("external-call.json"))
+                .expect("external call receipt should exist"),
+        )
+        .expect("external call receipt should parse");
+        receipt.validate().expect("receipt should be sealed");
+        assert_eq!(receipt.status, "succeeded");
+        assert_eq!(receipt.owner, "executor");
+        assert_eq!(receipt.request_kind, "verification");
+        assert_eq!(receipt.attempt, 3);
+        assert!(!receipt.retry_allowed);
+        assert!(receipt.deadline_at_ms.is_some());
+        assert!(worker_dir.join("external-call-start.json").exists());
+
+        let mut forged_retry = receipt;
+        forged_retry.idempotent = false;
+        forged_retry.retry_allowed = true;
+        forged_retry.receipt_hash.clear();
+        forged_retry.receipt_hash = forged_retry.expected_hash().expect("hash receipt");
+        assert!(
+            forged_retry.validate().is_err(),
+            "receipt validation must reject a retry grant for a non-idempotent call"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_call_receipt_records_deadline_failure() {
+        let temp_dir = tempfile::tempdir().expect("failed to create temp directory");
+        let worker_dir = temp_dir.path().join(".gear").join("workers").join("task");
+        fs::create_dir_all(&worker_dir).expect("failed to create worker directory");
+        let mut env = HashMap::new();
+        env.insert(
+            "GEARBOX_WORKER_DIR".to_string(),
+            worker_dir.to_string_lossy().to_string(),
+        );
+        env.insert("GEARBOX_EXTERNAL_TASK_ID".to_string(), "task".to_string());
+        env.insert("GEARBOX_EXTERNAL_OWNER".to_string(), "executor".to_string());
+
+        let error = run_shell_command_with_env_and_cancellation_and_timeout(
+            temp_dir.path(),
+            "sleep 2",
+            &env,
+            None,
+            Some(Duration::from_millis(50)),
+        )
+        .expect_err("command should hit its deadline");
+        assert!(error.to_string().contains("timed out"));
+        let receipt: ExternalCallReceipt = serde_json::from_str(
+            &fs::read_to_string(worker_dir.join("external-call.json"))
+                .expect("deadline receipt should exist"),
+        )
+        .expect("deadline receipt should parse");
+        assert_eq!(receipt.status, "deadline_exceeded");
+        assert!(receipt.error.is_some());
+        receipt.validate().expect("deadline receipt should be sealed");
+    }
+
+    #[test]
+    fn blocked_external_effect_persists_a_pre_spawn_receipt() {
+        let temp_dir = tempfile::tempdir().expect("failed to create temp directory");
+        let worker_dir = temp_dir.path().join(".gear").join("workers").join("task");
+        fs::create_dir_all(&worker_dir).expect("failed to create worker directory");
+        let marker = temp_dir.path().join("must-not-run");
+        let mut env = HashMap::new();
+        env.insert(
+            "GEARBOX_WORKER_DIR".to_string(),
+            worker_dir.to_string_lossy().to_string(),
+        );
+        env.insert("GEARBOX_EXTERNAL_TASK_ID".to_string(), "task".to_string());
+        env.insert("GEARBOX_EXTERNAL_OWNER".to_string(), "executor".to_string());
+        env.insert(
+            "GEARBOX_EXTERNAL_REQUEST_KIND".to_string(),
+            "webfetch".to_string(),
+        );
+        env.insert(
+            "GEARBOX_EXTERNAL_TARGET".to_string(),
+            "https://example.test/a".to_string(),
+        );
+        env.insert(
+            "GEARBOX_EXTERNAL_REQUIRE_DEADLINE".to_string(),
+            "true".to_string(),
+        );
+
+        let error = run_shell_command_with_env_and_cancellation_and_timeout(
+            temp_dir.path(),
+            &format!("touch {}", marker.display()),
+            &env,
+            None,
+            None,
+        )
+        .expect_err("missing deadline must block before spawn");
+        assert!(error.to_string().contains("admission blocked"));
+        assert!(!marker.exists(), "blocked command must not spawn");
+
+        let receipt: ExternalCallReceipt = serde_json::from_str(
+            &fs::read_to_string(worker_dir.join("external-call.json"))
+                .expect("blocked call receipt should exist"),
+        )
+        .expect("blocked call receipt should parse");
+        receipt.validate().expect("blocked receipt should be sealed");
+        assert_eq!(receipt.status, "blocked");
+        assert_eq!(receipt.request_kind, "webfetch");
+        assert!(receipt
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("deadline")));
+        assert!(!worker_dir.join("external-call-start.json").exists());
+    }
+
+    #[test]
+    fn external_effect_admission_blocks_redirects_cancel_and_non_idempotent_retry() {
+        let workspace = tempfile::tempdir().expect("workspace should be created");
+        let base = ExternalEffectRequest {
+            kind: ExternalEffectKind::WebFetch,
+            owner: "worker".to_string(),
+            workspace: workspace.path().to_path_buf(),
+            target: "https://example.test/a".to_string(),
+            deadline_at_ms: Some(200),
+            cancellation_requested: false,
+            terminal_session: false,
+            redirect_count: 6,
+            max_redirects: 5,
+            idempotent: false,
+            retry_requested: false,
+            require_deadline: true,
+        };
+        assert_eq!(
+            admit_external_effect(&base, 100).status,
+            "blocked",
+            "redirect loops must not be admitted"
+        );
+
+        let mut cancelled = base.clone();
+        cancelled.redirect_count = 0;
+        cancelled.cancellation_requested = true;
+        assert_eq!(admit_external_effect(&cancelled, 100).status, "blocked");
+
+        let mut replay = cancelled;
+        replay.cancellation_requested = false;
+        replay.retry_requested = true;
+        assert_eq!(admit_external_effect(&replay, 100).status, "blocked");
+
+        let mut relative_escape = base;
+        relative_escape.redirect_count = 0;
+        relative_escape.target = "../outside".to_string();
+        relative_escape.kind = ExternalEffectKind::Lsp;
+        assert_eq!(admit_external_effect(&relative_escape, 100).status, "blocked");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_effect_admission_blocks_missing_target_through_external_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().expect("workspace should be created");
+        let outside = tempfile::tempdir().expect("outside directory should be created");
+        symlink(outside.path(), workspace.path().join("linked"))
+            .expect("external symlink should be created");
+        let request = ExternalEffectRequest {
+            kind: ExternalEffectKind::Shell,
+            owner: "worker".to_string(),
+            workspace: workspace.path().to_path_buf(),
+            target: "linked/new-file.txt".to_string(),
+            deadline_at_ms: Some(200),
+            cancellation_requested: false,
+            terminal_session: false,
+            redirect_count: 0,
+            max_redirects: 0,
+            idempotent: false,
+            retry_requested: false,
+            require_deadline: true,
+        };
+        let decision = admit_external_effect(&request, 100);
+        assert_eq!(decision.status, "blocked");
+        assert!(decision.reason.contains("escapes the workspace"));
+    }
+
+    #[test]
+    fn external_effect_admission_requires_deadline_and_allows_idempotent_retry() {
+        let workspace = tempfile::tempdir().expect("workspace should be created");
+        let request = ExternalEffectRequest {
+            kind: ExternalEffectKind::Mcp,
+            owner: "worker".to_string(),
+            workspace: workspace.path().to_path_buf(),
+            target: "mcp://server/tool".to_string(),
+            deadline_at_ms: None,
+            cancellation_requested: false,
+            terminal_session: false,
+            redirect_count: 0,
+            max_redirects: 0,
+            idempotent: true,
+            retry_requested: true,
+            require_deadline: true,
+        };
+        assert_eq!(admit_external_effect(&request, 100).status, "blocked");
+
+        let mut admitted = request;
+        admitted.deadline_at_ms = Some(200);
+        let decision = admit_external_effect(&admitted, 100);
+        assert_eq!(decision.status, "admitted");
+        assert!(decision.retry_allowed);
+    }
+
+    #[test]
+    fn protocol_external_effects_require_a_deadline_by_default() {
+        let workspace = tempfile::tempdir().expect("workspace should be created");
+        let env = HashMap::from([
+            (
+                "GEARBOX_EXTERNAL_REQUEST_KIND".to_string(),
+                "mcp".to_string(),
+            ),
+            (
+                "GEARBOX_EXTERNAL_TARGET".to_string(),
+                "mcp://server/tool".to_string(),
+            ),
+        ]);
+        let request = external_effect_request(
+            workspace.path(),
+            "printf ok",
+            &env,
+            None,
+            100,
+        );
+        assert!(request.require_deadline);
+        assert_eq!(admit_external_effect(&request, 100).status, "blocked");
+    }
+
+    #[test]
+    fn external_transport_commands_are_bounded_and_protocol_specific() {
+        let mut webfetch_env = HashMap::from([
+            (
+                "GEARBOX_EXTERNAL_REQUEST_KIND".to_string(),
+                "webfetch".to_string(),
+            ),
+            (
+                "GEARBOX_EXTERNAL_TARGET".to_string(),
+                "https://example.test/a'b".to_string(),
+            ),
+            (
+                "GEARBOX_EXTERNAL_MAX_REDIRECTS".to_string(),
+                "2".to_string(),
+            ),
+        ]);
+        let webfetch = external_transport_command(
+            "ignored",
+            &webfetch_env,
+            Some(Duration::from_secs(3)),
+        )
+        .expect("WebFetch transport should compile")
+        .expect("WebFetch should have a transport command");
+        assert!(webfetch.starts_with("curl --fail --silent --show-error --location"));
+        assert!(webfetch.contains("--max-redirs 2"));
+        assert!(webfetch.contains("example.test/a'\\''b"));
+
+        webfetch_env.insert(
+            "GEARBOX_EXTERNAL_REQUEST_KIND".to_string(),
+            "lsp".to_string(),
+        );
+        webfetch_env.insert(
+            "GEARBOX_EXTERNAL_PROTOCOL_REQUEST".to_string(),
+            "{\"jsonrpc\":\"2.0\"}".to_string(),
+        );
+        let protocol = external_transport_command("server", &webfetch_env, Some(Duration::from_secs(1)))
+            .expect("protocol transport should compile")
+            .expect("protocol should have a transport command");
+        assert!(protocol.contains("printf 'Content-Length:"));
+        assert!(protocol.contains("Content-Length: %s\r\n\r\n%s"));
+        assert!(protocol.ends_with("| server"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lsp_transport_runs_content_length_framed_request_through_owned_worker() {
+        let temp_dir = tempfile::tempdir().expect("workspace should be created");
+        let worker_dir = temp_dir.path().join(".gear").join("workers").join("task");
+        fs::create_dir_all(&worker_dir).expect("worker directory should be created");
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#;
+        let env = HashMap::from([
+            (
+                "GEARBOX_WORKER_DIR".to_string(),
+                worker_dir.to_string_lossy().to_string(),
+            ),
+            (
+                "GEARBOX_EXTERNAL_TASK_ID".to_string(),
+                "task".to_string(),
+            ),
+            (
+                "GEARBOX_EXTERNAL_OWNER".to_string(),
+                "lsp-worker".to_string(),
+            ),
+            (
+                "GEARBOX_EXTERNAL_REQUEST_KIND".to_string(),
+                "lsp".to_string(),
+            ),
+            ("GEARBOX_EXTERNAL_TARGET".to_string(), "cat".to_string()),
+            (
+                "GEARBOX_EXTERNAL_PROTOCOL_REQUEST".to_string(),
+                request.to_string(),
+            ),
+        ]);
+        let result = run_shell_command_with_env_and_cancellation_and_timeout(
+            temp_dir.path(),
+            "cat",
+            &env,
+            None,
+            Some(Duration::from_secs(2)),
+        )
+        .expect("LSP protocol transport should succeed");
+        assert!(result.success);
+        assert!(result.stdout.starts_with(&format!(
+            "Content-Length: {}\r\n\r\n",
+            request.len()
+        )));
+        assert!(result.stdout.ends_with(request));
+        let receipt: ExternalCallReceipt = serde_json::from_str(
+            &fs::read_to_string(worker_dir.join("external-call.json"))
+                .expect("LSP receipt should exist"),
+        )
+        .expect("LSP receipt should parse");
+        receipt.validate().expect("LSP receipt should be sealed");
+        assert_eq!(receipt.request_kind, "lsp");
+        assert_eq!(receipt.status, "succeeded");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn webfetch_transport_runs_bounded_local_http_through_owned_worker() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let temp_dir = tempfile::tempdir().expect("workspace should be created");
+        let worker_dir = temp_dir.path().join(".gear").join("workers").join("task");
+        fs::create_dir_all(&worker_dir).expect("worker directory should be created");
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("local HTTP listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("local HTTP listener should expose an address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("curl should connect to local HTTP");
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: close\r\n\r\nwebfetch-test",
+                )
+                .expect("local HTTP response should be writable");
+        });
+        let target = format!("http://{address}/probe");
+        let env = HashMap::from([
+            (
+                "GEARBOX_WORKER_DIR".to_string(),
+                worker_dir.to_string_lossy().to_string(),
+            ),
+            (
+                "GEARBOX_EXTERNAL_TASK_ID".to_string(),
+                "task".to_string(),
+            ),
+            (
+                "GEARBOX_EXTERNAL_OWNER".to_string(),
+                "webfetch-worker".to_string(),
+            ),
+            (
+                "GEARBOX_EXTERNAL_REQUEST_KIND".to_string(),
+                "webfetch".to_string(),
+            ),
+            ("GEARBOX_EXTERNAL_TARGET".to_string(), target.clone()),
+            (
+                "GEARBOX_EXTERNAL_MAX_REDIRECTS".to_string(),
+                "1".to_string(),
+            ),
+        ]);
+        let result = run_shell_command_with_env_and_cancellation_and_timeout(
+            temp_dir.path(),
+            "ignored",
+            &env,
+            None,
+            Some(Duration::from_secs(3)),
+        )
+        .expect("WebFetch transport should reach the local server");
+        server.join().expect("local HTTP server should exit cleanly");
+        assert!(result.success);
+        assert_eq!(result.stdout, "webfetch-test");
+        let receipt: ExternalCallReceipt = serde_json::from_str(
+            &fs::read_to_string(worker_dir.join("external-call.json"))
+                .expect("WebFetch receipt should exist"),
+        )
+        .expect("WebFetch receipt should parse");
+        receipt.validate().expect("WebFetch receipt should be sealed");
+        assert_eq!(receipt.request_kind, "webfetch");
+        assert_eq!(receipt.target, target);
+        assert_eq!(receipt.status, "succeeded");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mcp_transport_runs_protocol_request_through_owned_worker() {
+        let temp_dir = tempfile::tempdir().expect("failed to create temp directory");
+        let worker_dir = temp_dir.path().join(".gear").join("workers").join("task");
+        fs::create_dir_all(&worker_dir).expect("failed to create worker directory");
+        let mut env = HashMap::from([
+            (
+                "GEARBOX_WORKER_DIR".to_string(),
+                worker_dir.to_string_lossy().to_string(),
+            ),
+            (
+                "GEARBOX_EXTERNAL_TASK_ID".to_string(),
+                "task".to_string(),
+            ),
+            (
+                "GEARBOX_EXTERNAL_OWNER".to_string(),
+                "mcp-worker".to_string(),
+            ),
+            (
+                "GEARBOX_EXTERNAL_REQUEST_KIND".to_string(),
+                "mcp".to_string(),
+            ),
+            (
+                "GEARBOX_EXTERNAL_TARGET".to_string(),
+                "cat".to_string(),
+            ),
+            (
+                "GEARBOX_EXTERNAL_PROTOCOL_REQUEST".to_string(),
+                "{\"jsonrpc\":\"2.0\",\"method\":\"tools/list\"}".to_string(),
+            ),
+        ]);
+        let result = run_shell_command_with_env_and_cancellation_and_timeout(
+            temp_dir.path(),
+            "cat",
+            &env,
+            None,
+            Some(Duration::from_secs(2)),
+        )
+        .expect("MCP protocol transport should succeed");
+        assert!(result.success);
+        assert!(result.stdout.contains("tools/list"));
+        assert_eq!(result.command, "cat");
+        let receipt: ExternalCallReceipt = serde_json::from_str(
+            &fs::read_to_string(worker_dir.join("external-call.json"))
+                .expect("MCP receipt should exist"),
+        )
+        .expect("MCP receipt should parse");
+        receipt.validate().expect("MCP receipt should be sealed");
+        assert_eq!(receipt.request_kind, "mcp");
+        assert_eq!(receipt.target, "cat");
+        assert_eq!(receipt.status, "succeeded");
+        env.insert(
+            "GEARBOX_EXTERNAL_PROTOCOL_REQUEST".to_string(),
+            String::new(),
+        );
+        let error = run_shell_command_with_env_and_cancellation_and_timeout(
+            temp_dir.path(),
+            "cat",
+            &env,
+            None,
+            Some(Duration::from_secs(2)),
+        )
+        .expect_err("empty MCP payload must be rejected");
+        assert!(error.to_string().contains("cannot be empty"));
+        let receipt: ExternalCallReceipt = serde_json::from_str(
+            &fs::read_to_string(worker_dir.join("external-call.json"))
+                .expect("failed MCP receipt should remain durable"),
+        )
+        .expect("failed MCP receipt should parse");
+        assert_eq!(receipt.status, "error");
+        assert!(receipt.error.is_some());
     }
 }

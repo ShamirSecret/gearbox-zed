@@ -232,13 +232,54 @@ pub(crate) fn parse_json_object<T: DeserializeOwned>(raw_output: &str, context: 
         let mut deserializer = serde_json::Deserializer::from_str(candidate);
         match T::deserialize(&mut deserializer) {
             Ok(value) => return Ok(value),
-            Err(error) => last_error = Some(error.to_string()),
+            Err(error) => {
+                last_error = Some(error.to_string());
+                let repaired = repair_provider_json_escapes(candidate);
+                if repaired != candidate {
+                    let mut deserializer = serde_json::Deserializer::from_str(&repaired);
+                    match T::deserialize(&mut deserializer) {
+                        Ok(value) => return Ok(value),
+                        Err(repaired_error) => last_error = Some(repaired_error.to_string()),
+                    }
+                }
+            }
         }
     }
     bail!(
         "{context}: {}",
         last_error.unwrap_or_else(|| "no JSON object found".to_string())
     )
+}
+
+/// Some provider JSON serializers incorrectly emit `\'` inside a JSON string.
+/// An apostrophe has no escaping role in JSON, so remove only that invalid
+/// escape while preserving valid escaped backslashes and every other error.
+fn repair_provider_json_escapes(candidate: &str) -> String {
+    let bytes = candidate.as_bytes();
+    let mut repaired = String::with_capacity(candidate.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' && index + 1 < bytes.len() && bytes[index + 1] == b'\'' {
+            let mut preceding_backslashes = 0;
+            let mut preceding = index;
+            while preceding > 0 && bytes[preceding - 1] == b'\\' {
+                preceding_backslashes += 1;
+                preceding -= 1;
+            }
+            if preceding_backslashes % 2 == 0 {
+                repaired.push('\'');
+                index += 2;
+                continue;
+            }
+        }
+        let character = candidate[index..]
+            .chars()
+            .next()
+            .expect("byte index must be on a character boundary");
+        repaired.push(character);
+        index += character.len_utf8();
+    }
+    repaired
 }
 
 impl IntentFoldVerdict {
@@ -1002,7 +1043,169 @@ fn structure_findings(plan: &PlanGraph) -> Vec<String> {
             .map(|question| format!("unresolved planning question blocks approval: {}", question)),
     );
     findings.extend(decomposition_findings(plan));
+    findings.extend(byte_count_consistency_findings(plan));
     findings
+}
+
+/// Reject plans that make an objectively false byte-count claim about a
+/// literal payload. Models frequently count the separator or newline twice;
+/// allowing that contradiction through the approval gate makes the executor
+/// follow an impossible acceptance contract.
+fn byte_count_consistency_findings(plan: &PlanGraph) -> Vec<String> {
+    let Ok(serialized) = serde_json::to_value(plan) else {
+        return vec!["plan could not be serialized for byte-count consistency checks".to_string()];
+    };
+    let mut texts = Vec::new();
+    collect_plan_texts(&serialized, &mut texts);
+    let mut findings = Vec::new();
+    let mut seen = HashSet::new();
+    for (path, text) in texts {
+        for (number_start, claimed, byte_end) in byte_claims(&text) {
+            if byte_claim_is_component(&text, number_start, byte_end) {
+                continue;
+            }
+            let window_start = number_start.saturating_sub(128);
+            let window_end = (byte_end + 160).min(text.len());
+            let window = &text[window_start..window_end];
+            let Some(literal) = byte_literal(window) else {
+                continue;
+            };
+            if literal.starts_with('.') || literal.contains('/') {
+                continue;
+            }
+            let has_line_feed = contains_ascii_word(window, "newline")
+                || contains_ascii_word(window, "line feed")
+                || window.to_ascii_lowercase().contains("0x0a")
+                || contains_ascii_word(window, "lf");
+            let expected = literal.len() + usize::from(has_line_feed);
+            if claimed == expected {
+                continue;
+            }
+            let key = format!("{claimed}:{expected}:{literal}:{has_line_feed}");
+            if seen.insert(key) {
+                findings.push(format!(
+                    "plan text {path} claims {claimed} bytes for UTF-8 literal {literal}{} but the deterministic length is {expected}",
+                    if has_line_feed { " plus one line feed" } else { "" }
+                ));
+            }
+        }
+    }
+    findings
+}
+
+fn byte_claim_is_component(text: &str, number_start: usize, byte_end: usize) -> bool {
+    let lowercase = text.to_ascii_lowercase();
+    let claim = &lowercase[number_start..byte_end];
+    let prefix_start = number_start.saturating_sub(32);
+    let prefix = &lowercase[prefix_start..number_start];
+    claim.contains("content")
+        || claim.contains("payload")
+        || claim.contains("lf")
+        || claim.contains("line feed")
+        || claim.contains("newline")
+        || prefix.contains("lf")
+        || prefix.contains("line feed")
+        || prefix.contains("newline")
+}
+
+fn collect_plan_texts(value: &serde_json::Value, texts: &mut Vec<(String, String)>) {
+    fn visit(value: &serde_json::Value, path: &str, texts: &mut Vec<(String, String)>) {
+        match value {
+            serde_json::Value::String(text) => texts.push((path.to_string(), text.clone())),
+            serde_json::Value::Array(values) => {
+                for (index, value) in values.iter().enumerate() {
+                    visit(value, &format!("{path}[{index}]"), texts);
+                }
+            }
+            serde_json::Value::Object(values) => {
+                for (key, value) in values {
+                    let child_path = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    visit(value, &child_path, texts);
+                }
+            }
+            serde_json::Value::Null
+            | serde_json::Value::Bool(_)
+            | serde_json::Value::Number(_) => {}
+        }
+    }
+    visit(value, "$", texts);
+}
+
+fn byte_claims(text: &str) -> Vec<(usize, usize, usize)> {
+    let lower = text.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut claims = Vec::new();
+    let mut cursor = 0;
+    while let Some(relative_byte) = lower[cursor..].find("byte") {
+        let byte_start = cursor + relative_byte;
+        let mut number_end = byte_start;
+        while number_end > 0 && bytes[number_end - 1].is_ascii_whitespace() {
+            number_end -= 1;
+        }
+        let mut number_start = number_end;
+        while number_start > 0 && bytes[number_start - 1].is_ascii_digit() {
+            number_start -= 1;
+        }
+        if number_start < number_end
+            && let Ok(claimed) = lower[number_start..number_end].parse::<usize>()
+        {
+            claims.push((number_start, claimed, byte_start + "byte".len()));
+        }
+        cursor = byte_start + "byte".len();
+    }
+    claims
+}
+
+fn byte_literal(window: &str) -> Option<String> {
+    for delimiter in ['\u{0060}', '"', '\''] {
+        let mut search_start = 0;
+        while let Some(relative_start) = window[search_start..].find(delimiter) {
+            let start = search_start + relative_start;
+            let rest = &window[start + delimiter.len_utf8()..];
+            if let Some(end) = rest.find(delimiter) {
+                let literal = &rest[..end];
+                // Shell commands commonly quote a printf format string before
+                // quoting the actual payload. `%s\\n` is not the file
+                // content, so skip format literals and keep searching for the
+                // next quoted candidate.
+                if !literal.is_empty() && !literal.contains('%') {
+                    return Some(literal.to_string());
+                }
+                search_start = start + delimiter.len_utf8() + end + delimiter.len_utf8();
+                continue;
+            }
+            break;
+        }
+    }
+    let colon = window.find(':')?;
+    let remainder = window[colon + 1..].trim_start();
+    let literal = remainder
+        .split(|character: char| character.is_whitespace() || matches!(character, '+' | ',' | ';'))
+        .next()
+        .filter(|candidate| {
+            !candidate.is_empty()
+                && candidate.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || "-_./".contains(character)
+                })
+                && candidate
+                    .chars()
+                    .any(|character| character.is_ascii_alphabetic() || "-_./".contains(character))
+        })?;
+    Some(literal.to_string())
+}
+
+fn contains_ascii_word(text: &str, word: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    if word.contains(' ') {
+        return lower.contains(word);
+    }
+    lower
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|part| part == word)
 }
 
 /// Keep the planner's work orders independently executable without imposing
@@ -1117,7 +1320,8 @@ fn reference_is_declared_write_target(task: &PlanTaskContract, reference_path: &
         })
 }
 
-/// Plan references commonly include a human-facing `file:start-end` suffix.
+/// Plan references commonly include a human-facing `file:line` or
+/// `file:start-end` suffix.
 /// Keep the original reference in receipts, but resolve the file portion when
 /// checking repository containment so line annotations do not become false
 /// hard failures.
@@ -1125,16 +1329,26 @@ fn reference_path_candidates(path: &str) -> Vec<String> {
     let mut candidates = vec![path.to_string()];
     if let Some((file, range)) = path.rsplit_once(':')
         && !file.is_empty()
-        && range.split_once('-').is_some_and(|(start, end)| {
-            !start.is_empty()
-                && !end.is_empty()
-                && start.chars().all(|character| character.is_ascii_digit())
-                && end.chars().all(|character| character.is_ascii_digit())
-        })
+        && is_line_annotation(range)
     {
         candidates.push(file.to_string());
     }
     candidates
+}
+
+fn is_line_annotation(annotation: &str) -> bool {
+    let mut lines = annotation.split('-');
+    let Some(start) = lines.next() else {
+        return false;
+    };
+    let Some(end) = lines.next() else {
+        return !start.is_empty() && start.chars().all(|character| character.is_ascii_digit());
+    };
+    lines.next().is_none()
+        && !start.is_empty()
+        && !end.is_empty()
+        && start.chars().all(|character| character.is_ascii_digit())
+        && end.chars().all(|character| character.is_ascii_digit())
 }
 
 fn scope_findings(plan: &PlanGraph) -> Vec<String> {
@@ -1605,6 +1819,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reference_path_candidates_accept_single_line_annotations() {
+        assert_eq!(
+            reference_path_candidates("hello.txt:1"),
+            vec!["hello.txt:1".to_string(), "hello.txt".to_string()]
+        );
+        assert_eq!(
+            reference_path_candidates("src/lib.rs:10-12"),
+            vec!["src/lib.rs:10-12".to_string(), "src/lib.rs".to_string()]
+        );
+        assert_eq!(
+            reference_path_candidates("src/lib.rs:10-12-14"),
+            vec!["src/lib.rs:10-12-14".to_string()]
+        );
+    }
+
+    #[test]
     fn strict_phase_parser_accepts_provider_prose_before_json() -> Result<()> {
         let raw = r#"I inspected the workspace first.
 {"schema_version":1,"goal_id":"goal","normalized_objective":"outcome","assumptions":[],"constraints":[],"ambiguities":[],"required_questions":[],"risks":[],"acceptance_signals":["verified"],"decision":"ready","summary":"ready"}"#;
@@ -1612,6 +1842,23 @@ mod tests {
         assert_eq!(verdict.goal_id, "goal");
         Ok(())
     }
+
+    #[test]
+    fn strict_phase_parser_repairs_provider_apostrophe_escape() -> Result<()> {
+        let raw = r#"{"summary":"provider\'s verdict"}"#;
+        let value: serde_json::Value = parse_json_object(raw, "test JSON")?;
+        assert_eq!(value["summary"], "provider's verdict");
+        Ok(())
+    }
+
+    #[test]
+    fn strict_phase_parser_preserves_a_valid_escaped_backslash_before_apostrophe() -> Result<()> {
+        let raw = r#"{"summary":"provider\\'s verdict"}"#;
+        let value: serde_json::Value = parse_json_object(raw, "test JSON")?;
+        assert_eq!(value["summary"], r#"provider\'s verdict"#);
+        Ok(())
+    }
+
     use crate::{
         plan_graph::{
             CommandExpectation, PlanReference, PlannerReceipt, QaScenario,
@@ -1694,6 +1941,127 @@ mod tests {
             model_id: Some("critic-model".to_string()),
             actual_session_id: Some("critic-actual-session".to_string()),
         }
+    }
+
+    #[test]
+    fn byte_count_consistency_calculates_utf8_literal_with_one_line_feed() {
+        let text = "hello.txt contains exactly 25 bytes: gearbox-self-dogfood-ok + 0x0a";
+        let claims = byte_claims(text);
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].1, 25);
+        let window = &text[claims[0].0..];
+        let literal = byte_literal(window).expect("literal should be found");
+        assert_eq!(literal, "gearbox-self-dogfood-ok");
+        assert_eq!(literal.len() + 1, 24);
+        assert!(contains_ascii_word(window, "0x0a") || window.contains("0x0a"));
+    }
+
+    #[test]
+    fn byte_count_literal_detection_ignores_numeric_descriptors() {
+        let text = "hello.txt (22 bytes: 21 content bytes gearbox-deepseek-final + 1 LF byte)";
+        let claims = byte_claims(text);
+        assert_eq!(claims.len(), 1);
+        assert!(byte_literal(&text[claims[0].0..]).is_none());
+    }
+
+    #[test]
+    fn byte_count_consistency_ignores_component_byte_descriptors() -> Result<()> {
+        let text = "gearbox-deepseek-final (22 bytes: 22 content bytes + LF (1 byte))";
+        let claims = byte_claims(text);
+        assert_eq!(claims.len(), 2);
+        assert!(!byte_claim_is_component(text, claims[0].0, claims[0].2));
+        assert!(byte_claim_is_component(text, claims[1].0, claims[1].2));
+        let fixture = fixture()?;
+        let mut draft = fixture.plan.draft.clone();
+        draft.must_have.push(
+            "hello.txt contains gearbox-deepseek-final (22 content bytes) + LF (1 byte)"
+                .to_string(),
+        );
+        let plan = PlanGraph::seal(
+            fixture.plan.goal_id.as_str(),
+            fixture.plan.revision,
+            fixture.plan.source.clone(),
+            fixture.plan.planner.clone(),
+            draft,
+        )?;
+        let report = PlanVerifierReport::verify(&plan, fixture._temp_dir.path())?;
+        assert!(report
+            .check(PlanVerifierDimension::Structure)
+            .context("structure check missing")?
+            .passed);
+        Ok(())
+    }
+
+    #[test]
+    fn byte_count_consistency_ignores_printf_format_literal() -> Result<()> {
+        let fixture = fixture()?;
+        let mut draft = fixture.plan.draft.clone();
+        draft.tasks[0].must_do.push(
+            "Create hello.txt with printf '%s\\n' 'gearbox-deepseek-final' (23 bytes total: 22 content + 1 LF)"
+                .to_string(),
+        );
+        let plan = PlanGraph::seal(
+            fixture.plan.goal_id.as_str(),
+            fixture.plan.revision,
+            fixture.plan.source.clone(),
+            fixture.plan.planner.clone(),
+            draft,
+        )?;
+        let report = PlanVerifierReport::verify(&plan, fixture._temp_dir.path())?;
+        assert!(report
+            .check(PlanVerifierDimension::Structure)
+            .context("structure check missing")?
+            .passed);
+        Ok(())
+    }
+
+    #[test]
+    fn byte_count_consistency_ignores_path_size_descriptions() -> Result<()> {
+        let fixture = fixture()?;
+        let mut draft = fixture.plan.draft.clone();
+        draft.tasks[0].already_in_working_tree.push(
+            "Baseline contents: .gear/ (framework metadata) and driver.log (empty, 0 bytes)"
+                .to_string(),
+        );
+        let plan = PlanGraph::seal(
+            fixture.plan.goal_id.as_str(),
+            fixture.plan.revision,
+            fixture.plan.source.clone(),
+            fixture.plan.planner.clone(),
+            draft,
+        )?;
+        let report = PlanVerifierReport::verify(&plan, fixture._temp_dir.path())?;
+        assert!(report
+            .check(PlanVerifierDimension::Structure)
+            .context("structure check missing")?
+            .passed);
+        Ok(())
+    }
+
+    #[test]
+    fn verifier_blocks_contradictory_literal_byte_count() -> Result<()> {
+        let fixture = fixture()?;
+        let mut draft = fixture.plan.draft.clone();
+        draft
+            .must_have
+            .push("hello.txt must contain exactly 25 bytes: gearbox-self-dogfood-ok + 0x0a".to_string());
+        let plan = PlanGraph::seal(
+            fixture.plan.goal_id.as_str(),
+            fixture.plan.revision,
+            fixture.plan.source.clone(),
+            fixture.plan.planner.clone(),
+            draft,
+        )?;
+        let report = PlanVerifierReport::verify(&plan, fixture._temp_dir.path())?;
+        let structure = report
+            .check(PlanVerifierDimension::Structure)
+            .context("structure check missing")?;
+        assert!(!structure.passed);
+        assert!(structure
+            .findings
+            .iter()
+            .any(|finding| finding.contains("deterministic length is 24")));
+        Ok(())
     }
 
     fn checks(verdict: PlanCriticCheckVerdict) -> Vec<PlanCriticCheck> {
@@ -1898,6 +2266,27 @@ mod tests {
         let fixture = fixture()?;
         let mut draft = fixture.plan.draft.clone();
         draft.tasks[0].references[0].path = "src/lib.rs:1-1".to_string();
+        let plan = PlanGraph::seal(
+            "goal-1",
+            2,
+            PlanSource::PlannerModel,
+            fixture.plan.planner.clone(),
+            draft,
+        )?;
+        let report = PlanVerifierReport::verify(&plan, fixture._temp_dir.path())?;
+        assert!(
+            report
+                .check(PlanVerifierDimension::ReferencePaths)
+                .is_some_and(|check| check.passed)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn verifier_resolves_human_facing_single_line_references() -> Result<()> {
+        let fixture = fixture()?;
+        let mut draft = fixture.plan.draft.clone();
+        draft.tasks[0].references[0].path = "src/lib.rs:1".to_string();
         let plan = PlanGraph::seal(
             "goal-1",
             2,

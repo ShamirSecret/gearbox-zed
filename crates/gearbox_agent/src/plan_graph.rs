@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 
 pub const PLAN_GRAPH_SCHEMA_VERSION: u32 = 1;
 pub const PLAN_REVISION_MANIFEST_SCHEMA_VERSION: u32 = 2;
+pub const MAX_PLAN_REVISION_EVIDENCE_REFS: usize = 32;
 
 /// Compact contract example embedded in planner repair prompts. Keep this
 /// synchronized with the typed draft by exercising it in the unit tests below.
@@ -234,7 +235,7 @@ impl PlanRevisionManifest {
         if evidence_refs.is_empty() {
             bail!("plan revision manifest requires evidence references");
         }
-        if evidence_refs.len() > 32 {
+        if evidence_refs.len() > MAX_PLAN_REVISION_EVIDENCE_REFS {
             bail!("plan revision manifest allows at most 32 evidence references");
         }
         if base.goal_id != next.goal_id {

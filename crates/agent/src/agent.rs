@@ -6320,6 +6320,12 @@ impl NativeWorkerBackend for GearZedWorkerBackend {
         );
         let worker_model = validate_native_worker_model_id(route.worker_model)?;
         let plan_task = request.task.inputs.plan_task.as_ref();
+        let current_step_id = plan_task.and_then(|plan_task| {
+            plan_task
+                .execution_steps_or_legacy()
+                .first()
+                .map(|step| step.step_id.clone())
+        });
         let packet_goal = plan_task
             .map(|plan_task| plan_task.worker_goal(request.goal))
             .unwrap_or_else(|| request.goal.to_string());
@@ -6364,6 +6370,7 @@ impl NativeWorkerBackend for GearZedWorkerBackend {
         let packet = WorkerPacket {
             task_id: request.task.id.clone(),
             worker: route.worker_kind.as_str().to_string(),
+            current_step_id,
             worker_model: worker_model.clone(),
             variant: route.variant.clone(),
             variant_applied: route.variant.clone(),
@@ -7073,6 +7080,12 @@ impl NativeWorkerBackend for GearAcpBrokerBackend {
         );
         let worker_model = validate_native_worker_model_id(route.worker_model)?;
         let plan_task = request.task.inputs.plan_task.as_ref();
+        let current_step_id = plan_task.and_then(|plan_task| {
+            plan_task
+                .execution_steps_or_legacy()
+                .first()
+                .map(|step| step.step_id.clone())
+        });
         let packet_goal = plan_task
             .map(|plan_task| plan_task.worker_goal(request.goal))
             .unwrap_or_else(|| request.goal.to_string());
@@ -7117,6 +7130,7 @@ impl NativeWorkerBackend for GearAcpBrokerBackend {
         let packet = WorkerPacket {
             task_id: request.task.id.clone(),
             worker: route.worker_kind.as_str().to_string(),
+            current_step_id,
             worker_model: worker_model.clone(),
             variant: route.variant.clone(),
             variant_applied: route.variant.clone(),

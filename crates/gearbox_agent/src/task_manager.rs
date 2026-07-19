@@ -2126,7 +2126,9 @@ impl TaskManager {
             self.set_session_scope(context.session_id.clone());
         }
         if self.goal_epoch_context.as_ref().is_some_and(|current| {
-            current.session_id != context.session_id || current.goal_id != context.goal_id
+            current.session_id != context.session_id
+                || current.goal_id != context.goal_id
+                || current.epoch_id != context.epoch_id
         }) {
             self.goal_unavailable_worker_models.clear();
             self.goal_provider_sessions.clear();
@@ -9466,6 +9468,21 @@ mod tests {
     }
 
     #[test]
+    fn goal_epoch_context_resets_provider_session_when_epoch_changes() -> Result<()> {
+        let mut manager = TaskManager::new();
+        manager.set_goal_epoch_context("session-one", "goal-shared", "epoch-one")?;
+        manager.goal_provider_sessions.insert(
+            "goal-shared".to_string(),
+            "provider-session-one".to_string(),
+        );
+
+        manager.set_goal_epoch_context("session-one", "goal-shared", "epoch-two")?;
+
+        assert!(manager.goal_provider_sessions.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn possibly_accepted_outcomes_expose_a_warning_reason() {
         let send = SendOutcome::PossiblyAccepted(OutcomeContext::default());
         assert!(send.is_accepted());
@@ -10571,7 +10588,8 @@ mod tests {
         })?;
 
         let mut settled = 0;
-        for _ in 0..50 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
             settled += manager.tick()?;
             if settled > 0 {
                 break;
@@ -10633,7 +10651,8 @@ mod tests {
             })?;
 
         let mut completed = false;
-        for _ in 0..50 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
             completed = manager
                 .lock()
                 .map_err(|_| anyhow::anyhow!("task manager mutex poisoned"))?

@@ -1477,6 +1477,12 @@ pub struct ModelCallLedgerEntry {
     pub observed_paths: Vec<String>,
     #[serde(default)]
     pub observation_events: Vec<RepositoryObservationEvent>,
+    /// Provider/tool call identifiers observed in the worker transcript. The
+    /// ledger entry itself binds them to goal/plan/task/session/workspace, so
+    /// adapters can accept either `callID` or `call_id` without losing
+    /// lineage.
+    #[serde(default)]
+    pub observed_call_ids: Vec<String>,
     pub requested_tokens: Option<u64>,
     pub actual_tokens: Option<u64>,
     pub cost_micros: Option<u64>,
@@ -1986,6 +1992,15 @@ impl ModelCallLedgerEntry {
         }
         for event in &self.observation_events {
             event.validate()?;
+        }
+        let mut observed_call_ids = HashSet::new();
+        for call_id in &self.observed_call_ids {
+            if call_id.trim().is_empty() {
+                bail!("ModelCallLedgerEntry observed call id cannot be empty");
+            }
+            if !observed_call_ids.insert(call_id) {
+                bail!("ModelCallLedgerEntry observed call ids must be unique");
+            }
         }
         Ok(())
     }
@@ -3210,6 +3225,9 @@ pub fn is_destructive_command(command: &str) -> Option<&'static str> {
                 continue;
             }
             if token.starts_with("-c") || token.starts_with("--git-") {
+                // `-C <dir>` consumes the following path, while the
+                // attached `-C<dir>` form consumes only this token. Do not
+                // skip the actual subcommand in the attached form.
                 cursor += 1;
                 continue;
             }
@@ -3702,7 +3720,7 @@ impl ObjectiveGraph {
         self.reseal()
     }
 
-    /// Reopen a needs-user frontier for a new epoch after an explicit answer.
+    /// Reopen a needs-user, context-pressure-limited, blocked, or replay-failed frontier for a new epoch.
     /// Prior terminal evidence remains in the event ledger; the node itself
     /// becomes the active planning frontier with a fresh request binding.
     pub fn reopen_for_user_answer(
@@ -3711,15 +3729,26 @@ impl ObjectiveGraph {
         epoch_id: &str,
         request: &str,
     ) -> Result<()> {
-        if self.status != ObjectiveStatus::NeedsUser || self.active_goal_id.is_some() {
-            bail!("objective is not waiting for a user answer");
+        if !matches!(
+            self.status,
+            ObjectiveStatus::NeedsUser
+                | ObjectiveStatus::Limited
+                | ObjectiveStatus::Blocked
+                | ObjectiveStatus::Failed
+        )
+            || self.active_goal_id.is_some()
+        {
+            bail!("objective is not waiting for a resumable answer");
         }
         let node = self
             .nodes
             .iter_mut()
             .find(|node| node.goal_id == goal_id)
             .context("user answer references an unknown objective goal")?;
-        if !matches!(node.status, GoalStatus::NeedsUser | GoalStatus::Complete) {
+        if !matches!(
+            node.status,
+            GoalStatus::NeedsUser | GoalStatus::Complete | GoalStatus::Failed
+        ) {
             bail!("objective goal is not waiting for a user answer");
         }
         if epoch_id.trim().is_empty() || request.trim().is_empty() {
@@ -4005,6 +4034,7 @@ pub enum ObjectiveEventKind {
     GoalOutcomeRecorded,
     StrategistContinueAccepted,
     UserAnswerAccepted,
+    ContextPressureResumed,
     ChildDispatchReserved,
     FinalReviewBlockerPromoted,
     ObjectiveBudgetSettled,
@@ -4143,6 +4173,13 @@ fn validate_objective_event_transition(
             *active = true;
             *terminated = false;
         }
+        ObjectiveEventKind::ContextPressureResumed => {
+            if !*terminated || *active {
+                bail!("context-pressure resume requires a terminal objective");
+            }
+            *active = true;
+            *terminated = false;
+        }
         ObjectiveEventKind::GoalAttached
         | ObjectiveEventKind::GoalOutcomeRecorded
         | ObjectiveEventKind::StrategistContinueAccepted
@@ -4207,6 +4244,11 @@ fn validate_objective_event_payload(event: &ObjectiveEvent) -> Result<()> {
             required_non_empty("goal_id")?;
             required_non_empty("epoch_id")?;
             required_non_empty("answer")?;
+        }
+        ObjectiveEventKind::ContextPressureResumed => {
+            required_non_empty("active_goal_id")?;
+            required_non_empty("epoch_id")?;
+            required_non_empty("reason")?;
         }
         ObjectiveEventKind::ChildDispatchReserved => {
             required_non_empty("reservation_id")?;
@@ -4613,6 +4655,73 @@ pub struct CanonicalPlanBundle {
     pub binding_hash: String,
 }
 
+pub const CANONICAL_PLAN_POINTER_SCHEMA_VERSION: u32 = 1;
+
+/// A small, independently atomic pointer prevents a stale compatibility
+/// mirror from being mistaken for the active approved plan after a restart.
+/// The bundle remains the source of the plan and receipt contents; this file
+/// only binds the active identity to that bundle.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalPlanPointer {
+    pub schema_version: u32,
+    pub goal_id: String,
+    pub plan_id: String,
+    pub plan_hash: String,
+    pub revision: usize,
+    pub bundle_path: String,
+    pub bundle_binding_hash: String,
+    pub updated_at: String,
+    pub pointer_hash: String,
+}
+
+impl CanonicalPlanPointer {
+    fn seal(
+        goal_id: &str,
+        plan: &crate::plan_graph::PlanGraph,
+        bundle_path: &Path,
+        bundle_binding_hash: &str,
+    ) -> Result<Self> {
+        let mut pointer = Self {
+            schema_version: CANONICAL_PLAN_POINTER_SCHEMA_VERSION,
+            goal_id: goal_id.to_string(),
+            plan_id: plan.plan_id.clone(),
+            plan_hash: plan.plan_hash.clone(),
+            revision: plan.revision,
+            bundle_path: bundle_path.to_string_lossy().to_string(),
+            bundle_binding_hash: bundle_binding_hash.to_string(),
+            updated_at: timestamp(),
+            pointer_hash: String::new(),
+        };
+        pointer.pointer_hash = pointer.expected_hash()?;
+        pointer.validate(bundle_path)?;
+        Ok(pointer)
+    }
+
+    fn expected_hash(&self) -> Result<String> {
+        let mut payload = self.clone();
+        payload.pointer_hash.clear();
+        Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(&payload)?)))
+    }
+
+    fn validate(&self, expected_bundle_path: &Path) -> Result<()> {
+        if self.schema_version != CANONICAL_PLAN_POINTER_SCHEMA_VERSION
+            || self.goal_id.trim().is_empty()
+            || self.plan_id.trim().is_empty()
+            || self.plan_hash.trim().is_empty()
+            || self.bundle_binding_hash.trim().is_empty()
+            || self.updated_at.trim().is_empty()
+            || Path::new(&self.bundle_path) != expected_bundle_path
+        {
+            bail!("canonical plan pointer has an invalid identity or bundle path");
+        }
+        if self.pointer_hash != self.expected_hash()? {
+            bail!("canonical plan pointer binding hash mismatch");
+        }
+        Ok(())
+    }
+}
+
 impl CanonicalPlanBundle {
     fn seal(
         plan: crate::plan_graph::PlanGraph,
@@ -4894,6 +5003,11 @@ impl StateStore {
     pub fn canonical_plan_bundle_path(&self, goal_id: &str) -> PathBuf {
         self.plans_dir()
             .join(format!("{goal_id}.canonical.bundle.json"))
+    }
+
+    pub fn canonical_plan_pointer_path(&self, goal_id: &str) -> PathBuf {
+        self.plans_dir()
+            .join(format!("{goal_id}.active-plan.json"))
     }
 
     pub fn plan_reviews_dir(&self) -> PathBuf {
@@ -6062,9 +6176,20 @@ impl StateStore {
         self.validate_plan_approval_bundle_with_approval(plan_graph, &approval)
             .context("refusing to persist a PlanGraph without a valid approval bundle")?;
         let bundle = CanonicalPlanBundle::seal(plan_graph.clone(), approval)?;
+        let bundle_path = self.canonical_plan_bundle_path(&plan_graph.goal_id);
         write_json_atomic(
-            &self.canonical_plan_bundle_path(&plan_graph.goal_id),
+            &bundle_path,
             &bundle,
+        )?;
+        let pointer = CanonicalPlanPointer::seal(
+            &plan_graph.goal_id,
+            plan_graph,
+            &bundle_path,
+            &bundle.binding_hash,
+        )?;
+        write_json_atomic(
+            &self.canonical_plan_pointer_path(&plan_graph.goal_id),
+            &pointer,
         )?;
         let path = self
             .plans_dir()
@@ -6509,6 +6634,27 @@ impl StateStore {
             bundle.validate().with_context(|| {
                 format!("invalid canonical plan bundle at {}", bundle_path.display())
             })?;
+            let pointer_path = self.canonical_plan_pointer_path(goal_id);
+            if !pointer_path.is_file() {
+                bail!(
+                    "canonical plan pointer is missing for bundle {}",
+                    bundle_path.display()
+                );
+            }
+            let pointer: CanonicalPlanPointer = read_json_file(&pointer_path).with_context(|| {
+                format!("failed to read canonical plan pointer {}", pointer_path.display())
+            })?;
+            pointer.validate(&bundle_path).with_context(|| {
+                format!("invalid canonical plan pointer at {}", pointer_path.display())
+            })?;
+            if pointer.goal_id != goal_id
+                || pointer.plan_id != bundle.plan.plan_id
+                || pointer.plan_hash != bundle.plan.plan_hash
+                || pointer.revision != bundle.plan.revision
+                || pointer.bundle_binding_hash != bundle.binding_hash
+            {
+                bail!("canonical plan pointer does not match its bundle");
+            }
             self.validate_plan_approval_bundle_with_approval(&bundle.plan, &bundle.approval)
                 .with_context(|| {
                     format!(
@@ -7638,6 +7784,33 @@ mod gbx236_per_file_attribution_tests {
             result.modified[0].fingerprint.content_hash,
             before_fp.content_hash
         );
+    }
+
+    #[test]
+    fn per_file_attribution_detects_two_session_stale_preimage() {
+        let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let workspace = temp_dir.path();
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        std::fs::write(workspace.join("src/race.rs"), "baseline\n").unwrap();
+
+        let before = fingerprint_paths(workspace, &["src/race.rs".to_string()]);
+        std::fs::write(workspace.join("src/race.rs"), "session-a\n").unwrap();
+        let session_a_after = fingerprint_paths(workspace, &["src/race.rs".to_string()]);
+        let first = compute_per_file_attribution(&before, &session_a_after, "session-a", 1);
+        assert_eq!(first.modified.len(), 1);
+
+        // Session B still holds the original preimage.  Comparing that
+        // preimage with the current content must classify the write as a
+        // conflict instead of allowing a stale edit to be treated as noop.
+        std::fs::write(workspace.join("src/race.rs"), "session-b\n").unwrap();
+        let session_b_after = fingerprint_paths(workspace, &["src/race.rs".to_string()]);
+        let second = compute_per_file_attribution(&before, &session_b_after, "session-b", 1);
+        assert_eq!(second.modified.len(), 1);
+        assert_ne!(
+            second.modified[0].fingerprint.content_hash,
+            first.modified[0].fingerprint.content_hash
+        );
+        assert!(!second.scope_verdict);
     }
 
     #[test]
