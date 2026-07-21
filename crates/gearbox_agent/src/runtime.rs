@@ -12556,9 +12556,34 @@ fn build_final_verification_wave(
         .session_id
         .clone()
         .unwrap_or_else(|| "worker-outcome".to_string());
-    let qa_evidence = verification_path
+    let mut qa_evidence = verification_path
         .map(|path| vec![path.to_string_lossy().to_string()])
         .unwrap_or_default();
+    let provider_recovery_path = workspace
+        .join(".gear")
+        .join("artifacts")
+        .join(goal_id)
+        .join("provider-recovery-ledger.json");
+    let mut provider_recovery_info = String::new();
+    if provider_recovery_path.is_file() {
+        if let Ok(contents) = std::fs::read_to_string(&provider_recovery_path) {
+            if let Ok(recovery) = serde_json::from_str::<serde_json::Value>(&contents) {
+                let failed_models = recovery
+                    .get("failed_models")
+                    .and_then(serde_json::Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or(0);
+                let provider_session = recovery
+                    .get("provider_session_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("none");
+                provider_recovery_info = format!(
+                    " Provider recovery: failed_models={failed_models}, provider_session={provider_session}."
+                );
+                qa_evidence.push(provider_recovery_path.to_string_lossy().to_string());
+            }
+        }
+    }
     let scope_evidence = vec![worker_result.result_path.to_string_lossy().to_string()];
     let mut plan_evidence = node_evidence.clone();
     plan_evidence.extend(
@@ -12606,7 +12631,9 @@ fn build_final_verification_wave(
             dimension: FinalVerificationDimension::RealQa,
             passed: !verification_results.is_empty()
                 && verification_results.iter().all(|result| result.success),
-            summary: "Gear-owned verification commands all passed.".to_string(),
+            summary: format!(
+                "Gear-owned verification commands all passed.{provider_recovery_info}"
+            ),
             evidence_paths: if qa_evidence.is_empty() {
                 vec!["runtime-verification".to_string()]
             } else {
